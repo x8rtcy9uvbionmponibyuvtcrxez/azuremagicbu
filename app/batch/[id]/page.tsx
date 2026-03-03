@@ -276,7 +276,8 @@ export default function BatchPage({ params }: PageProps) {
                 <div className="space-y-2">
                   <Progress value={tenant.progress} />
                   <p className="text-sm text-muted-foreground">
-                    Progress: {tenant.progress}% • Step: {tenant.currentStep || "Waiting for next action"}
+                    Progress: {tenant.progress}% • Step:{" "}
+                    {tenant.status === "auth_pending" ? "Waiting for device code confirmation" : tenant.currentStep || "Waiting for next action"}
                   </p>
                   {retryStatusByTenant[tenant.id] ? (
                     <Badge variant="outline">Retry from: {retryStatusByTenant[tenant.id]}</Badge>
@@ -290,7 +291,9 @@ export default function BatchPage({ params }: PageProps) {
                       <span className="text-sm font-medium">Action Required</span>
                     </div>
                     <p className="text-sm text-amber-900">Go to Microsoft device login and enter this code:</p>
-                    <p className="mt-2 text-2xl font-semibold tracking-[0.15em] text-amber-950">{tenant.authCode || "CODE_PENDING"}</p>
+                    <div className="mt-2 text-2xl font-mono font-bold tracking-[0.15em] text-amber-950">
+                      {tenant.authCode || "CODE_PENDING"}
+                    </div>
                     <a className="mt-2 inline-block text-sm underline" href="https://microsoft.com/devicelogin" target="_blank" rel="noreferrer">
                       Open microsoft.com/devicelogin
                     </a>

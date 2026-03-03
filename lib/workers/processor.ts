@@ -67,6 +67,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
         zoneId: true,
         tenantId: true,
         authCode: true,
+        deviceCode: true,
         authConfirmed: true,
         csvUrl: true
       }
@@ -92,10 +93,10 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       return { state: "failed" };
     }
   } else {
-    console.log(`✓ [Worker] Cloudflare already complete for ${tenant.tenantName}, skipping`);
+    console.log(`✅ [Worker] Cloudflare already complete for ${tenant.tenantName}, skipping`);
   }
 
-  if (!tenant.tenantId && !tenant.authCode && !tenant.authConfirmed) {
+  if (!tenant.tenantId && !tenant.deviceCode && !tenant.authConfirmed) {
     await setupTenantPrep(tenant.id);
     console.log("✅ [Worker] Tenant prep complete");
     tenant = await loadTenant();
@@ -104,10 +105,15 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       return { state: "failed" };
     }
   } else {
-    console.log(`✓ [Worker] Tenant prep already complete or auth started for ${tenant.tenantName}, skipping`);
+    console.log(`✅ [Worker] Tenant prep already complete for ${tenant.tenantName}, skipping`);
   }
 
-  if (!tenant.authConfirmed && !tenant.authCode) {
+  if (tenant.authConfirmed) {
+    console.log(`✅ [Worker] Auth already confirmed for ${tenant.tenantName}, skipping device auth`);
+  } else if (tenant.deviceCode) {
+    console.log(`⚠️ [Worker] Device code already exists for ${tenant.tenantName}, waiting for confirmation`);
+  } else {
+    console.log(`🔄 [Worker] Generating new device code for ${tenant.tenantName}`);
     await initiateDeviceAuth(tenant.id);
     console.log("✅ [Worker] Device auth initiated");
     tenant = await loadTenant();
@@ -115,11 +121,10 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       await updateBatchStatus(batchId);
       return { state: "failed" };
     }
-  } else if (!tenant.authConfirmed) {
-    console.log(`✓ [Worker] Waiting for auth confirmation for ${tenant.tenantName}`);
   }
 
   if (!tenant.authConfirmed) {
+    console.log(`⚠️ [Worker] Waiting for auth confirmation for ${tenant.tenantName}`);
     await updateBatchStatus(batchId);
     return { state: "waiting_for_auth_confirmation" };
   }

@@ -142,10 +142,10 @@ async function createForwardingRule(zoneId: string, domain: string, forwardingUr
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
     const isRulesetLimitError =
-      message.includes("not a valid value for kind") &&
-      message.includes("exceeded maximum number of zone rulesets") &&
-      message.includes("http_request_dynamic_redirect");
+      normalized.includes("exceeded maximum number of zone rulesets") ||
+      (normalized.includes("not a valid value for kind") && normalized.includes("http_request_dynamic_redirect"));
 
     if (isRulesetLimitError) {
       console.log("⚠️ [Cloudflare] Skipping forwarding ruleset: max dynamic redirect rulesets already reached");

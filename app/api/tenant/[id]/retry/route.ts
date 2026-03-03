@@ -22,6 +22,10 @@ export async function POST(_request: Request, { params }: Params) {
         batchId: true,
         zoneId: true,
         tenantId: true,
+        status: true,
+        authCode: true,
+        deviceCode: true,
+        authCodeExpiry: true,
         authConfirmed: true,
         csvUrl: true
       }
@@ -31,24 +35,61 @@ export async function POST(_request: Request, { params }: Params) {
       return NextResponse.json({ error: "Tenant not found" }, { status: 404 });
     }
 
+    if (existing.csvUrl) {
+      return NextResponse.json({ error: "Tenant already completed" }, { status: 400 });
+    }
+
     let restartStatus: TenantStatus = "queued";
     let progress = 0;
-    let currentStep = "Retry requested from queue";
+    let currentStep: string | null = null;
 
-    if (existing.zoneId && !existing.tenantId) {
-      restartStatus = "tenant_prep";
-      progress = 50;
-      currentStep = "Retry requested from tenant prep";
-    } else if (existing.tenantId && !existing.authConfirmed) {
-      restartStatus = "auth_pending";
-      progress = 65;
-      currentStep = "Retry requested for device auth";
-    } else if (existing.tenantId && existing.authConfirmed && !existing.csvUrl) {
+    if (existing.authConfirmed && existing.tenantId) {
       restartStatus = "mailboxes";
       progress = 70;
       currentStep = "Retry requested from mailbox creation";
-    } else if (existing.csvUrl) {
-      return NextResponse.json({ ok: true, tenantId: existing.id, message: "Tenant already completed." });
+      console.log("✅ [Retry] Auth confirmed, restarting from mailboxes");
+    } else if (existing.deviceCode && !existing.authConfirmed) {
+      const isExpired = existing.authCodeExpiry ? existing.authCodeExpiry.getTime() <= Date.now() : false;
+      if (!isExpired) {
+        restartStatus = "auth_pending";
+        progress = 65;
+        currentStep = "Waiting for device code confirmation";
+        console.log("⚠️ [Retry] Device code exists, staying at auth_pending (code still valid)");
+
+        await prisma.tenant.update({
+          where: { id: existing.id },
+          data: {
+            status: restartStatus,
+            progress,
+            errorMessage: null,
+            currentStep
+          }
+        });
+
+        return NextResponse.json({
+          ok: true,
+          tenantId: existing.id,
+          restartStatus,
+          message: "Use existing device code. Click \"I've Entered the Code\" when ready."
+        });
+      }
+
+      restartStatus = "tenant_prep";
+      progress = 55;
+      currentStep = "Device code expired. Regenerating authentication code.";
+      console.log("🔄 [Retry] Device code expired, regenerating a fresh one");
+    } else if (existing.tenantId && !existing.deviceCode) {
+      restartStatus = "mailboxes";
+      progress = 70;
+      currentStep = "Auth already verified. Continuing mailbox setup...";
+      console.log("✅ [Retry] Tenant already authorized, bypassing device auth and restarting from mailboxes");
+    } else if (existing.zoneId && !existing.tenantId) {
+      restartStatus = "tenant_prep";
+      progress = 50;
+      currentStep = "Retry requested from tenant prep";
+      console.log("✅ [Retry] Cloudflare complete, restarting from Microsoft");
+    } else {
+      console.log("🔄 [Retry] Starting from beginning");
     }
 
     const tenant = await prisma.tenant.update({
@@ -58,8 +99,11 @@ export async function POST(_request: Request, { params }: Params) {
         progress,
         errorMessage: null,
         currentStep,
-        ...((restartStatus === "tenant_prep" || restartStatus === "auth_pending")
-          ? { authConfirmed: false, authCode: null, authCodeExpiry: null }
+        ...(restartStatus === "tenant_prep"
+          ? { authConfirmed: false, authCode: null, deviceCode: null, authCodeExpiry: null }
+          : {}),
+        ...(restartStatus === "mailboxes" && existing.tenantId
+          ? { authConfirmed: true, authCode: null, deviceCode: null, authCodeExpiry: null }
           : {})
       }
     });

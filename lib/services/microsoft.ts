@@ -30,6 +30,18 @@ type GraphUserResponse = {
   userPrincipalName: string;
 };
 
+function tenantFromAdminEmail(adminEmail?: string | null): string | null {
+  if (!adminEmail) return null;
+  const atIndex = adminEmail.indexOf("@");
+  if (atIndex < 0) return null;
+  const domain = adminEmail.slice(atIndex + 1).trim().toLowerCase();
+  return domain || null;
+}
+
+function resolveTenantAuthority(input: { adminEmail?: string | null; tenantId?: string | null }): string {
+  return tenantFromAdminEmail(input.adminEmail) || input.tenantId || process.env.GRAPH_TENANT_ID || "common";
+}
+
 function assertGraphConfig() {
   const clientId = process.env.GRAPH_CLIENT_ID;
   const clientSecret = process.env.GRAPH_CLIENT_SECRET;
@@ -145,7 +157,8 @@ export async function initiateDeviceAuth(tenantId: string): Promise<void> {
       where: { id: tenantId },
       select: {
         id: true,
-        tenantId: true
+        tenantId: true,
+        adminEmail: true
       }
     });
 
@@ -164,21 +177,26 @@ export async function initiateDeviceAuth(tenantId: string): Promise<void> {
 
     if (TEST_MODE) {
       console.log("🧪 TEST MODE: Skipping Microsoft Graph API call");
-      const fakeCode = `TEST-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+      const fakeUserCode = `TEST-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+      const fakeDeviceCode = `test-device-${Math.random().toString(36).slice(2)}-${Date.now()}`;
       const expiry = new Date(Date.now() + 15 * 60 * 1000);
       await prisma.tenant.update({
         where: { id: tenant.id },
         data: {
-          authCode: fakeCode,
+          authCode: fakeUserCode,
+          deviceCode: fakeDeviceCode,
           authCodeExpiry: expiry,
-          currentStep: `Enter code ${fakeCode} at https://microsoft.com/devicelogin (test mode)`
+          currentStep: `Enter code ${fakeUserCode} at https://microsoft.com/devicelogin (test mode)`
         }
       });
       return;
     }
 
     const { clientId } = assertGraphConfig();
-    const tenantIdentifier = tenant.tenantId || process.env.GRAPH_TENANT_ID || "common";
+    const tenantIdentifier = resolveTenantAuthority({
+      adminEmail: tenant.adminEmail,
+      tenantId: tenant.tenantId
+    });
 
     const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantIdentifier)}/oauth2/v2.0/devicecode`, {
       method: "POST",
@@ -200,7 +218,8 @@ export async function initiateDeviceAuth(tenantId: string): Promise<void> {
     await prisma.tenant.update({
       where: { id: tenant.id },
       data: {
-        authCode: payload.device_code,
+        authCode: payload.user_code || null,
+        deviceCode: payload.device_code,
         authCodeExpiry: expiry,
         currentStep: `Enter code ${payload.user_code || "(check portal)"} at ${payload.verification_uri || "https://microsoft.com/devicelogin"}`
       }
@@ -316,6 +335,7 @@ export async function createMailboxes(tenantId: string): Promise<void> {
           currentStep: "Completed (test mode)",
           errorMessage: null,
           authCode: null,
+          deviceCode: null,
           authCodeExpiry: null
         }
       });
@@ -360,6 +380,7 @@ export async function createMailboxes(tenantId: string): Promise<void> {
         currentStep: "Mailbox provisioning complete",
         errorMessage: null,
         authCode: null,
+        deviceCode: null,
         authCodeExpiry: null
       }
     });
@@ -392,27 +413,49 @@ export async function pollDeviceAuthToken(
 
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },
-    select: { tenantId: true }
+    select: {
+      tenantId: true,
+      adminEmail: true
+    }
   });
 
   if (!tenant) {
     throw new Error(`Tenant ${tenantId} not found`);
   }
 
-  const { clientId } = assertGraphConfig();
-  const tenantIdentifier = tenant.tenantId || process.env.GRAPH_TENANT_ID || "common";
+  const { clientId, clientSecret } = assertGraphConfig();
+  const tenantIdentifier = resolveTenantAuthority({
+    adminEmail: tenant.adminEmail,
+    tenantId: tenant.tenantId
+  });
+
+  const bodyParams = {
+    grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    client_id: clientId,
+    client_secret: clientSecret,
+    device_code: deviceCode
+  };
+
+  console.log("🔍 [Debug] Token exchange params:");
+  console.log("- Client ID:", clientId);
+  console.log("- Client secret length:", clientSecret?.length || 0);
+  console.log("- Client secret first 10 chars:", clientSecret?.substring(0, 10) || "EMPTY");
+  console.log("- Tenant domain:", tenantIdentifier);
+  console.log("- Device code length:", deviceCode?.length ?? 0);
+  console.log("🔍 [Debug] URLSearchParams keys:", Object.keys(bodyParams));
+  console.log("🔍 [Debug] URLSearchParams has client_secret:", "client_secret" in bodyParams);
 
   const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantIdentifier)}/oauth2/v2.0/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      client_id: clientId,
-      device_code: deviceCode
-    })
+    body: new URLSearchParams(bodyParams)
   });
 
   const payload = (await response.json()) as { access_token?: string; error?: string; error_description?: string };
+  console.log("🔍 [Debug] Token endpoint response:", response.status, payload.error || "ok");
+  if (payload.error_description) {
+    console.log("🔍 [Debug] Token error description:", payload.error_description);
+  }
 
   if (response.ok && payload.access_token) {
     const organizationId = await getOrganizationIdFromToken(payload.access_token);

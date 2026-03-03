@@ -52,6 +52,7 @@ model Tenant {
   zoneId            String?
   tenantId          String?
   authCode          String?
+  deviceCode        String?
   authCodeExpiry    DateTime?
   authConfirmed     Boolean      @default(false)
   setupConfirmed    Boolean      @default(false)
