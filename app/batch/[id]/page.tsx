@@ -96,6 +96,7 @@ export default function BatchPage({ params }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
+  const [retryStatusByTenant, setRetryStatusByTenant] = useState<Record<string, string>>({});
 
   const fetchBatch = useCallback(async () => {
     try {
@@ -165,9 +166,13 @@ export default function BatchPage({ params }: PageProps) {
         body: body ? JSON.stringify(body) : undefined
       });
 
-      const payload = (await response.json()) as { error?: string };
+      const payload = (await response.json()) as { error?: string; restartStatus?: string };
       if (!response.ok) {
         throw new Error(payload.error || "Action failed");
+      }
+
+      if (endpoint === "retry" && payload.restartStatus) {
+        setRetryStatusByTenant((prev) => ({ ...prev, [tenantId]: payload.restartStatus as string }));
       }
 
       await fetchBatch();
@@ -273,6 +278,9 @@ export default function BatchPage({ params }: PageProps) {
                   <p className="text-sm text-muted-foreground">
                     Progress: {tenant.progress}% • Step: {tenant.currentStep || "Waiting for next action"}
                   </p>
+                  {retryStatusByTenant[tenant.id] ? (
+                    <Badge variant="outline">Retry from: {retryStatusByTenant[tenant.id]}</Badge>
+                  ) : null}
                 </div>
 
                 {tenant.status === "auth_pending" ? (

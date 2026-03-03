@@ -114,31 +114,46 @@ async function createDnsRecords(zoneId: string, domain: string, headers: Record<
 }
 
 async function createForwardingRule(zoneId: string, domain: string, forwardingUrl: string, headers: Record<string, string>) {
-  await requestCloudflare<{ id: string }>(`/zones/${zoneId}/rulesets`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      name: `Forward ${domain}`,
-      kind: "zone",
-      phase: "http_request_dynamic_redirect",
-      rules: [
-        {
-          expression: `(http.host eq \"${domain}\") or (http.host eq \"www.${domain}\")`,
-          description: "Redirect root + www",
-          enabled: true,
-          action: "redirect",
-          action_parameters: {
-            from_value: {
-              status_code: 301,
-              target_url: {
-                value: forwardingUrl
+  try {
+    await requestCloudflare<{ id: string }>(`/zones/${zoneId}/rulesets`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        name: `Forward ${domain}`,
+        kind: "zone",
+        phase: "http_request_dynamic_redirect",
+        rules: [
+          {
+            expression: `(http.host eq \"${domain}\") or (http.host eq \"www.${domain}\")`,
+            description: "Redirect root + www",
+            enabled: true,
+            action: "redirect",
+            action_parameters: {
+              from_value: {
+                status_code: 301,
+                target_url: {
+                  value: forwardingUrl
+                }
               }
             }
           }
-        }
-      ]
-    })
-  });
+        ]
+      })
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isRulesetLimitError =
+      message.includes("not a valid value for kind") &&
+      message.includes("exceeded maximum number of zone rulesets") &&
+      message.includes("http_request_dynamic_redirect");
+
+    if (isRulesetLimitError) {
+      console.log("⚠️ [Cloudflare] Skipping forwarding ruleset: max dynamic redirect rulesets already reached");
+      return;
+    }
+
+    throw error;
+  }
 }
 
 export async function setupCloudflare(tenantId: string): Promise<void> {

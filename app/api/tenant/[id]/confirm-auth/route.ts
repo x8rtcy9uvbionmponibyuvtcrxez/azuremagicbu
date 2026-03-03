@@ -46,9 +46,9 @@ export async function POST(request: Request, { params }: Params) {
       return NextResponse.json({ error: "No device code available for this tenant" }, { status: 400 });
     }
 
-    const verified = await pollDeviceAuthToken(tenant.id, tenant.authCode);
+    const verification = await pollDeviceAuthToken(tenant.id, tenant.authCode);
 
-    if (!verified) {
+    if (!verification.verified) {
       return NextResponse.json(
         { error: "Authorization still pending. Complete device login and try again." },
         { status: 409 }
@@ -59,6 +59,8 @@ export async function POST(request: Request, { params }: Params) {
       where: { id: tenant.id },
       data: {
         authConfirmed: true,
+        tenantId: verification.organizationId || undefined,
+        status: "mailboxes",
         currentStep: "Auth confirmed. Continuing mailbox setup...",
         progress: 68
       }

@@ -57,14 +57,22 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     return { state: "batch-terminal" };
   }
 
-  let tenant = await prisma.tenant.findUnique({
-    where: { id: tenantId },
-    select: {
-      id: true,
-      status: true,
-      authConfirmed: true
-    }
-  });
+  const loadTenant = () =>
+    prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: {
+        id: true,
+        tenantName: true,
+        status: true,
+        zoneId: true,
+        tenantId: true,
+        authCode: true,
+        authConfirmed: true,
+        csvUrl: true
+      }
+    });
+
+  let tenant = await loadTenant();
 
   if (!tenant) {
     throw new Error(`Tenant ${tenantId} not found`);
@@ -75,53 +83,52 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     return { state: tenant.status };
   }
 
-  if (tenant.status === "queued") {
+  if (!tenant.zoneId) {
     await setupCloudflare(tenant.id);
     console.log("✅ [Worker] Cloudflare complete");
-    tenant = await prisma.tenant.findUnique({
-      where: { id: tenant.id },
-      select: { id: true, status: true, authConfirmed: true }
-    });
+    tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
       return { state: "failed" };
     }
+  } else {
+    console.log(`✓ [Worker] Cloudflare already complete for ${tenant.tenantName}, skipping`);
   }
 
-  if (tenant.status === "cloudflare") {
+  if (!tenant.tenantId && !tenant.authCode && !tenant.authConfirmed) {
     await setupTenantPrep(tenant.id);
     console.log("✅ [Worker] Tenant prep complete");
-    tenant = await prisma.tenant.findUnique({
-      where: { id: tenant.id },
-      select: { id: true, status: true, authConfirmed: true }
-    });
+    tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
       return { state: "failed" };
     }
+  } else {
+    console.log(`✓ [Worker] Tenant prep already complete or auth started for ${tenant.tenantName}, skipping`);
   }
 
-  if (tenant.status === "tenant_prep") {
+  if (!tenant.authConfirmed && !tenant.authCode) {
     await initiateDeviceAuth(tenant.id);
     console.log("✅ [Worker] Device auth initiated");
-    tenant = await prisma.tenant.findUnique({
-      where: { id: tenant.id },
-      select: { id: true, status: true, authConfirmed: true }
-    });
+    tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
       return { state: "failed" };
     }
+  } else if (!tenant.authConfirmed) {
+    console.log(`✓ [Worker] Waiting for auth confirmation for ${tenant.tenantName}`);
   }
 
-  if (tenant.status === "auth_pending" && !tenant.authConfirmed) {
+  if (!tenant.authConfirmed) {
     await updateBatchStatus(batchId);
     return { state: "waiting_for_auth_confirmation" };
   }
 
-  if ((tenant.status === "auth_pending" && tenant.authConfirmed) || tenant.status === "mailboxes") {
+  if (!tenant.csvUrl && tenant.status !== "completed") {
     await createMailboxes(tenant.id);
     console.log("✅ [Worker] Mailboxes complete");
+  } else {
+    console.log(`✓ [Worker] Mailboxes already complete for ${tenant.tenantName}, skipping`);
   }
 
   await updateBatchStatus(batchId);

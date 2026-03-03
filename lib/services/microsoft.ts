@@ -115,43 +115,17 @@ export async function setupTenantPrep(tenantId: string): Promise<void> {
       data: {
         status: "tenant_prep",
         progress: 55,
-        currentStep: "Requesting organization details"
+        currentStep: "Ready for authentication"
       }
     });
 
     if (TEST_MODE) {
       console.log("🧪 TEST MODE: Skipping Microsoft Graph API call");
-      await sleep(1000);
-      await prisma.tenant.update({
-        where: { id: tenant.id },
-        data: {
-          tenantId: `test-tenant-${Math.random().toString(36).slice(2, 11)}`,
-          progress: 60,
-          currentStep: "Tenant prep complete (test mode)"
-        }
-      });
+      await sleep(300);
       return;
     }
 
-    const tenantIdentifier = tenant.tenantId || process.env.GRAPH_TENANT_ID || "common";
-    console.log("🔄 [Microsoft] Getting token");
-    const token = await requestGraphToken(tenantIdentifier);
-
-    const org = await graphRequest<{ value: Array<{ id: string }> }>(token, "/organization");
-    const orgId = org.value?.[0]?.id;
-
-    if (!orgId) {
-      throw new Error("No organization ID returned by Graph");
-    }
-
-    await prisma.tenant.update({
-      where: { id: tenant.id },
-      data: {
-        tenantId: orgId,
-        progress: 60,
-        currentStep: "Tenant prep complete"
-      }
-    });
+    console.log("🔄 [Microsoft] Tenant prep - skipping token, will use device auth");
   } catch (error) {
     await prisma.tenant.update({
       where: { id: tenantId },
@@ -402,10 +376,18 @@ export async function createMailboxes(tenantId: string): Promise<void> {
   }
 }
 
-export async function pollDeviceAuthToken(tenantId: string, deviceCode: string): Promise<boolean> {
+async function getOrganizationIdFromToken(accessToken: string): Promise<string | null> {
+  const org = await graphRequest<{ value: Array<{ id: string }> }>(accessToken, "/organization");
+  return org.value?.[0]?.id || null;
+}
+
+export async function pollDeviceAuthToken(
+  tenantId: string,
+  deviceCode: string
+): Promise<{ verified: boolean; organizationId: string | null }> {
   if (TEST_MODE) {
     console.log("🧪 TEST MODE: Skipping Microsoft Graph API call");
-    return true;
+    return { verified: true, organizationId: `test-tenant-${Math.random().toString(36).slice(2, 11)}` };
   }
 
   const tenant = await prisma.tenant.findUnique({
@@ -433,11 +415,12 @@ export async function pollDeviceAuthToken(tenantId: string, deviceCode: string):
   const payload = (await response.json()) as { access_token?: string; error?: string; error_description?: string };
 
   if (response.ok && payload.access_token) {
-    return true;
+    const organizationId = await getOrganizationIdFromToken(payload.access_token);
+    return { verified: true, organizationId };
   }
 
   if (payload.error === "authorization_pending" || payload.error === "slow_down") {
-    return false;
+    return { verified: false, organizationId: null };
   }
 
   throw new Error(payload.error_description || payload.error || "Device auth verification failed");
