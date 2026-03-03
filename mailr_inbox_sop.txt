@@ -1,0 +1,695 @@
+Tab 1
+This SOP goes through the entire process for setting up cold email infrastructure with 99 inboxes on 1 domain, from setting up tenants to connecting inboxes to your sender and configuring warmup.
+
+Table of contents:
+Overview
+SOP overview:
+The loophole:
+Deliverability
+Costs
+Limits & Considerations
+One-time setup
+Tenant provider:
+Airtable Setup:
+Cloudflare Setup:
+RDP Setup:
+Purchasing your RDP/s:
+Connecting to your RDP/s:
+RDP Setup (Powershell):
+2. Search for powershell -> right click -> â€˜Run as administratorâ€™ -> pin it to the taskbar (youâ€™ll be using it a lot)
+RDP Setup (Python, chrome & chromedriver) - paste these links in the edge browser in the RDP:
+a. Open Command Prompt
+RDP Setup (API Keys):
+Azure app setup:
+Setup process:
+Tenant Setup
+Stage 1: Gathering tenant info:
+Business name and person name generation:
+Domain:
+Finding real addresses:
+Combining tenant information:
+Stage 2: Creating tenants - License selection:
+Stage 3: Prepping tenants for use:
+Mailbox Setup
+Stage 1: Setting up the domains
+Stage 2: Adding the domain to the tenant
+Stage 3: Creating and configuring the inboxes
+Connecting to your sequencer
+Download uploaders to RDP: Uploaders
+Connecting to Smartlead:
+Connecting to Instantly:
+Instantly warmup:
+Connecting to EmailBison:
+Connecting to plusvibe:
+
+
+SOP overview:
+
+	1	One time setup
+	1	Installation steps for all of the tools and systems required
+	2	Tenant creation and prep
+	3	Domain setup
+	1	Configuring DNS records
+	2	Adding domains to tenants
+	4	Mailbox creation
+	5	Connecting to your sender
+	6	Configuring warmup
+
+The loophole:
+
+Thereâ€™s a big misconception that these inboxes are special in one way or another.
+
+Words like â€œenterpriseâ€ or â€œazureâ€ get thrown around.
+
+But theyâ€™re simply just Outlook shared mailboxes.
+
+Shared mailboxes are essentially standard outlook mailboxes, just with limited functionality. Meaning theyâ€™re only purpose is to send and receive emails.
+
+Theyâ€™re primary use case is for collaborative accounts like info@ or support@ inboxes, but the key loophole is you can actually assign passwords to these mailboxes which allows you to connect them to your sender to send and receive emails.
+
+And most importantly, they DON'T need a paid license/subscription to send and receive emails.
+
+So you only need to pay $4.50/m for 1 Exchange Online license -> assign it to 1 regular user mailbox and use the other 99 inboxes for â€œfreeâ€.
+
+But the tricky part, is being able to setup working infrastructure without running into major issues or getting flagged with Microsoft.
+
+The system is essentially a puzzle, where every piece is crucial and without one - the whole system breaks.
+
+Note on â€œAzure inboxesâ€:
+
+These are NOT â€˜Azure Inboxesâ€™. Thereâ€™s technically no such thing as Azure Inboxes.
+
+Azure is simply a hosting provider owned by Microsoft.
+
+What you would consider azure inboxes are rare, and are actually just private SMTP servers hosted on azure with a custom email server hosted on it.
+
+Thatâ€™s an entirely different system to this one.
+
+Deliverability
+
+Deliverability in terms of infrastructure (not including email copy or other little factors) comes down to 2 things:
+
+	1	Domain health/reputation
+	2	Server health/reputation
+
+Health or reputation essentially means - how do other major ESPs such as Google or Microsoft view my domain or server? Do they recognise it as spam or safe?
+
+Good health = Google, Microsoft etc. donâ€™t view your domain or server as spam.
+
+And vice versa
+
+So when it comes to these inboxes (and Google) your only consideration is domain health.
+
+Because Google and Microsoft have such a major infrastructure thatâ€™s used by majority of the population, that their servers are essentially â€œbulletproofâ€ and cannot have a bad reputation.
+
+Thatâ€™s what gives Google and Microsoft inboxes a massive leg up over private SMTP inboxes.
+
+Therefore if deliverability is poor, and all other factors are considered - itâ€™s likely your domain health.
+
+Costs
+
+~$4.50/m per license = 1 domain & tenant x 99 inboxes
+
+Limits & Considerations
+
+As you already know, Microsoft does not like people misusing their platform. Which is why you need to take measures to ensure you donâ€™t get flagged.
+
+There are limits.
+
+	1	Tenant sending threshold:
+	1	Every new tenant has a â€œhidden sending limitâ€ which is around 2,000 emails/day (across ALL inboxes). This includes cold emails, warmup emails and warmup replies.
+	2	This is the reasoning behind the warmup and sending settings we recommend.
+	2	Never have inboxes warming up on more than 1 platform at a time.
+	1	For example if you had inboxes connected to instantly and emailbison, with warmup enabled in both that would be a big NO NO.
+	3	New tenants have a 3 day â€œwarmup periodâ€.
+	1	Another hidden limit from Microsoft. Within three days of setting up a tenant, if you attempt to connect inboxes to a sender -> and send an email, youâ€™ll likely hit an IP error.
+	2	You simply just need to wait out the 3 days and it will resolve itself.
+
+Risk Mitigation (IMPORTANT)
+
+	1	Random licenses:
+For every 10 - 20 tenants you, set up 1 - 2 with random licenses other than just Exchange Online Plan 1.
+
+These can be any licenses, but the point is to show youâ€™re not just solely subscribing to the cheapest product that allows you to send emails - this screams spam.
+
+	2	Spread across tenant providers:
+
+All of your tenants should be spread across at least 2 tenant providers. For example if you need 100 tenants - setup 50 on Intermedia and 50 on Sherweb.
+
+Donâ€™t just stick to Intermedia and Sherweb however, there are plenty more CSPs.
+
+One-time setup
+
+The following steps take you through setting up the tools and systems necessary to build your infrastructure. They only require a one-time setup and will just need to be maintained with any future updates or if something breaks.
+
+
+Tenant provider:
+
+A tenant provider (or CSP) is a third party platform that allows you to purchase and set up a high volume of tenants without dealing with major billing headaches that come with buying licenses directly from Microsoft.
+
+Why you need it:
+
+Youâ€™ll likely be setting up a high number of tenants, so going through Microsoft's direct signupÂ can be cumbersome and have greater risk of your tenant/s getting banned.
+
+Unfortunately, getting setup with these CSPs is not as easy as signing up and entering your credit card.
+
+These providers allow you to sign up without going through Microsoftâ€™s painful reseller sign up process:
+	•	Sherweb
+	•	Select white-label option during registration
+	•	Will likely require govt ID
+	•	Intermedia
+	•	We can provide a referral signup link
+
+There is also Pax8, however they require you to get verified with Microsoft first.
+
+Itâ€™s important to understand the risks that come with using these 3rd parties as they can ban your entire partner account (and the tenants with it) at any point.
+
+Although if youâ€™re setting up a small volume of tenants (100 - 200) then youâ€™re in a safe range.
+
+Best practice would be to use multiple LLCs, phone numbers, credit cards and aliases across platforms to manage risk.
+
+Airtable Setup:
+
+Airtable will serve as the central hub for this entire operation. Itâ€™s where youâ€™ll store and track all domains, tenants and credentials.
+
+Why you need it:
+
+When managing dozens of domains and thousands of inboxes, you need a centralized system to track credentials, domain status, and configuration details.
+
+Without Airtable, you would need to manually record this information in messy spreadsheets and manually update scripts with credentials every time you want to create inboxes.
+
+Airtable's API integration allows scripts to automatically retrieve the correct credentials for each domain, update status fields when tasks complete, and store important information like Tenant IDs and Cloudflare Zone IDs for future reference.
+
+￼
+To setup your airtable base:
+
+	1	Go to this base and copy it: https://airtable.com/appoPANBCcRbzQdSm/shrfVvhZMsr7Q7qbr
+	2	Go to the following link and create aÂ personal access token:
+
+https://airtable.com/create/tokens
+
+	1	Give it any name, and add the following scopes:
+	•	data.records:read
+	•	data.records:write
+	•	Schema.bases:read
+Â Â Â Â Â Â Â Â 
+	2	Click â€˜Add a baseâ€™ and select the base you just copied, which should have the name â€˜Tenantsâ€™
+
+	3	Click create token and COPY IT (you wont see it again) - then store the API Key for later.
+
+	3	Go back to https://airtable.com/Â and open the base:
+￼
+	4	Copy the base ID from the URL and store it for later. Itâ€™s the ID that starts with â€˜appâ€™ and will look something like â€˜appoLVNcCcObzFdVmâ€™:
+
+￼
+
+
+
+Cloudflare Setup:
+
+Cloudflare will be the platform where you host all of your domains, to allow you to easily manage all of the DNS records and redirects automatically.
+
+What it does:
+
+Cloudflare hosts all the DNS records for your domains, including MX records for email delivery, SPF/DKIM/DMARC records for email authentication, and A records for website forwarding.
+
+The automation scripts communicate directly with Cloudflare's API to automatically configure all these DNS settings when you add a new domain.
+
+Why you need it:
+
+Manually configuring DNS records for every domain would take hours. Cloudflare's API allows the scripts to automatically create all necessary DNS records in seconds. Additionally, Cloudflare provides website forwarding so your domains can redirect to any URL you choose.
+
+	1	Sign up at: https://dash.cloudflare.com/sign-up
+	2	Skip the onboarding and go straight to: https://dash.cloudflare.com/profile/api-tokens
+	3	Click View for Global API Key, verify your email then copy the key and store it for later.
+￼
+
+
+
+
+RDP Setup:
+
+RDPs (Remote Desktop Protocol) are virtual Windows computers hosted in data centers that you can connect to remotely from your own device. Think of it as renting a computer in the cloud that runs 24/7.
+
+What it does:
+
+An RDP provides a clean, dedicated Windows environment where you can run all the automation scripts without affecting your personal computer. It acts as the "command center" where all domain and inbox creation happens.
+
+Why you need it:
+
+Microsoft monitors login patterns and device fingerprints. If you create dozens of Microsoft 365 tenants from your personal computer or home network, Microsoft will flag your activity as suspicious and potentially ban your accounts.
+
+RDPs provide a consistent, US-based IP address and clean device
+fingerprint that keeps Microsoft from detecting automation patterns. Additionally, RDPs allow the scripts to run continuously without keeping your personal computer on.
+
+RDPs can be rented on a subscription from a bunch of hosting providers, but we recommend ContaboÂ as they give you the best bang for your buck.
+
+Purchasing your RDP/s:
+	1	Go to https://contabo.com/en-us/windows-servers-vps/Â and select Cloud VPS 20 - Windows Server
+	2	Select subscription term
+	3	Under Region, select America -> United States (Central)
+	4	Leave everything else default but be sure Image is set to Windows Server
+	5	Generate a password and STORE IT SOMEWHERE SAFE (you wonâ€™t be able to see it again)
+	6	Fill out the rest of the information and complete payment
+
+Once the RDP is ready, youâ€™ll get an email that looks like this. Note the IP Address.
+
+￼
+
+Connecting to your RDP/s:
+	•	How to connect to RDP from Mac: How to Remote Desktop from Mac to Windows
+
+	•	How to connect to RDP from Windows: How to Access Windows VPS Server via RDP
+
+Note: The email says username is â€˜rootâ€™ - but itâ€™s actually â€˜Administratorâ€™
+
+
+
+
+RDP Setup (Powershell):
+
+Powershell is the main application that makes this system possible. It manages the entire domain and inbox setup process.
+
+What it does:
+
+PowerShell runs all the automation scripts that create Microsoft 365 tenants, add domains, create users, set up mailboxes, configure passwords, and manage permissions.
+
+It connects directly to Microsoft's cloud services through special modules (ExchangeOnlineManagement and Microsoft.Graph) that give it the ability to perform administrative tasks programmatically.
+
+Why you need it:
+
+Creating 99 inboxes manually through Microsoft's web interface would take 6-8 hours per domain and be extremely error-prone. PowerShell scripts automate this entire process down to 30 minutes per domain with zero manual clicking.
+
+How it works:
+
+We provide you with pre-written PowerShell scripts (files ending in .ps1) that contain sequences of commands. When you run a script, PowerShell executes each command in order: connecting to Microsoft 365, authenticating with your Azure App credentials, creating mailboxes, setting passwords, updating DNS records through Python helper scripts, and tracking progress in Airtable.
+
+The scripts handle all the complex API calls, error handling, and retry logic automatically. You simply run the script, provide the domain name when prompted, and PowerShell does all the work.
+
+
+	1	Open this drive link in microsoft edge, and download and extract the folder to the desktop in the RDP:
+Powershell-Scripts
+
+	2	Search for powershell -> right click -> â€˜Run as administratorâ€™Â -> pin it to the taskbar (youâ€™ll be using it a lot)
+
+￼
+
+	3	Copy and paste these commands one by one into powershell and hit enter for each command:
+	1	cd "C:\Users\Administrator\Desktop\Powershell-Scripts"
+	2	.\INSTALL_GRAPH_2.25.0.ps1 (this script installs the necessary Microsoft Graph modules)
+	1	Type â€˜Yâ€™ and hit enter:
+ ￼
+	3	.\INSTALL_EXCHANGE_3.7.1.ps1
+
+￼
+
+
+
+
+
+
+ RDP Setup (Python, chrome & chromedriver) - paste these links in the edge browser in the RDP:
+
+The following steps are to install the necessary programs for running the sequencer upload scripts.
+
+	1	Download chrome:Â https://storage.googleapis.com/chrome-for-testing-public/143.0.7499.169/win64/chrome-win64.zip
+	1	Open the zip file and click Extract All:
+ ￼
+	2	Extract to downloads:
+ ￼
+	3	Open the extracted folder from downloads:
+ ￼
+	4	Open the chrome app from the extracted folder and pin to taskbar:
+ ￼
+	2	Download chromedriver (chromedriver is the tool that automates the inbox connection process): https://storage.googleapis.com/chrome-for-testing-public/143.0.7499.169/win64/chromedriver-win64.zip
+	3	Install Python:
+	1	Download link: https://drive.google.com/file/d/18pFP7NmUmVKpmx1s-3Z13RZUh3IyXKKF/view?usp=drive_link
+	2	Right click and â€˜Run as administratorâ€™
+￼
+
+	3	CHECK -> â€˜Add python.exe to PATHâ€™ -> Install now:
+ ￼
+	4	Open the chromedriver-win64.zip folder and copy the application:
+￼
+	5	Search for following folder and open it:  C:\Users\Administrator\AppData\Local\Programs\Python\Python313-32
+ ￼
+
+	6	Paste the chromedriver application:
+ ￼
+	4	Install python packages:
+	1	Open Command Prompt
+￼
+	2	Paste this command and hit enter: Â Â Â Â Â Â Â Â pip install requests selenium colorama dotenv tqdm
+￼
+	3	Paste this entire command and hit enter:
+python -m pip install --upgrade --extra-index-url https://PySimpleGUI.net/install PySimpleGUI
+
+	4	Paste this command and hit enter: cd "C:\Users\Administrator\Desktop\Powershell-Scripts"
+￼
+
+
+RDP Setup (API Keys):
+
+	1	Paste this command and hit enter:
+ python fill_credentials.py
+
+	2	Enter the credentials you saved before:
+
+￼
+
+
+Azure app setup:
+
+The Azure App (also called App Registration or Service Principal) is the authentication bridge that allows the PowerShell scripts to automatically connect with your Microsoft 365 tenants without manual login.
+
+What it does:
+	•	Acts as a "robot user" that can manage domains, users, and mailboxes across all your Microsoft 365 tenants
+	•	Provides the scripts with permission to perform actions like adding domains, creating users, updating passwords, and managing mailboxes
+	•	Uses API credentials (Client ID and Client Secret) instead of requiring you to manually log in each time
+
+Why you need it:
+Without the Azure App, you would have to manually log into each tenant every single time you want to create mailboxes or manage domains. The Azure App enables complete automation by giving the scripts the necessary permissions to work on your behalf.
+
+How it works:
+	1	You create one Azure App in your main Microsoft account
+	2	The scripts use the App's credentials (Client ID: 35bda794-fd06-4e53-b935-26170f9eb12e and Client Secret) to authenticate
+	3	This App is granted specific permissions to manage Microsoft 365 resources via Microsoft Graph API
+	4	The same App credentials work across all your tenants, making the process scalable
+
+Setup process:
+
+Create application:
+	1	Sign up at portal.azure.comÂ with any email you have
+	2	Click + New registration
+	3	Fill in:
+	1	Name (can be anything): automation-app
+	2	Supported account types:
+	1	Accounts in any organizational directory (Any Azure AD directory - Multitenant)
+	3	Redirect URI: Leave blank
+	4	Click Register
+	5	Note theÂ Application (client) ID
+	1	After creation, you'll see:
+Application (client) ID: e.g., 35bda794-fd06-4e53-b935-26170f9eb12e
+
+Create Client Secret:
+	1	In the app registration, go to Certificates & secrets
+	2	Click + New client secret
+	3	Fill in:
+	1	Description: Leave empty
+	2	Expires: 24 months (or custom)
+	4	Click Add
+	1	COPY THE SECRET VALUE IMMEDIATELYÂ (you can't see it again!)
+Example: PIL8V~_K1jNqETttXDseP.jymkwNLoK93jfcNKcyq
+
+Configure API Permissions:
+	1	Go to API permissions
+	2	Click + Add a permission
+	3	Select Microsoft Graph
+	4	Select Application permissions (not Delegated)
+
+Â  Â Â Â Â Â Â Â Â Required ApplicationÂ Permissions:
+
+Â Â Â Â Â Â Â Â Â Add all of these:
+
+	•	Directory.ReadWrite.All
+	•	Domain.ReadWrite.All
+	•	Group.Read.All
+	•	User.Read (Default)
+	•	User.Read.All
+
+
+Tenant Setup
+
+The entire tenant setup process can be broken down into 3 stages:
+
+	1	Gathering tenant info (creating business names, addresses etc.)
+
+	2	Creating tenants (creating tenants through your CSP)
+
+	3	Prepping tenants (preparing the tenants for use - MUST BE DONE WITHIN 24 HOURS OF TENANT CREATION)
+
+Stage 1: Gathering tenant info:
+
+Creating tenants requires semi-legitimate business information. Microsoft requires the following:
+	•	Business name
+	•	REAL and verifiable address
+	•	Phone number
+	•	Contact person name
+	•	Domain
+
+Business name and person name generation:
+
+For business namesÂ and person namesÂ we created a claude project to generate names for us with the following project instructions:
+You have 2 jobs:
+
+1. Generating batches of completely unique business names, that sound like real companies BUT are not real companies.
+
+They should sound like real legacy industries, like manufacturing, finance, medicine, logistics, insurance etc.
+
+Avoid using made up words to sound tech fancy
+
+There should be no duplicates to those business names provided in the files or in lists provided.
+
+2. Generating unique person names, first and last name across all cultures.
+
+There should be no duplicates to those names provided in the files or in lists provided.
+
+Ensure there are absolutely no '-' characters in the names or any special characters of any kind
+
+Then I just open a chat in the project with the following prompts:
+
+Business names:
+please generate 50 more business names. ensuring there are no duplicates with those in the files and the previous 20 generated
+
+dont just generate names with 3 words. some should have 2, or 3 or even 4
+
+Person names:  generate 50 unique person names in CSV format ensuring there are no duplicates with those in the names list in files and the 20 previously generated   And absolutely no '-' characters in the names or any special characters of any kind
+
+
+Domain:
+
+Microsoft requires a default â€˜domainâ€™ during tenant creation. This isÂ NOT the custom sending domain youâ€™ll use in your outreach.
+
+Itâ€™s just a default domain that comes before â€˜.onmicrosft.comâ€™ (default microsoft domain) like â€˜emberlandingstudio.onmicrosoft.comâ€™
+
+It can be absolutely anything, but it MUST be unique as duplicates will fail during the creation process.
+
+We like to take the contact name and use that.
+
+
+Finding real addresses:
+
+For addresses, itâ€™s crucial you use real addresses as Microsoft verifies each one during the tenant creation process. You can download databases of real addresses in the US, just ask ChatGPT or any LLM to point you in the right direction.
+
+
+Combining tenant information:
+
+Combine all of the information, business names, person names and addresses into a spreadsheet so you can keep track of all of them and wont have duplicates.
+
+See this example:
+Tenant Info Example
+
+Assign each tenant a unique â€˜Tenant Nameâ€™ to help with tracking. We just use the letters â€˜TN-â€™ combined with a number. This is DIFFERENT to the business name.
+
+Do NOT copy this ^^ format as itâ€™s possible your CSP may flag the same format across partner accounts.
+
+
+Stage 2: Creating tenants - License selection:
+
+The tenant creation process will be slightly different depending on which CSP you go through, but for the most part they all have the same foundational process.
+
+	1	Each platform is different, however some may require you to enter either a Tenant Name or Business Name first.
+	1	IMPORTANT: You must be able to distinguish between â€˜Organization/Business nameâ€™ and â€˜Tenant nameâ€™ during the tenant creation process.
+	2	Enter business information, names, addresses etc. (Screenshot from Sherweb)
+￼
+	3	CRUCIAL STEP: At some point during the tenant creation process youâ€™ll have to select a microsoft license. The only license you need is Exchange Online (Plan 1 - NCE) x 1 This costs less than $5 per tenant and you only need 1 per tenant.
+￼
+
+	4	Submit the order and your CSP should send you an automated email within 2 - 10 minutes with the admin logins.
+	5	Import your tenants into airtable with the tenant name, admin credentials, domain and inbox names (first and last names, separated by commas):
+￼
+Stage 3: Prepping tenants for use:
+
+This stage is crucial as it prepares the tenant with the necessary app permissions for the following inbox and domain setup steps, as well as disabling 2FA so you can log back into the tenant anytime without needing a 2FA code.
+
+This MUSTÂ be done within 24 hours of tenant creation, as after 24 hours youâ€™ll be required to set up 2FA.
+
+Repeat for each tenant
+
+	1	Open the RDP and open an incognito edge browser
+	2	Navigate to admin.microsoft.com
+	3	Login with the provided admin credentials, and enter a new password. We always just add â€˜123â€™ at the end of the current password.  IMPORTANT:
+ Itâ€™s crucial you update the password column inside of airtable, otherwise the rest of the process will not work.
+
+￼
+
+	4	Once youâ€™ve logged in and reset the password, open powershell and cd into the Powershell-Scripts folder with:  cd "C:\Users\Administrator\Desktop\Powershell-Scripts"
+	5	Run the following script:  .\tenant_prep.ps1
+	1	Enter the tenant name.
+	2	Youâ€™ll get prompted with a code.
+
+(screenshot says â€˜.\disable_2fa.ps1â€™ - that was the old script name)
+￼
+
+	6	In the same edge window, go to https://microsoft.com/devicelogin and paste the code
+
+￼
+
+	7	Check the box â€˜Consent on behalf of your organisationâ€™Â -> Click Accept
+
+￼
+
+	8	The script will now run itself, and keep you updated along the way. This column â€˜Tenant IDâ€™ will populate once it is complete.
+
+￼
+
+	9	Repeat this process for all tenants created.
+
+
+
+Mailbox Setup
+The entire mailbox setup process can be broken down into 3 stages:
+
+	1	Setting up the domains (adding to cloudflare, automated DNS setup etc.)
+	2	Adding the domains to the tenant
+	3	Creating and configuring the inboxes
+Each stage must be repeated every time you want to spin up new mailboxes.
+Stage 1: Setting up the domains
+
+By this point you should have already imported your tenants into airtable along with their assigned domains, forwarding URLs and inbox names.
+
+Important considerations:
+
+Each domain must be unique for each tenant. The forwarding URL must include â€˜https://â€™ in order for it work properly, like - https://mailr.io
+
+	1	Open command promptÂ inside the RDP, paste this command and hit enter:
+
+cd "C:\Users\Administrator\Desktop\Powershell-Scriptsâ€
+
+	2	Paste this command and hit enter (you can also run this script on your own desktop as weâ€™re only working with cloudflare and airtable):
+
+Â Â Â Â Â Â Â Â python addzone_airtable.py
+
+This script will search airtable for all domains that have empty Nameservers -> add them to Cloudflare -> update the nameservers in airtable -> and configure most of the DNS records.
+
+￼ ￼
+Youâ€™ll need to run this script anytime you add new domains to airtable.
+
+Ultimately, you can customise these automations in any way you want to make it even more streamlined.
+
+For example, our user dashboard would automatically add each domain that users order to cloudflare and return the nameservers.
+
+	3	Update the nameservers in your registrar, then the domains should become active in Cloudflare within 5 - 15 minutes.
+Â Â Â Â Â Â Â Â 
+Just open Cloudflare and you can search for your domain/s to check if theyâ€™re active.
+￼
+
+	4	Once the domains are active, and there were no issues with configuration you can proceed to Stage 2Â - adding the domain to the tenant.
+
+
+Stage 2: Adding the domain to the tenant
+
+At the moment, youâ€™ll have to go through these steps for each domain you want to setup.
+
+This stage involves adding the domain to the assigned tenant.
+
+Itâ€™s almost entirely automated, and will also create the licensed user.
+
+	1	Open the Powershell-Scripts folder and double launch_script1 to open the interface
+
+￼
+
+	2	Enter the tenant name into the interface and click run
+￼
+Â Â Â Â Â Â Â Â 
+This will automatically open a powershell window and start processing the domain by adding it to the tenant, and creating the licensed user.
+
+If you see DKIM errors, donâ€™t worry weâ€™ll come back to that.
+￼
+
+	3	Not required, but you can login to the tenant at https://admin.cloud.microsoft/?#/DomainsÂ to verify the domain was added and set to Default.  It will likely say â€˜Incomplete setupâ€™ which is completely normal and not an issue - the domain will still function as normal with proper DNS records.
+￼
+
+Youâ€™ll also see in https://admin.cloud.microsoft/?#/usersÂ thereâ€™s now 1 active user under the domain, with the Exchange Online license. It will have whatever name under Alias in airtable.
+￼
+
+
+This concludes Stage 2, and you can immediately move onto Stage 3 if there are no issues.
+
+Stage 3: Creating and configuring the inboxes
+
+This stage will automatically create all 99 inboxes, using the the names in the â€˜Inbox Namesâ€™ column in airtable.
+
+	1	In the same Powershell window (not crucial to remain in the same window), run this script:  .\mailbox_setup  Enter the tenant name when prompted. It will start by retrieving the data from airtable -> then generate a CSV with all 99 inbox variations and passwords.  The CSV can be found in the CSVâ€™s folder on the desktop.
+	2	Drag and drop the CSV from the CSVâ€™s folder into Powershell and it will add the CSV file path automatically -> then hit enter.
+￼
+
+
+	3	Once you hit enter the script will start running and look like this:
+
+￼
+
+The script will now proceed to run by itself for around 20 minutes. You donâ€™t have to do anything from this point onwards, and can proceed to the next steps once itâ€™s complete - uploading the accounts.
+
+
+Connecting to your sequencer
+
+This is the final step, and is very straightforward as long as there were no hiccups in the mailbox setup process.
+
+Microsoft requires every single mailbox to be signed in 1 by 1 to your sequencer. Thereâ€™s no native way to bulk upload accounts like you have done before with custom SMTP accounts.
+
+This is why weâ€™ve built custom upload tools to automate this process for the main sending platforms - Instantly & Smartlead, EmailBison and plusvibe provide their own upload tool.
+
+Download uploaders to RDP: Uploaders
+
+IMPORTANT: only run the upload scripts within your RDP/s
+
+Connecting to Smartlead:
+
+	1	Open smartlead-uploader and double click launcher
+	2	This will open the Smartlead uploader. Enter the API Key and OAuth URL
+
+￼
+	3	Select the CSVs you want to upload from the CSVâ€™s folder (as many as you need) -> then hit run
+	4	The script will connect each account 1 by 1 and update you along the way -> then configure warmup once completed.
+
+
+Connecting to Instantly:
+
+	1	There are 2 instantly uploaders.  If your account only has 1 workspace, use the single workspace uploader as it will run behind the scenes without visible browsers.  If your account has multiple workspaces you will need to use the multi workspace uploader and specific which workspace to upload to.
+
+￼
+	2	Enter your API key, (V1 or V2, be sure to check the correct version option) login email and password.
+￼
+
+	3	Select the CSVs you want to upload from the CSVâ€™s folder (as many as you need) -> then hit run
+	4	The script will connect each account 1 by 1 and update you along the way 
+Instantly warmup:
+This script will configure all of the warmup settings and enable warmup.
+
+	1	Open instantly-setup in the uploaders folder
+	2	Enter BOTH V1 AND V2 API Keys
+
+￼
+
+	3	Select all of the CSVs you want to process
+	4	Click process files
+
+
+Connecting to EmailBison:
+
+EmailBison offers their own bulk upload tool which has all of the necessary functionality.
+
+Follow the documentation on their page: https://docs.emailbison.com/email-accounts/bulk-uploader-tool
+
+Note: You may need to update the CSV header names to use this uploader, and youâ€™ll have to combine the CSVâ€™s in order to upload multiple files.
+
+For this you can use this script: https://drive.google.com/file/d/1mYCnvbAMGX_6omxqc54nvT5MYdj4J9Rj/view?usp=sharing
+
+
+Connecting to plusvibe:
+
+Plusvibe also offers their own bulk upload tool, which you can find at: https://user.plusvibe.ai/
+
+
+

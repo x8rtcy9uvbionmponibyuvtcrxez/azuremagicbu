@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BatchStatus {
+  uploading
+  processing
+  completed
+  failed
+}
+
+enum TenantStatus {
+  queued
+  cloudflare
+  tenant_prep
+  auth_pending
+  mailboxes
+  completed
+  failed
+}
+
+model Batch {
+  id             String      @id @default(cuid())
+  status         BatchStatus @default(uploading)
+  totalCount     Int
+  completedCount Int         @default(0)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  tenants Tenant[]
+}
+
+model Tenant {
+  id                String       @id @default(cuid())
+  batchId           String
+  tenantName        String
+  adminEmail        String
+  adminPassword     String
+  encryptionVersion Int          @default(1)
+  domain            String
+  inboxNames        Json
+  inboxCount        Int          @default(99)
+  forwardingUrl     String
+  status            TenantStatus @default(queued)
+  progress          Int          @default(0)
+  currentStep       String?
+  zoneId            String?
+  tenantId          String?
+  authCode          String?
+  authCodeExpiry    DateTime?
+  authConfirmed     Boolean      @default(false)
+  setupConfirmed    Boolean      @default(false)
+  csvUrl            String?
+  errorMessage      String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId, status])
+  @@index([domain])
+}
+
