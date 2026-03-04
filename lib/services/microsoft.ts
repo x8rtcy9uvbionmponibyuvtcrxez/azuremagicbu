@@ -122,6 +122,16 @@ function escapeODataString(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+function isDomainAlreadyExistsError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("already exists") ||
+    normalized.includes("already added") ||
+    normalized.includes("already been added") ||
+    normalized.includes("object reference already exists")
+  );
+}
+
 async function callPowerShellService(endpoint: string, body: Record<string, unknown>): Promise<any> {
   const response = await fetch(`${PS_SERVICE_URL}${endpoint}`, {
     method: "POST",
@@ -243,7 +253,7 @@ export async function completeTenantPrep(tenantId: string, accessToken: string):
       console.log("✅ [Microsoft] Service principal created:", servicePrincipalId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("conflicting object") || message.includes("already exists")) {
+      if (message.includes("conflicting object") || message.includes("already exists") || message.includes("already in use")) {
         console.log("ℹ️ [Microsoft] Service principal already exists, looking it up...");
         const existing = await graphRequest<{ value: Array<{ id: string }> }>(
           accessToken,
@@ -358,7 +368,7 @@ export async function addDomainToTenant(tenantDbId: string, domain: string, acce
     console.log(`✅ [Microsoft] Domain ${domain} added to tenant`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (message.includes("already exist") || message.includes("already been added")) {
+    if (isDomainAlreadyExistsError(message)) {
       console.log(`ℹ️ [Microsoft] Domain ${domain} already exists in tenant`);
     } else {
       throw error;
@@ -456,9 +466,19 @@ export async function verifyDomainWithDns(
       console.log(`✅ [Microsoft] Domain ${domain} verified on attempt ${attempt}`);
       break;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.toLowerCase().includes("already verified")) {
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: { domainVerified: true }
+        });
+        console.log("ℹ️ [Microsoft] Domain already verified, skipping");
+        return;
+      }
+
       console.log(
         `⚠️ [Microsoft] Domain verification attempt ${attempt}/5 failed:`,
-        error instanceof Error ? error.message : String(error)
+        message
       );
       if (attempt < 5) {
         await sleep(15000);
@@ -482,12 +502,21 @@ export async function setDomainAsDefault(tenantDbId: string, domain: string, acc
     data: { currentStep: "Setting domain as default...", progress: 75 }
   });
 
-  await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ isDefault: true })
-  });
+  try {
+    await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ isDefault: true })
+    });
 
-  console.log(`✅ [Microsoft] Domain ${domain} set as default`);
+    console.log(`✅ [Microsoft] Domain ${domain} set as default`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("already")) {
+      console.log(`ℹ️ [Microsoft] Domain ${domain} is already default (or already updated), skipping`);
+    } else {
+      throw error;
+    }
+  }
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
@@ -507,10 +536,41 @@ export async function createLicensedUser(
     data: { currentStep: "Creating licensed user...", progress: 80, status: "licensed_user" }
   });
 
-  const localPart = adminEmail.split("@")[0];
-  const displayName = localPart.charAt(0).toUpperCase() + localPart.slice(1);
-  const userPrincipalName = `${localPart}@${domain}`;
-  const mailNickname = localPart.replace(/[^a-zA-Z0-9]/g, "");
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantDbId },
+    select: { inboxNames: true }
+  });
+
+  const extractedNames: string[] = [];
+  const rawInboxNames = tenant?.inboxNames;
+
+  if (Array.isArray(rawInboxNames)) {
+    for (const entry of rawInboxNames) {
+      if (typeof entry === "string") {
+        extractedNames.push(
+          ...entry
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean)
+        );
+      }
+    }
+  } else if (typeof rawInboxNames === "string") {
+    extractedNames.push(
+      ...rawInboxNames
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+    );
+  }
+
+  const fallbackLocalPart = adminEmail.split("@")[0].replace(/[^a-zA-Z0-9]/g, "").toLowerCase() || "admin";
+  const firstInboxName = extractedNames[0] || fallbackLocalPart;
+  const [firstName = fallbackLocalPart, ...rest] = firstInboxName.split(/\s+/).filter(Boolean);
+  const lastName = rest.join(" ");
+  const displayName = [firstName, lastName].filter(Boolean).join(" ");
+  const mailNickname = firstName.toLowerCase().replace(/[^a-zA-Z0-9]/g, "") || fallbackLocalPart;
+  const userPrincipalName = `${mailNickname}@${domain}`;
 
   let userId: string;
   try {
@@ -639,7 +699,20 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
   const accessToken = await requestTenantGraphToken(organizationId);
 
   if (!tenant.domainAdded) {
-    await addDomainToTenant(tenantDbId, domain, accessToken);
+    try {
+      await addDomainToTenant(tenantDbId, domain, accessToken);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isDomainAlreadyExistsError(message)) {
+        console.log(`ℹ️ [Microsoft] Domain ${domain} already exists in tenant, continuing`);
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: { domainAdded: true }
+        });
+      } else {
+        throw error;
+      }
+    }
   }
 
   if (!tenant.domainVerified) {

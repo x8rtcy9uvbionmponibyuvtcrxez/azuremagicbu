@@ -1,5 +1,8 @@
 const express = require("express");
 const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 const app = express();
 app.use(express.json());
@@ -47,6 +50,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/create-shared-mailboxes", async (req, res) => {
+  let tmpFile;
   try {
     const { adminUpn, adminPassword, organizationId, mailboxes } = req.body;
 
@@ -54,12 +58,15 @@ app.post("/create-shared-mailboxes", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    tmpFile = path.join(os.tmpdir(), `mailboxes-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(mailboxes));
+
     const escapedClientId = escapePowerShellString(process.env.GRAPH_CLIENT_ID || "");
     const escapedClientSecret = escapePowerShellString(process.env.GRAPH_CLIENT_SECRET || "");
     const escapedOrgId = escapePowerShellString(organizationId);
     const escapedAdminUpn = escapePowerShellString(adminUpn);
     const escapedAdminPassword = escapePowerShellString(adminPassword);
-    const mailboxJson = escapePowerShellString(JSON.stringify(mailboxes));
+    const escapedTmpFile = escapePowerShellString(tmpFile);
 
     const script = `
 $ErrorActionPreference = "Continue"
@@ -74,13 +81,13 @@ $credential = New-Object System.Management.Automation.PSCredential($clientId, $s
 try {
   Connect-ExchangeOnline -CertificateThumbprint $null -AppId $clientId -Organization $orgId -Credential $credential -ShowBanner:$false 2>$null
 } catch {
-  $securePassword = ConvertTo-SecureString "${escapedAdminPassword}" -AsPlainText -Force
-  $userCredential = New-Object System.Management.Automation.PSCredential("${escapedAdminUpn}", $securePassword)
-  Connect-ExchangeOnline -Credential $userCredential -ShowBanner:$false
+$securePassword = ConvertTo-SecureString "${escapedAdminPassword}" -AsPlainText -Force
+$userCredential = New-Object System.Management.Automation.PSCredential("${escapedAdminUpn}", $securePassword)
+Connect-ExchangeOnline -Credential $userCredential -ShowBanner:$false
 }
 
 $results = @()
-$mailboxData = "${mailboxJson}" | ConvertFrom-Json
+$mailboxData = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 $counter = 1
 
 foreach ($mb in $mailboxData) {
@@ -112,19 +119,29 @@ $results | ConvertTo-Json -Compress
   } catch (error) {
     console.error("Create shared mailboxes error:", error.message);
     res.status(500).json({ error: error.message });
+  } finally {
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
   }
 });
 
 app.post("/enable-smtp-auth", async (req, res) => {
+  let tmpFile;
   try {
     const { adminUpn, adminPassword, emails } = req.body;
     if (!adminUpn || !adminPassword || !Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    tmpFile = path.join(os.tmpdir(), `emails-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(emails));
+
     const escapedAdminUpn = escapePowerShellString(adminUpn);
     const escapedAdminPassword = escapePowerShellString(adminPassword);
-    const emailsJson = escapePowerShellString(JSON.stringify(emails));
+    const escapedTmpFile = escapePowerShellString(tmpFile);
 
     const script = `
 $ErrorActionPreference = "Continue"
@@ -135,7 +152,7 @@ Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 Set-TransportConfig -SmtpClientAuthenticationDisabled $false
 
 $results = @()
-$emails = "${emailsJson}" | ConvertFrom-Json
+$emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 
 foreach ($email in $emails) {
   try {
@@ -154,20 +171,30 @@ $results | ConvertTo-Json -Compress
     res.json({ success: true, results: JSON.parse(output) });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
   }
 });
 
 app.post("/set-delegation", async (req, res) => {
+  let tmpFile;
   try {
     const { adminUpn, adminPassword, licensedUserUpn, emails } = req.body;
     if (!adminUpn || !adminPassword || !licensedUserUpn || !Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    tmpFile = path.join(os.tmpdir(), `delegation-emails-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(emails));
+
     const escapedAdminUpn = escapePowerShellString(adminUpn);
     const escapedAdminPassword = escapePowerShellString(adminPassword);
     const escapedLicensedUser = escapePowerShellString(licensedUserUpn);
-    const emailsJson = escapePowerShellString(JSON.stringify(emails));
+    const escapedTmpFile = escapePowerShellString(tmpFile);
 
     const script = `
 $ErrorActionPreference = "Continue"
@@ -177,7 +204,7 @@ Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 
 $licensedUser = "${escapedLicensedUser}"
 $results = @()
-$emails = "${emailsJson}" | ConvertFrom-Json
+$emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 
 foreach ($email in $emails) {
   try {
@@ -198,6 +225,12 @@ $results | ConvertTo-Json -Compress
     res.json({ success: true, results: JSON.parse(output) });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
   }
 });
 
