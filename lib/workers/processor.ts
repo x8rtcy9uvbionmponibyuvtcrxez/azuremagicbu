@@ -9,7 +9,8 @@ import {
   type TenantProcessingJobData
 } from "@/lib/queue";
 import { setupCloudflare } from "@/lib/services/cloudflare";
-import { createMailboxes, initiateDeviceAuth, setupTenantPrep } from "@/lib/services/microsoft";
+import { configureDkim, initiateDeviceAuth, setupDomainAndUser, setupSharedMailboxes, setupTenantPrep } from "@/lib/services/microsoft";
+import { connectMailboxesToSequencer } from "@/lib/services/sequencer";
 
 const TERMINAL_BATCH_STATUSES: BatchStatus[] = ["completed", "failed"];
 
@@ -69,7 +70,20 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
         authCode: true,
         deviceCode: true,
         authConfirmed: true,
-        csvUrl: true
+        csvUrl: true,
+        domainAdded: true,
+        domainVerified: true,
+        domainDefault: true,
+        licensedUserId: true,
+        sharedMailboxesCreated: true,
+        passwordsSet: true,
+        smtpAuthEnabled: true,
+        delegationComplete: true,
+        signInEnabled: true,
+        cloudAppAdminAssigned: true,
+        dkimConfigured: true,
+        smartleadConnected: true,
+        instantlyConnected: true
       }
     });
 
@@ -129,11 +143,96 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     return { state: "waiting_for_auth_confirmation" };
   }
 
-  if (!tenant.csvUrl && tenant.status !== "completed") {
-    await createMailboxes(tenant.id);
-    console.log("✅ [Worker] Mailboxes complete");
+  const phaseTwoComplete =
+    tenant.domainAdded && tenant.domainVerified && tenant.domainDefault && Boolean(tenant.licensedUserId);
+
+  if (!phaseTwoComplete) {
+    await setupDomainAndUser(tenant.id);
+    console.log("✅ [Worker] Domain setup + licensed user complete");
+    tenant = await loadTenant();
+    if (!tenant || tenant.status === "failed") {
+      await updateBatchStatus(batchId);
+      return { state: "failed" };
+    }
   } else {
-    console.log(`✓ [Worker] Mailboxes already complete for ${tenant.tenantName}, skipping`);
+    console.log(`✓ [Worker] Domain setup already complete for ${tenant.tenantName}, skipping`);
+  }
+
+  const phaseThreeComplete =
+    tenant.sharedMailboxesCreated &&
+    tenant.passwordsSet &&
+    tenant.smtpAuthEnabled &&
+    tenant.delegationComplete &&
+    tenant.signInEnabled &&
+    tenant.cloudAppAdminAssigned;
+
+  if (!phaseThreeComplete && tenant.status !== "completed") {
+    await setupSharedMailboxes(tenant.id);
+    console.log("✅ [Worker] Shared mailbox pipeline complete");
+    tenant = await loadTenant();
+    if (!tenant || tenant.status === "failed") {
+      await updateBatchStatus(batchId);
+      return { state: "failed" };
+    }
+  } else {
+    console.log(`✓ [Worker] Shared mailbox pipeline already complete for ${tenant.tenantName}, skipping`);
+  }
+
+  if (!tenant.dkimConfigured) {
+    await configureDkim(tenant.id);
+    console.log("✅ [Worker] DKIM configured");
+    tenant = await loadTenant();
+    if (!tenant || tenant.status === "failed") {
+      await updateBatchStatus(batchId);
+      return { state: "failed" };
+    }
+  } else {
+    console.log(`✓ [Worker] DKIM already configured for ${tenant.tenantName}, skipping`);
+  }
+
+  const shouldConnectSmartlead = Boolean(process.env.SMARTLEAD_API_KEY);
+  const shouldConnectInstantly = Boolean(process.env.INSTANTLY_API_KEY);
+
+  if (shouldConnectSmartlead && !tenant.smartleadConnected) {
+    await connectMailboxesToSequencer(tenant.id, "smartlead");
+    console.log("✅ [Worker] Smartlead integration complete");
+    tenant = await loadTenant();
+  } else if (shouldConnectSmartlead) {
+    console.log(`✓ [Worker] Smartlead already connected for ${tenant.tenantName}, skipping`);
+  } else {
+    console.log("ℹ️ [Worker] SMARTLEAD_API_KEY not set, skipping Smartlead integration");
+  }
+
+  if (shouldConnectInstantly && !tenant.instantlyConnected) {
+    await connectMailboxesToSequencer(tenant.id, "instantly");
+    console.log("✅ [Worker] Instantly integration complete");
+    tenant = await loadTenant();
+  } else if (shouldConnectInstantly) {
+    console.log(`✓ [Worker] Instantly already connected for ${tenant.tenantName}, skipping`);
+  } else {
+    console.log("ℹ️ [Worker] INSTANTLY_API_KEY not set, skipping Instantly integration");
+  }
+
+  if (!tenant || tenant.status === "failed") {
+    await updateBatchStatus(batchId);
+    return { state: "failed" };
+  }
+
+  const phaseFourComplete =
+    tenant.dkimConfigured &&
+    (!shouldConnectSmartlead || tenant.smartleadConnected) &&
+    (!shouldConnectInstantly || tenant.instantlyConnected);
+
+  if (phaseFourComplete && tenant.status !== "completed") {
+    await prisma.tenant.update({
+      where: { id: tenant.id },
+      data: {
+        status: "completed",
+        currentStep: "All mailboxes configured and connected",
+        progress: 100
+      }
+    });
+    console.log("✅ [Worker] Phase 4 complete");
   }
 
   await updateBatchStatus(batchId);

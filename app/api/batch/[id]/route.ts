@@ -39,9 +39,7 @@ export async function GET(_request: Request, { params }: Params) {
   }
 
   const completedCount = batch.tenants.filter((tenant) => tenant.status === "completed").length;
-  const hasActive = batch.tenants.some((tenant) =>
-    ["queued", "cloudflare", "tenant_prep", "auth_pending", "mailboxes"].includes(tenant.status)
-  );
+  const hasActive = batch.tenants.some((tenant) => !["completed", "failed"].includes(tenant.status));
   const hasFailed = batch.tenants.some((tenant) => tenant.status === "failed");
 
   let nextStatus = batch.status;

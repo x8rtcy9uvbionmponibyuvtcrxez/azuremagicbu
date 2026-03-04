@@ -19,7 +19,13 @@ enum TenantStatus {
   cloudflare
   tenant_prep
   auth_pending
+  domain_add
+  domain_verify
+  licensed_user
   mailboxes
+  mailbox_config
+  dkim_config
+  sequencer_connect
   completed
   failed
 }
@@ -56,6 +62,30 @@ model Tenant {
   authCodeExpiry    DateTime?
   authConfirmed     Boolean      @default(false)
   setupConfirmed    Boolean      @default(false)
+  securityDefaultsDisabled Boolean @default(false)
+  servicePrincipalCreated  Boolean @default(false)
+  globalAdminAssigned      Boolean @default(false)
+  // Phase 2: Domain setup
+  domainAdded       Boolean      @default(false)
+  domainVerified    Boolean      @default(false)
+  domainDefault     Boolean      @default(false)
+  dkimConfigured    Boolean      @default(false)
+  licensedUserId    String?
+  licensedUserUpn   String?
+  // Phase 3: Mailbox setup
+  sharedMailboxesCreated  Boolean  @default(false)
+  passwordsSet            Boolean  @default(false)
+  smtpAuthEnabled         Boolean  @default(false)
+  delegationComplete      Boolean  @default(false)
+  signInEnabled           Boolean  @default(false)
+  cloudAppAdminAssigned   Boolean  @default(false)
+  // Phase 4: DKIM + sequencer integrations
+  smartleadConnected      Boolean  @default(false)
+  instantlyConnected      Boolean  @default(false)
+  smartleadConnectedCount Int      @default(0)
+  smartleadFailedCount    Int      @default(0)
+  instantlyConnectedCount Int      @default(0)
+  instantlyFailedCount    Int      @default(0)
   csvUrl            String?
   errorMessage      String?
   createdAt         DateTime     @default(now())
