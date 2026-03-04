@@ -167,7 +167,13 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     tenant.cloudAppAdminAssigned;
 
   if (!phaseThreeComplete && tenant.status !== "completed") {
-    await setupSharedMailboxes(tenant.id);
+    try {
+      await setupSharedMailboxes(tenant.id);
+    } catch (error: any) {
+      console.error("❌ [Worker] Phase 3 failed:", error.message);
+      console.error("❌ [Worker] Stack:", error.stack);
+      throw error;
+    }
     console.log("✅ [Worker] Shared mailbox pipeline complete");
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
@@ -178,13 +184,19 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     console.log(`✓ [Worker] Shared mailbox pipeline already complete for ${tenant.tenantName}, skipping`);
   }
 
+  let dkimSkipped = false;
   if (!tenant.dkimConfigured) {
-    await configureDkim(tenant.id);
-    console.log("✅ [Worker] DKIM configured");
-    tenant = await loadTenant();
-    if (!tenant || tenant.status === "failed") {
-      await updateBatchStatus(batchId);
-      return { state: "failed" };
+    try {
+      await configureDkim(tenant.id);
+      console.log("✅ [Worker] DKIM configured");
+      tenant = await loadTenant();
+      if (!tenant || tenant.status === "failed") {
+        await updateBatchStatus(batchId);
+        return { state: "failed" };
+      }
+    } catch (error) {
+      dkimSkipped = true;
+      console.log("⚠️ [Worker] DKIM skipped:", error instanceof Error ? error.message : String(error));
     }
   } else {
     console.log(`✓ [Worker] DKIM already configured for ${tenant.tenantName}, skipping`);
@@ -219,7 +231,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   const phaseFourComplete =
-    tenant.dkimConfigured &&
+    (tenant.dkimConfigured || dkimSkipped) &&
     (!shouldConnectSmartlead || tenant.smartleadConnected) &&
     (!shouldConnectInstantly || tenant.instantlyConnected);
 

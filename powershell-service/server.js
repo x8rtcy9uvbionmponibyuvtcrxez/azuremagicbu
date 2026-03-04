@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require("express");
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -15,7 +16,11 @@ function escapePowerShellString(value) {
     .replace(/"/g, '`"');
 }
 
-function runPowerShell(script, timeout = 300000) {
+function stripAnsi(str) {
+  return str.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function runPowerShell(script, timeout = 1200000) {
   return new Promise((resolve, reject) => {
     const ps = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
       timeout,
@@ -35,9 +40,9 @@ function runPowerShell(script, timeout = 300000) {
 
     ps.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`PowerShell exited with code ${code}: ${stderr}`));
+        reject(new Error(`PowerShell exited with code ${code}: ${stripAnsi(stderr)}`));
       } else {
-        resolve(stdout.trim());
+        resolve(stripAnsi(stdout.trim()));
       }
     });
 
@@ -92,14 +97,30 @@ $counter = 1
 
 foreach ($mb in $mailboxData) {
   try {
-    $tempName = "$($mb.displayName) $counter"
-    New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
-    Start-Sleep -Seconds 2
-    Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName
-    $results += @{ email = $mb.email; status = "created"; error = $null }
+    # Check if mailbox already exists
+    $existing = $null
+    try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
+    
+    if ($existing) {
+      # Already exists - treat as success
+      try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    } else {
+      $tempName = "$($mb.displayName) $counter"
+      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
+      Start-Sleep -Seconds 2
+      try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      $results += @{ email = $mb.email; status = "created"; error = $null }
+    }
   } catch {
-    $results += @{ email = $mb.email; status = "failed"; error = $_.Exception.Message }
+    $msg = $_.Exception.Message
+    if ($msg -like "*already*" -or $msg -like "*proxy address*") {
+      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    } else {
+      $results += @{ email = $mb.email; status = "failed"; error = $msg }
+    }
   }
+  Write-Host "[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)"
   $counter++
 }
 
@@ -205,23 +226,26 @@ Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 $licensedUser = "${escapedLicensedUser}"
 $results = @()
 $emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
+$counter = 1
 
 foreach ($email in $emails) {
   try {
-    Add-MailboxPermission -Identity $email -User $licensedUser -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false
-    Add-RecipientPermission -Identity $email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false
-    Set-Mailbox -Identity $email -GrantSendOnBehalfTo $licensedUser
+    Add-MailboxPermission -Identity $email -User $licensedUser -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false | Out-Null
+    Add-RecipientPermission -Identity $email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false | Out-Null
+    Set-Mailbox -Identity $email -GrantSendOnBehalfTo $licensedUser | Out-Null
     $results += @{ email = $email; status = "delegated" }
   } catch {
     $results += @{ email = $email; status = "failed"; error = $_.Exception.Message }
   }
+  Write-Host "[$counter/$($emails.Count)] $email -> $($results[-1].status)"
+  $counter++
 }
 
 Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    const output = await runPowerShell(script, 300000);
+    const output = await runPowerShell(script, 1200000);
     res.json({ success: true, results: JSON.parse(output) });
   } catch (error) {
     res.status(500).json({ error: error.message });
