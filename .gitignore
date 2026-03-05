@@ -15,3 +15,5 @@ tsconfig.tsbuildinfo
 pnpm-lock.yaml
 yarn.lock
 .DS_Store
+
+.claude/
