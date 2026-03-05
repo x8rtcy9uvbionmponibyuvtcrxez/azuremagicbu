@@ -1359,13 +1359,58 @@ export async function configureDkim(tenantDbId: string): Promise<void> {
     }
   }
 
-  await sleep(30000);
+  console.log("⏳ [DKIM] Waiting for DNS propagation...");
+  let dnsReady = false;
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    await sleep(15000);
+    try {
+      const checkResponse = await fetch(
+        `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=CNAME&name=selector1._domainkey.${domain}`,
+        {
+          headers: {
+            "X-Auth-Key": cfApiKey,
+            "X-Auth-Email": cfEmail,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+      const checkData = (await checkResponse.json()) as any;
+      if (checkData.result && checkData.result.length > 0) {
+        console.log(`✅ [DKIM] DNS records found after ${attempt * 15}s`);
+        dnsReady = true;
+        break;
+      }
+      console.log(`⏳ [DKIM] DNS not ready yet, attempt ${attempt}/12...`);
+    } catch (_error) {
+      console.log(`⏳ [DKIM] DNS check failed, attempt ${attempt}/12, retrying...`);
+    }
+  }
+  if (!dnsReady) {
+    console.log("⚠️ [DKIM] DNS records not confirmed after 3 minutes. Attempting enable anyway...");
+  }
 
-  await callPowerShellService("/enable-dkim", {
-    adminUpn,
-    adminPassword: resolvedAdminPassword,
-    domain
-  });
+  let dkimEnabled = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await callPowerShellService("/enable-dkim", {
+        adminUpn,
+        adminPassword: resolvedAdminPassword,
+        domain
+      });
+      dkimEnabled = true;
+      console.log(`✅ [DKIM] Enabled on attempt ${attempt}`);
+      break;
+    } catch (error: any) {
+      console.log(`⚠️ [DKIM] Enable attempt ${attempt}/3 failed: ${error.message}`);
+      if (attempt < 3) {
+        console.log("⏳ [DKIM] Waiting 30s before retry...");
+        await sleep(30000);
+      }
+    }
+  }
+  if (!dkimEnabled) {
+    throw new Error("DKIM could not be enabled after 3 attempts. DNS may need more propagation time.");
+  }
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
