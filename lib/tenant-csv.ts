@@ -6,15 +6,23 @@ type TenantCsvInput = {
   tenantName: string;
   domain: string;
   inboxCount: number;
-  inboxNames: Prisma.JsonValue;
+  inboxNames: Prisma.JsonValue | string;
   csvUrl: string | null;
 };
 
-function parseInboxNames(value: Prisma.JsonValue): string[] {
+function parseInboxNamesValue(value: Prisma.JsonValue | string): string[] {
   if (Array.isArray(value)) {
-    return value
-      .map((item) => (typeof item === "string" ? item.trim() : ""))
-      .filter(Boolean);
+    return value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
+      }
+    } catch {
+      // fall through
+    }
   }
   return [];
 }
@@ -35,7 +43,7 @@ function rowsToCsv(rows: string[][]): string {
 }
 
 function generateFallbackCsv(tenant: TenantCsvInput): string {
-  const names = parseInboxNames(tenant.inboxNames);
+  const names = parseInboxNamesValue(tenant.inboxNames);
   const safeNames = names.length > 0 ? names : ["Inbox User", "Ops User"];
 
   const rows: string[][] = [["DisplayName", "EmailAddress", "Password"]];

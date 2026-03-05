@@ -3,6 +3,7 @@ import { readFile } from "fs/promises";
 import { decryptSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 import { generateEmailVariations } from "@/lib/services/email-generator";
+import { parseInboxNamesValue } from "@/lib/utils";
 
 const SMARTLEAD_API_URL = "https://server.smartlead.ai/api/v1";
 const SMARTLEAD_API_KEY = process.env.SMARTLEAD_API_KEY;
@@ -99,13 +100,19 @@ async function loadMailboxCredentials(tenantId: string): Promise<MailboxCredenti
     }
   }
 
-  const names = Array.isArray(tenant.inboxNames)
-    ? tenant.inboxNames.filter((value): value is string => typeof value === "string")
-    : [];
+  const names = parseInboxNamesValue(tenant.inboxNames);
+
+  const resolvedAdminPassword = (() => {
+    try {
+      return decryptSecret(tenant.adminPassword);
+    } catch {
+      return tenant.adminPassword || "";
+    }
+  })();
 
   return generateEmailVariations(names, tenant.domain, tenant.inboxCount).map((mailbox) => ({
     email: mailbox.email,
-    password: mailbox.password,
+    password: mailbox.password || resolvedAdminPassword,
     displayName: mailbox.displayName
   }));
 }

@@ -6,6 +6,7 @@ import { encryptSecret, ensureEncryptionKey } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 import { mapTenantCsvRow } from "@/lib/validation";
 import type { ParsedTenantRecord } from "@/lib/validation";
+import { serializeInboxNames } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -128,7 +129,7 @@ export async function POST(request: Request) {
             adminPassword: encryptSecret(tenant.adminPassword),
             encryptionVersion: 1,
             domain: tenant.domain,
-            inboxNames: tenant.inboxNames,
+            inboxNames: serializeInboxNames(tenant.inboxNames),
             inboxCount: tenant.inboxCount,
             forwardingUrl: tenant.forwardingUrl,
             status: "queued"

@@ -207,6 +207,11 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   const shouldConnectSmartlead = Boolean(process.env.SMARTLEAD_API_KEY);
   const shouldConnectInstantly = Boolean(process.env.INSTANTLY_API_KEY);
 
+  if (!tenant) {
+    await updateBatchStatus(batchId);
+    return { state: "failed" };
+  }
+
   if (shouldConnectSmartlead && !tenant.smartleadConnected) {
     await connectMailboxesToSequencer(tenant.id, "smartlead");
     console.log("✅ [Worker] Smartlead integration complete");
@@ -215,6 +220,11 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     console.log(`✓ [Worker] Smartlead already connected for ${tenant.tenantName}, skipping`);
   } else {
     console.log("ℹ️ [Worker] SMARTLEAD_API_KEY not set, skipping Smartlead integration");
+  }
+
+  if (!tenant) {
+    await updateBatchStatus(batchId);
+    return { state: "failed" };
   }
 
   if (shouldConnectInstantly && !tenant.instantlyConnected) {

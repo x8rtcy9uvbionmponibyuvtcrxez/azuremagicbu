@@ -4,6 +4,7 @@ import path from "path";
 import { decryptSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 import { generateEmailVariations } from "@/lib/services/email-generator";
+import { parseInboxNamesValue } from "@/lib/utils";
 
 const GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0";
 const TEST_MODE = process.env.TEST_MODE === "true";
@@ -835,9 +836,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     throw new Error("Missing tenant data for mailbox setup");
   }
 
-  const names = Array.isArray(tenant.inboxNames)
-    ? tenant.inboxNames.filter((value): value is string => typeof value === "string")
-    : [];
+  const names = parseInboxNamesValue(tenant.inboxNames);
 
   const resolvedAdminPassword = (() => {
     try {
@@ -1574,11 +1573,15 @@ export async function createMailboxes(tenantId: string): Promise<void> {
     });
 
     // Decryption validates the stored credential integrity before automation continues.
-    void decryptSecret(tenant.adminPassword);
+    const resolvedAdminPassword = (() => {
+      try {
+        return decryptSecret(tenant.adminPassword);
+      } catch {
+        return tenant.adminPassword;
+      }
+    })();
 
-    const names = Array.isArray(tenant.inboxNames)
-      ? tenant.inboxNames.filter((value): value is string => typeof value === "string")
-      : [];
+  const names = parseInboxNamesValue(tenant.inboxNames);
 
     const generated = generateEmailVariations(names, tenant.domain, tenant.inboxCount);
     const rows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
@@ -1633,7 +1636,7 @@ export async function createMailboxes(tenantId: string): Promise<void> {
 
     for (let index = 0; index < generated.length; index++) {
       const mailbox = generated[index];
-      const password = mailbox.password;
+      const password = mailbox.password || resolvedAdminPassword;
       console.log("✅ [Microsoft] Creating mailbox", index + 1, "of", generated.length);
 
       await createGraphUser(token, mailbox.displayName, mailbox.email, password);

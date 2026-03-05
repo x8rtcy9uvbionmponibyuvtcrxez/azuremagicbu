@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
@@ -49,7 +49,7 @@ model Tenant {
   adminPassword     String
   encryptionVersion Int          @default(1)
   domain            String
-  inboxNames        Json
+  inboxNames        String
   inboxCount        Int          @default(99)
   forwardingUrl     String
   status            TenantStatus @default(queued)
@@ -79,7 +79,7 @@ model Tenant {
   delegationComplete      Boolean  @default(false)
   signInEnabled           Boolean  @default(false)
   cloudAppAdminAssigned   Boolean  @default(false)
-  mailboxStatuses         Json?
+  mailboxStatuses         String?
   // Phase 4: DKIM + sequencer integrations
   smartleadConnected      Boolean  @default(false)
   instantlyConnected      Boolean  @default(false)
