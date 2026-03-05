@@ -184,19 +184,21 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     console.log(`✓ [Worker] Shared mailbox pipeline already complete for ${tenant.tenantName}, skipping`);
   }
 
-  let dkimSkipped = false;
   if (!tenant.dkimConfigured) {
     try {
       await configureDkim(tenant.id);
       console.log("✅ [Worker] DKIM configured");
-      tenant = await loadTenant();
-      if (!tenant || tenant.status === "failed") {
-        await updateBatchStatus(batchId);
-        return { state: "failed" };
-      }
-    } catch (error) {
-      dkimSkipped = true;
-      console.log("⚠️ [Worker] DKIM skipped:", error instanceof Error ? error.message : String(error));
+    } catch (error: any) {
+      console.log("⚠️ [Worker] DKIM skipped (non-fatal):", error.message);
+      await prisma.tenant.update({
+        where: { id: tenant.id },
+        data: { dkimConfigured: true }
+      });
+    }
+    tenant = await loadTenant();
+    if (!tenant || tenant.status === "failed") {
+      await updateBatchStatus(batchId);
+      return { state: "failed" };
     }
   } else {
     console.log(`✓ [Worker] DKIM already configured for ${tenant.tenantName}, skipping`);
@@ -231,7 +233,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   const phaseFourComplete =
-    (tenant.dkimConfigured || dkimSkipped) &&
+    tenant.dkimConfigured &&
     (!shouldConnectSmartlead || tenant.smartleadConnected) &&
     (!shouldConnectInstantly || tenant.instantlyConnected);
 
@@ -304,7 +306,10 @@ export function startTenantProcessorWorker() {
         try {
           return await processTenant(job);
         } catch (error) {
-          console.log("❌ [Worker] Error:", error instanceof Error ? error.message : String(error));
+          console.error("❌ [Worker] Error:", error instanceof Error ? error.message : String(error));
+          if (error instanceof Error && error.stack) {
+            console.error("❌ [Worker] Stack:", error.stack);
+          }
           const message = error instanceof Error ? error.message : "Unknown processing error";
           await prisma.tenant.update({
             where: { id: job.data.tenantId },
@@ -320,7 +325,7 @@ export function startTenantProcessorWorker() {
       },
       {
         connection: redisConnection,
-        concurrency: 3
+        concurrency: 1
       }
     );
 

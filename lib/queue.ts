@@ -41,10 +41,14 @@ export function getTenantQueue(): Queue<TenantProcessingJobData> {
   return globalQueue.tenantProcessingQueue;
 }
 
-export async function enqueueTenantProcessingJob(data: TenantProcessingJobData) {
+export async function enqueueTenantProcessingJob(
+  data: TenantProcessingJobData,
+  options?: { delayMs?: number; jobId?: string }
+) {
   const queue = getTenantQueue();
   const job = await queue.add("process-tenant", data, {
-    jobId: `${data.batchId}:${data.tenantId}:${Date.now()}`
+    jobId: options?.jobId || `${data.batchId}:${data.tenantId}:${Date.now()}`,
+    delay: options?.delayMs || 0
   });
   console.log("🔄 [Queue] Adding job:", job.id);
   return job;

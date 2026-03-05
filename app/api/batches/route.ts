@@ -4,9 +4,7 @@ import { z } from "zod";
 
 import { encryptSecret, ensureEncryptionKey } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
-import { enqueueTenantProcessingJob } from "@/lib/queue";
 import { mapTenantCsvRow } from "@/lib/validation";
-import { startTenantProcessorWorker } from "@/lib/workers/processor";
 import type { ParsedTenantRecord } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -148,28 +146,11 @@ export async function POST(request: Request) {
       }
     });
 
-    startTenantProcessorWorker();
-    console.log("🔄 [API] Worker started for batch:", batch.id);
-
-    await Promise.all(
-      batch.tenants.map((tenant) =>
-        enqueueTenantProcessingJob({
-          tenantId: tenant.id,
-          batchId: batch.id
-        })
-      )
-    );
-
-    await prisma.batch.update({
-      where: { id: batch.id },
-      data: { status: "processing" }
-    });
-
     return NextResponse.json(
       {
         batch: {
           id: batch.id,
-          status: "processing",
+          status: batch.status,
           totalCount: batch.totalCount,
           completedCount: batch.completedCount,
           createdAt: batch.createdAt,

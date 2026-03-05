@@ -26,9 +26,12 @@ export async function GET(_request: Request, { params }: Params) {
           currentStep: true,
           authCode: true,
           authCodeExpiry: true,
+          authConfirmed: true,
           csvUrl: true,
           errorMessage: true,
-          setupConfirmed: true
+          setupConfirmed: true,
+          createdAt: true,
+          updatedAt: true
         }
       }
     }
@@ -47,8 +50,6 @@ export async function GET(_request: Request, { params }: Params) {
     nextStatus = "completed";
   } else if (!hasActive && hasFailed) {
     nextStatus = "failed";
-  } else if (batch.status === "uploading") {
-    nextStatus = "processing";
   }
 
   const needsUpdate = completedCount !== batch.completedCount || nextStatus !== batch.status;
@@ -73,7 +74,9 @@ export async function GET(_request: Request, { params }: Params) {
     },
     tenants: batch.tenants.map((tenant) => ({
       ...tenant,
-      authCodeExpiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null
+      authCodeExpiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null,
+      createdAt: tenant.createdAt.toISOString(),
+      updatedAt: tenant.updatedAt.toISOString()
     }))
   });
 }

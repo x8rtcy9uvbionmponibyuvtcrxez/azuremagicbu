@@ -424,9 +424,14 @@ export default function HomePage() {
             <h1 className="text-3xl font-semibold tracking-tight">M365 Tenant Automation</h1>
             <p className="mt-1 text-sm text-muted-foreground">Run one tenant quickly or process large CSV batches in one flow.</p>
           </div>
-          <Button asChild variant="outline">
-            <Link href="/config">Config</Link>
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button asChild variant="outline">
+              <Link href="/history">History</Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link href="/config">Config</Link>
+            </Button>
+          </div>
         </div>
 
         {testModeEnabled ? (

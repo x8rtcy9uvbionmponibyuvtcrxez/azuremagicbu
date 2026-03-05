@@ -79,6 +79,7 @@ model Tenant {
   delegationComplete      Boolean  @default(false)
   signInEnabled           Boolean  @default(false)
   cloudAppAdminAssigned   Boolean  @default(false)
+  mailboxStatuses         Json?
   // Phase 4: DKIM + sequencer integrations
   smartleadConnected      Boolean  @default(false)
   instantlyConnected      Boolean  @default(false)

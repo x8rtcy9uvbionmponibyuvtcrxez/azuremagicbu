@@ -3,7 +3,7 @@ import { randomInt } from "crypto";
 export type GeneratedEmail = {
   email: string;
   displayName: string;
-  password: string;
+  password?: string;
 };
 
 type ParsedName = {
@@ -116,7 +116,7 @@ export function generateStrongPassword(options?: {
   const uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const lowercase = "abcdefghijklmnopqrstuvwxyz";
   const numbers = "0123456789";
-  const symbols = "!@#$%^&*()_+-=[]{}|;:,.<>?";
+  const symbols = "!@#$%&*_+-=?";
   const all = uppercase + lowercase + numbers + symbols;
   const forbidden = (options?.forbiddenTokens ?? [])
     .map((token) => token.toLowerCase().trim())
@@ -127,7 +127,18 @@ export function generateStrongPassword(options?: {
     while (chars.length < length) {
       chars.push(pick(all));
     }
-    const password = shuffle(chars).join("");
+    let password = shuffle(chars).join("");
+
+    // Ensure password doesn't start with a special character (M365 requirement)
+    if (/[^A-Za-z0-9]/.test(password[0])) {
+      const passwordChars = password.split("");
+      const alphaIndex = passwordChars.findIndex((c, i) => i > 0 && /[A-Za-z0-9]/.test(c));
+      if (alphaIndex > 0) {
+        [passwordChars[0], passwordChars[alphaIndex]] = [passwordChars[alphaIndex], passwordChars[0]];
+        password = passwordChars.join("");
+      }
+    }
+
     const lower = password.toLowerCase();
 
     const hasForbiddenToken = forbidden.some((token) => lower.includes(token));
@@ -324,20 +335,9 @@ export function generateEmailVariations(names: string[], domain: string, totalCo
     const locals = generateForSingleName(firstName, lastName, targetForName, normalizedDomain, usedEmails);
 
     for (const local of locals) {
-      const fullTokens = fullName
-        .split(/\s+/)
-        .map((token) => normalizeToken(token))
-        .filter((token) => token.length >= 3);
-
-      const password = generateStrongPassword({
-        length: 16,
-        forbiddenTokens: [firstName, lastName, local, ...fullTokens]
-      });
-
       results.push({
         email: `${local}@${normalizedDomain}`,
-        displayName: fullName,
-        password
+        displayName: fullName
       });
     }
   }
@@ -360,7 +360,7 @@ export function generateEmailVariations(names: string[], domain: string, totalCo
     if (!item.displayName) {
       throw new Error("Missing display name");
     }
-    if (!item.password || item.password.length < 8) {
+    if (item.password && item.password.length < 8) {
       throw new Error("Invalid password");
     }
   }

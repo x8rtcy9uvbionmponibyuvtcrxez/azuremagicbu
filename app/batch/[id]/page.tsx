@@ -11,7 +11,32 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 
 type BatchStatus = "uploading" | "processing" | "completed" | "failed";
-type TenantStatus = "queued" | "cloudflare" | "tenant_prep" | "auth_pending" | "mailboxes" | "completed" | "failed";
+type TenantStatus =
+  | "queued"
+  | "cloudflare"
+  | "tenant_prep"
+  | "auth_pending"
+  | "domain_add"
+  | "domain_verify"
+  | "licensed_user"
+  | "mailboxes"
+  | "mailbox_config"
+  | "dkim_config"
+  | "sequencer_connect"
+  | "completed"
+  | "failed";
+
+const processingStatuses = new Set<TenantStatus>([
+  "cloudflare",
+  "tenant_prep",
+  "domain_add",
+  "domain_verify",
+  "licensed_user",
+  "mailboxes",
+  "mailbox_config",
+  "dkim_config",
+  "sequencer_connect"
+]);
 
 type BatchPayload = {
   batch: {
@@ -30,9 +55,12 @@ type BatchPayload = {
     currentStep: string | null;
     authCode: string | null;
     authCodeExpiry: string | null;
+    authConfirmed: boolean;
     csvUrl: string | null;
     errorMessage: string | null;
     setupConfirmed: boolean;
+    createdAt: string;
+    updatedAt: string;
   }>;
 };
 
@@ -54,6 +82,18 @@ function statusDisplay(status: TenantStatus): string {
       return "Awaiting Auth";
     case "mailboxes":
       return "Creating Mailboxes";
+    case "domain_add":
+      return "Adding Domain";
+    case "domain_verify":
+      return "Verifying Domain";
+    case "licensed_user":
+      return "Creating Licensed User";
+    case "mailbox_config":
+      return "Configuring Mailboxes";
+    case "dkim_config":
+      return "Configuring DKIM";
+    case "sequencer_connect":
+      return "Connecting Sequencer";
     case "completed":
       return "Completed";
     case "failed":
@@ -69,7 +109,13 @@ function statusClasses(status: TenantStatus): string {
       return "bg-slate-100 text-slate-800 border-slate-200";
     case "cloudflare":
     case "tenant_prep":
+    case "domain_add":
+    case "domain_verify":
+    case "licensed_user":
     case "mailboxes":
+    case "mailbox_config":
+    case "dkim_config":
+    case "sequencer_connect":
       return "bg-blue-100 text-blue-800 border-blue-200";
     case "auth_pending":
       return "bg-amber-100 text-amber-900 border-amber-200";
@@ -91,12 +137,23 @@ function formatEta(seconds: number): string {
   return `${Math.max(1, mins)}m`;
 }
 
+function formatCountdown(expiry: string | null): string {
+  if (!expiry) return "No expiry";
+  const remaining = new Date(expiry).getTime() - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) return "Expired";
+  const totalSeconds = Math.floor(remaining / 1000);
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  return `${mins}m ${secs.toString().padStart(2, "0")}s`;
+}
+
 export default function BatchPage({ params }: PageProps) {
   const [data, setData] = useState<BatchPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
   const [retryStatusByTenant, setRetryStatusByTenant] = useState<Record<string, string>>({});
+  const [batchActionBusy, setBatchActionBusy] = useState<Record<string, boolean>>({});
 
   const fetchBatch = useCallback(async () => {
     try {
@@ -133,11 +190,13 @@ export default function BatchPage({ params }: PageProps) {
   }, [data, fetchBatch, isTerminal]);
 
   const counts = useMemo(() => {
-    if (!data) return { completed: 0, failed: 0, inProgress: 0 };
+    if (!data) return { completed: 0, failed: 0, inProgress: 0, queued: 0, remaining: 0 };
     const completed = data.tenants.filter((tenant) => tenant.status === "completed").length;
     const failed = data.tenants.filter((tenant) => tenant.status === "failed").length;
-    const inProgress = data.tenants.filter((tenant) => ["cloudflare", "tenant_prep", "mailboxes"].includes(tenant.status)).length;
-    return { completed, failed, inProgress };
+    const inProgress = data.tenants.filter((tenant) => processingStatuses.has(tenant.status)).length;
+    const queued = data.tenants.filter((tenant) => tenant.status === "queued").length;
+    const remaining = data.tenants.filter((tenant) => !["completed", "failed"].includes(tenant.status)).length;
+    return { completed, failed, inProgress, queued, remaining };
   }, [data]);
 
   const overallPercent = useMemo(() => {
@@ -153,6 +212,39 @@ export default function BatchPage({ params }: PageProps) {
     const avgPerTenant = elapsedSec / data.batch.completedCount;
     const remaining = Math.max(0, data.batch.totalCount - data.batch.completedCount);
     return formatEta(avgPerTenant * remaining);
+  }, [data]);
+
+  const fixedEtaLabel = useMemo(() => formatEta(counts.remaining * 20 * 60), [counts.remaining]);
+
+  const showAuthGrid = useMemo(() => {
+    if (!data) return false;
+    if (data.batch.status === "processing" || data.batch.status === "completed" || data.batch.status === "failed") {
+      return false;
+    }
+    return true;
+  }, [data]);
+
+  const authGridTenants = useMemo(() => {
+    if (!data) return [];
+    return data.tenants.filter((tenant) => tenant.status === "auth_pending" || Boolean(tenant.authCode));
+  }, [data]);
+
+  const queuedPositions = useMemo(() => {
+    if (!data) return new Map<string, number>();
+    const map = new Map<string, number>();
+    let position = 1;
+    data.tenants
+      .filter((tenant) => tenant.status === "queued")
+      .forEach((tenant) => {
+        map.set(tenant.id, position);
+        position += 1;
+      });
+    return map;
+  }, [data]);
+
+  const currentTenant = useMemo(() => {
+    if (!data) return null;
+    return data.tenants.find((tenant) => processingStatuses.has(tenant.status)) || null;
   }, [data]);
 
   const callTenantAction = async (tenantId: string, endpoint: string, body?: Record<string, boolean>) => {
@@ -180,6 +272,28 @@ export default function BatchPage({ params }: PageProps) {
       setError(err instanceof Error ? err.message : "Action failed");
     } finally {
       setActionBusy((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const callBatchAction = async (endpoint: "generate-all-codes" | "start-processing") => {
+    setBatchActionBusy((prev) => ({ ...prev, [endpoint]: true }));
+    try {
+      const response = await fetch(`/api/batch/${params.id}/${endpoint}`, {
+        method: "POST"
+      });
+      const payload = (await response.json()) as { error?: string; notReady?: Array<{ tenantName?: string; error?: string }> };
+      if (!response.ok) {
+        const notReadyMessage =
+          payload.notReady && payload.notReady.length > 0
+            ? ` (${payload.notReady.map((item) => `${item.tenantName || "tenant"}: ${item.error || "pending"}`).join(" | ")})`
+            : "";
+        throw new Error((payload.error || "Batch action failed") + notReadyMessage);
+      }
+      await fetchBatch();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Batch action failed");
+    } finally {
+      setBatchActionBusy((prev) => ({ ...prev, [endpoint]: false }));
     }
   };
 
@@ -229,6 +343,75 @@ export default function BatchPage({ params }: PageProps) {
         </Alert>
       ) : null}
 
+      {showAuthGrid ? (
+        <Card className="mb-6">
+          <CardHeader>
+            <CardTitle>Batch Auth Grid</CardTitle>
+            <CardDescription>
+              Generate device codes for all tenants, authorize each at microsoft.com/devicelogin, then start processing.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                onClick={() => void callBatchAction("generate-all-codes")}
+                disabled={Boolean(batchActionBusy["generate-all-codes"])}
+              >
+                {batchActionBusy["generate-all-codes"] ? "Generating..." : "Generate All Codes"}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => void callBatchAction("start-processing")}
+                disabled={Boolean(batchActionBusy["start-processing"]) || authGridTenants.length === 0}
+              >
+                {batchActionBusy["start-processing"] ? "Starting..." : "I've Authorized All - Start Processing"}
+              </Button>
+            </div>
+
+            {authGridTenants.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No auth codes generated yet. Click Generate All Codes.</p>
+            ) : (
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {authGridTenants.map((tenant) => (
+                  <div key={tenant.id} className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                    <div className="mb-1 text-sm font-medium text-amber-900">{tenant.domain}</div>
+                    <div className="text-xs text-amber-800">{tenant.tenantName}</div>
+                    <div className="mt-2 text-2xl font-mono font-bold tracking-[0.12em] text-amber-950">
+                      {tenant.authCode || "CODE_PENDING"}
+                    </div>
+                    <div className="mt-2 text-xs text-amber-900">Expires in: {formatCountdown(tenant.authCodeExpiry)}</div>
+                    <div className="mt-3 flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={async () => {
+                          if (!tenant.authCode) return;
+                          try {
+                            await navigator.clipboard.writeText(tenant.authCode);
+                          } catch {
+                            setError("Unable to copy code");
+                          }
+                        }}
+                      >
+                        Copy Code
+                      </Button>
+                      <a
+                        className="text-xs underline"
+                        href="https://microsoft.com/devicelogin"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open device login
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
+
       <Card className="mb-6">
         <CardHeader>
           <CardTitle>Overall Progress</CardTitle>
@@ -239,10 +422,15 @@ export default function BatchPage({ params }: PageProps) {
           <div className="flex flex-wrap items-center gap-2">
             <Badge className="bg-emerald-100 text-emerald-900 border-emerald-200">Completed: {counts.completed}</Badge>
             <Badge className="bg-blue-100 text-blue-900 border-blue-200">In Progress: {counts.inProgress}</Badge>
+            <Badge className="bg-slate-100 text-slate-900 border-slate-200">Queued: {counts.queued}</Badge>
             <Badge className="bg-rose-100 text-rose-900 border-rose-200">Failed: {counts.failed}</Badge>
           </div>
           <div className="text-sm text-muted-foreground">
             {data.batch.completedCount} / {data.batch.totalCount} complete ({overallPercent}%) • ETA: {etaLabel}
+          </div>
+          <div className="text-sm text-muted-foreground">ETA (20m/tenant): {fixedEtaLabel}</div>
+          <div className="text-sm text-muted-foreground">
+            Current tenant: {currentTenant ? `${currentTenant.tenantName} (${currentTenant.domain})` : "Waiting for queue"}
           </div>
           {data.batch.status === "completed" ? (
             <Button asChild>
@@ -281,6 +469,12 @@ export default function BatchPage({ params }: PageProps) {
                   </p>
                   {retryStatusByTenant[tenant.id] ? (
                     <Badge variant="outline">Retry from: {retryStatusByTenant[tenant.id]}</Badge>
+                  ) : null}
+                  {tenant.status === "queued" ? (
+                    <Badge variant="outline">Queue position: #{queuedPositions.get(tenant.id) || 1}</Badge>
+                  ) : null}
+                  {processingStatuses.has(tenant.status) ? (
+                    <Badge className="bg-blue-100 text-blue-900 border-blue-200">Currently processing</Badge>
                   ) : null}
                 </div>
 
@@ -363,7 +557,7 @@ export default function BatchPage({ params }: PageProps) {
                   </div>
                 ) : null}
 
-                {["cloudflare", "tenant_prep", "mailboxes"].includes(tenant.status) ? (
+                {processingStatuses.has(tenant.status) ? (
                   <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
                     <CircleAlert className="h-4 w-4" />
                     Processing in progress.

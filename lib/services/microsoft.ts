@@ -122,6 +122,40 @@ function escapeODataString(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+type MailboxCheckpointState = {
+  created: boolean;
+  passwordSet: boolean;
+  smtpEnabled: boolean;
+  delegated: boolean;
+};
+
+type MailboxCheckpointMap = Record<string, MailboxCheckpointState>;
+
+function normalizeMailboxStatuses(raw: unknown): MailboxCheckpointMap {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+
+  const input = raw as Record<string, unknown>;
+  const normalized: MailboxCheckpointMap = {};
+
+  for (const [email, value] of Object.entries(input)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+
+    const item = value as Record<string, unknown>;
+    normalized[email] = {
+      created: item.created === true,
+      passwordSet: item.passwordSet === true,
+      smtpEnabled: item.smtpEnabled === true,
+      delegated: item.delegated === true
+    };
+  }
+
+  return normalized;
+}
+
 function isDomainAlreadyExistsError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -132,7 +166,20 @@ function isDomainAlreadyExistsError(message: string): boolean {
   );
 }
 
-async function callPowerShellService(endpoint: string, body: any, timeout = 1200000): Promise<any> {
+async function waitForPowerShellService(maxWaitMs = 30000): Promise<void> {
+  const startTime = Date.now();
+  while (Date.now() - startTime < maxWaitMs) {
+    try {
+      const response = await fetch(`${PS_SERVICE_URL}/health`, { signal: AbortSignal.timeout(3000) });
+      if (response.ok) return;
+    } catch {}
+    console.log("⏳ [PowerShell] Service not ready, waiting 3s...");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  throw new Error("PowerShell service not available after 30s. Please ensure it is running on port 3099.");
+}
+
+async function callPowerShellService(endpoint: string, body: Record<string, unknown>, timeout = 1200000): Promise<any> {
   const maxRetries = 3;
   const baseDelay = 5000;
 
@@ -140,11 +187,10 @@ async function callPowerShellService(endpoint: string, body: any, timeout = 1200
     try {
       console.log(`📡 [PowerShell] Calling ${endpoint} (attempt ${attempt}/${maxRetries})...`);
       const startTime = Date.now();
-
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-      const response = await fetch(`http://localhost:3099${endpoint}`, {
+      const response = await fetch(`${PS_SERVICE_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -152,22 +198,20 @@ async function callPowerShellService(endpoint: string, body: any, timeout = 1200
       });
 
       clearTimeout(timeoutId);
-
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-      const data = await response.json();
-
       if (!response.ok) {
-        console.log(`❌ [PowerShell] ${endpoint} failed after ${elapsed}s: ${data.error}`);
-        throw new Error(`PowerShell service error: ${data.error || JSON.stringify(data)}`);
+        const error = (await response.json().catch(() => ({ error: response.statusText }))) as { error?: string };
+        console.log(`❌ [PowerShell] ${endpoint} failed after ${elapsed}s: ${error.error}`);
+        throw new Error(`PowerShell service error: ${error.error || response.statusText}`);
       }
 
+      const data = await response.json();
       console.log(`✅ [PowerShell] ${endpoint} completed in ${elapsed}s`);
       return data;
     } catch (error: any) {
       const msg = error.message || "";
-      const isTransient =
-        msg.includes("fetch failed") ||
+      const isTransient = msg.includes("fetch failed") ||
         msg.includes("ECONNREFUSED") ||
         msg.includes("ETIMEDOUT") ||
         msg.includes("socket hang up") ||
@@ -178,34 +222,18 @@ async function callPowerShellService(endpoint: string, body: any, timeout = 1200
       if (isTransient && attempt < maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt - 1);
         console.log(`⚠️ [PowerShell] Attempt ${attempt}/${maxRetries} failed (${msg}). Waiting ${delay / 1000}s before retry...`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
 
       if (attempt === maxRetries && isTransient) {
-        throw new Error(`PowerShell service unreachable after ${maxRetries} attempts. Is the service running on port 3099?`);
+        throw new Error(`PowerShell service unreachable after ${maxRetries} attempts on ${endpoint}. Is the service running on port 3099?`);
       }
 
       throw error;
     }
   }
-
-  throw new Error("PowerShell service failed after maximum retries");
-}
-
-async function waitForPowerShellService(maxWaitMs = 30000): Promise<void> {
-  const startTime = Date.now();
-  while (Date.now() - startTime < maxWaitMs) {
-    try {
-      const response = await fetch("http://localhost:3099/health", {
-        signal: AbortSignal.timeout(3000)
-      });
-      if (response.ok) return;
-    } catch {}
-    console.log("⏳ [PowerShell] Service not ready, waiting 3s...");
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-  }
-  throw new Error("PowerShell service not available after 30s. Please ensure it is running.");
+  throw new Error("callPowerShellService: unexpected exit from retry loop");
 }
 
 export async function setupTenantPrep(tenantId: string): Promise<void> {
@@ -630,7 +658,7 @@ export async function createLicensedUser(
   const [firstName = fallbackLocalPart, ...rest] = firstInboxName.split(/\s+/).filter(Boolean);
   const lastName = rest.join(" ");
   const displayName = [firstName, lastName].filter(Boolean).join(" ");
-  const mailNickname = firstName.toLowerCase().replace(/[^a-zA-Z0-9]/g, "") || fallbackLocalPart;
+  const mailNickname = [firstName, ...rest].filter(Boolean).join(".").toLowerCase().replace(/[^a-z0-9.]/g, "") || fallbackLocalPart;
   const userPrincipalName = `${mailNickname}@${domain}`;
 
   let userId: string;
@@ -790,18 +818,18 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
 }
 
 export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
-  await waitForPowerShellService();
-
   const tenant = await prisma.tenant.findUniqueOrThrow({
     where: { id: tenantDbId },
     include: { batch: true }
   });
+  await waitForPowerShellService();
 
   const domain = tenant.domain;
   const organizationId = tenant.tenantId;
   const adminEmail = tenant.adminEmail;
   const adminPassword = tenant.adminPassword;
   const licensedUserUpn = tenant.licensedUserUpn;
+  const exchangeLicensedUser = licensedUserUpn || `admin@${domain}`;
 
   if (!domain || !organizationId || !adminEmail || !adminPassword) {
     throw new Error("Missing tenant data for mailbox setup");
@@ -811,17 +839,6 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     ? tenant.inboxNames.filter((value): value is string => typeof value === "string")
     : [];
 
-  const mailboxData = generateEmailVariations(names, domain, tenant.inboxCount).map((mailbox) => ({
-    email: mailbox.email,
-    displayName: mailbox.displayName || mailbox.email.split("@")[0],
-    password: mailbox.password
-  }));
-
-  if (mailboxData.length === 0) {
-    console.log("ℹ️ [Microsoft] No new mailboxes to create");
-    return;
-  }
-
   const resolvedAdminPassword = (() => {
     try {
       return decryptSecret(adminPassword);
@@ -829,6 +846,30 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       return adminPassword;
     }
   })();
+
+  const mailboxData = generateEmailVariations(names, domain, tenant.inboxCount).map((mailbox) => ({
+    email: mailbox.email,
+    displayName: mailbox.displayName || mailbox.email.split("@")[0],
+    password: resolvedAdminPassword
+  }));
+  const filteredMailboxData = mailboxData.filter((mb) => mb.email !== licensedUserUpn);
+  const mailboxStatuses = normalizeMailboxStatuses(tenant.mailboxStatuses);
+
+  for (const mailbox of filteredMailboxData) {
+    if (!mailboxStatuses[mailbox.email]) {
+      mailboxStatuses[mailbox.email] = {
+        created: false,
+        passwordSet: false,
+        smtpEnabled: false,
+        delegated: false
+      };
+    }
+  }
+
+  if (filteredMailboxData.length === 0) {
+    console.log("ℹ️ [Microsoft] No new mailboxes to create");
+    return;
+  }
 
   const accessToken = await requestTenantGraphToken(organizationId);
   const userIdByEmail = new Map<string, string>();
@@ -850,52 +891,77 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     return userId;
   };
 
-  if (!tenant.sharedMailboxesCreated) {
+  const pendingCreate = filteredMailboxData.filter((mailbox) => !mailboxStatuses[mailbox.email]?.created);
+
+  if (!tenant.sharedMailboxesCreated || pendingCreate.length > 0) {
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: { currentStep: "Creating shared mailboxes...", progress: 60, status: "mailboxes" }
     });
 
-    const createResult = await callPowerShellService("/create-shared-mailboxes", {
-      adminUpn: adminEmail,
-      adminPassword: resolvedAdminPassword,
-      organizationId,
-      mailboxes: mailboxData
-    });
+    if (pendingCreate.length > 0) {
+      const createResult = await callPowerShellService("/create-shared-mailboxes", {
+        adminUpn: adminEmail,
+        adminPassword: resolvedAdminPassword,
+        organizationId,
+        mailboxes: pendingCreate
+      });
 
-    type MailboxCreateStatus = {
-      email?: string;
-      status?: string;
-      error?: string | null;
-    };
+      type MailboxCreateStatus = {
+        email?: string;
+        status?: string;
+        error?: string | null;
+      };
 
-    const resultArray: MailboxCreateStatus[] = Array.isArray(
-      (createResult as { results?: unknown })?.results
-    )
-      ? ((createResult as { results: MailboxCreateStatus[] }).results || [])
-      : [];
-    const created = resultArray.filter((result) => result.status === "created" || result.status === "exists").length;
-    const failed = resultArray.filter((result) => result.status === "failed").length;
-    console.log(`✅ [Microsoft] Shared mailboxes: ${created} created/existing, ${failed} failed out of ${mailboxData.length}`);
+      const resultArray: MailboxCreateStatus[] = Array.isArray(
+        (createResult as { results?: unknown })?.results
+      )
+        ? ((createResult as { results: MailboxCreateStatus[] }).results || [])
+        : [];
 
-    if (failed > 0) {
-      const failedEmails = resultArray
-        .filter((result) => result.status === "failed")
-        .map((result) => `${result.email}: ${result.error}`);
-      console.log("⚠️ [Microsoft] Failed mailboxes:", failedEmails.join("; "));
+      for (const result of resultArray) {
+        if (!result.email) continue;
+        if (result.status === "created" || result.status === "exists") {
+          mailboxStatuses[result.email] = {
+            ...(mailboxStatuses[result.email] || {
+              created: false,
+              passwordSet: false,
+              smtpEnabled: false,
+              delegated: false
+            }),
+            created: true
+          };
+        }
+      }
+
+      const created = resultArray.filter((result) => result.status === "created" || result.status === "exists").length;
+      const failed = resultArray.filter((result) => result.status === "failed").length;
+      console.log(`✅ [Microsoft] Shared mailboxes: ${created} created/existing, ${failed} failed out of ${pendingCreate.length}`);
+
+      if (failed > 0) {
+        const failedEmails = resultArray
+          .filter((result) => result.status === "failed")
+          .map((result) => `${result.email}: ${result.error}`);
+        console.log("⚠️ [Microsoft] Failed mailboxes:", failedEmails.join("; "));
+      }
+
+      if (created === 0 && pendingCreate.length > 0) {
+        throw new Error(`All ${pendingCreate.length} mailbox creations failed. First error: ${resultArray[0]?.error || "unknown"}`);
+      }
     }
 
-    if (created === 0 && mailboxData.length > 0) {
-      throw new Error(`All ${mailboxData.length} mailbox creations failed. First error: ${resultArray[0]?.error || "unknown"}`);
-    }
-
-    console.log("⏳ [Microsoft] Cooling down 5s before password setting...");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const allCreated = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.created);
 
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { sharedMailboxesCreated: true }
+      data: {
+        sharedMailboxesCreated: allCreated,
+        mailboxStatuses
+      }
     });
+
+    console.log("⏳ [Microsoft] Cooling down 5s before next step...");
+    await sleep(5000);
   }
 
   await prisma.tenant.update({
@@ -903,7 +969,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     data: { currentStep: "Updating email addresses...", progress: 70 }
   });
 
-  for (const mailbox of mailboxData) {
+  for (const mailbox of filteredMailboxData) {
     try {
       const userId = await resolveUserId(mailbox.email);
       if (!userId) {
@@ -925,13 +991,17 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     }
   }
 
-  if (!tenant.passwordsSet) {
+  const pendingPasswordMailboxes = filteredMailboxData.filter(
+    (mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.passwordSet
+  );
+
+  if (!tenant.passwordsSet || pendingPasswordMailboxes.length > 0) {
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: { currentStep: "Setting mailbox passwords...", progress: 75 }
     });
 
-    for (const mailbox of mailboxData) {
+    for (const mailbox of pendingPasswordMailboxes) {
       try {
         const userId = await resolveUserId(mailbox.email);
         if (!userId) continue;
@@ -941,10 +1011,19 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
           body: JSON.stringify({
             passwordProfile: {
               forceChangePasswordNextSignIn: false,
-              password: mailbox.password || resolvedAdminPassword
+              password: resolvedAdminPassword
             }
           })
         });
+        mailboxStatuses[mailbox.email] = {
+          ...(mailboxStatuses[mailbox.email] || {
+            created: false,
+            passwordSet: false,
+            smtpEnabled: false,
+            delegated: false
+          }),
+          passwordSet: true
+        };
       } catch (error) {
         console.log(
           `⚠️ [Graph] Failed to set password for ${mailbox.email}:`,
@@ -953,50 +1032,151 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       }
     }
 
+    const allPasswordsSet = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.passwordSet);
+
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { passwordsSet: true }
+      data: {
+        passwordsSet: allPasswordsSet,
+        mailboxStatuses
+      }
     });
   }
 
-  if (!tenant.smtpAuthEnabled) {
+  const pendingSmtpEmails = filteredMailboxData
+    .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.smtpEnabled)
+    .map((mailbox) => mailbox.email);
+
+  if (!tenant.smtpAuthEnabled || pendingSmtpEmails.length > 0) {
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: { currentStep: "Enabling SMTP auth...", progress: 80, status: "mailbox_config" }
     });
 
-    await callPowerShellService("/enable-smtp-auth", {
-      adminUpn: adminEmail,
-      adminPassword: resolvedAdminPassword,
-      organizationId,
-      emails: mailboxData.map((mailbox) => mailbox.email)
-    });
+    if (pendingSmtpEmails.length > 0) {
+      const smtpResult = await callPowerShellService("/enable-smtp-auth", {
+        adminUpn: adminEmail,
+        adminPassword: resolvedAdminPassword,
+        organizationId,
+        emails: pendingSmtpEmails
+      });
 
-    console.log("⏳ [Microsoft] Cooling down 5s before delegation...");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+      type SmtpResultStatus = {
+        email?: string;
+        status?: string;
+      };
+
+      const resultArray: SmtpResultStatus[] = Array.isArray((smtpResult as { results?: unknown })?.results)
+        ? ((smtpResult as { results: SmtpResultStatus[] }).results || [])
+        : [];
+
+      for (const result of resultArray) {
+        if (!result.email) continue;
+        if (result.status === "enabled") {
+          mailboxStatuses[result.email] = {
+            ...(mailboxStatuses[result.email] || {
+              created: false,
+              passwordSet: false,
+              smtpEnabled: false,
+              delegated: false
+            }),
+            smtpEnabled: true
+          };
+        }
+      }
+    }
+
+    const allSmtpEnabled = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.smtpEnabled);
 
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { smtpAuthEnabled: true }
+      data: {
+        smtpAuthEnabled: allSmtpEnabled,
+        mailboxStatuses
+      }
     });
+
+    console.log("⏳ [Microsoft] Cooling down 5s before delegation...");
+    await sleep(5000);
   }
 
-  if (!tenant.delegationComplete) {
+  const pendingDelegationEmails = filteredMailboxData
+    .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+    .map((mailbox) => mailbox.email);
+
+  if (!tenant.delegationComplete || pendingDelegationEmails.length > 0) {
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: { currentStep: "Setting mailbox delegation...", progress: 85 }
     });
 
-    await callPowerShellService("/set-delegation", {
-      adminUpn: adminEmail,
-      adminPassword: resolvedAdminPassword,
-      licensedUserUpn: licensedUserUpn || `admin@${tenant.domain}`,
-      emails: mailboxData.map((mailbox) => mailbox.email)
-    });
+    if (pendingDelegationEmails.length > 0) {
+      // Start delegation as async job
+      const startResult = await callPowerShellService("/start-delegation", {
+        adminUpn: licensedUserUpn || adminEmail,
+        adminPassword: resolvedAdminPassword,
+        licensedUserUpn: exchangeLicensedUser,
+        emails: pendingDelegationEmails
+      });
+
+      const jobId = (startResult as any).jobId;
+      console.log(`📡 [Delegation] Started async job: ${jobId}`);
+
+      // Poll for completion every 10 seconds
+      let delegationDone = false;
+      while (!delegationDone) {
+        await sleep(10000);
+
+        try {
+          const statusResponse = await fetch(`${PS_SERVICE_URL}/delegation-status/${jobId}`);
+          const status = await statusResponse.json() as any;
+
+          console.log(`📡 [Delegation] Progress: ${status.completed}/${status.total} - ${status.status}`);
+
+          await prisma.tenant.update({
+            where: { id: tenantDbId },
+            data: { currentStep: `Delegating mailboxes... (${status.status})` }
+          });
+
+          if (status.status === "completed") {
+            delegationDone = true;
+            console.log(`✅ [Delegation] All ${status.total} mailboxes delegated`);
+
+            if (Array.isArray(status.results)) {
+              for (const item of status.results as Array<{ email?: string; status?: string }>) {
+                if (!item.email) continue;
+                if (item.status === "delegated") {
+                  mailboxStatuses[item.email] = {
+                    ...(mailboxStatuses[item.email] || {
+                      created: false,
+                      passwordSet: false,
+                      smtpEnabled: false,
+                      delegated: false
+                    }),
+                    delegated: true
+                  };
+                }
+              }
+            }
+          } else if (status.status === "failed") {
+            delegationDone = true;
+            throw new Error(`Delegation failed: ${status.error}`);
+          }
+        } catch (error: any) {
+          if (error.message?.includes("Delegation failed")) throw error;
+          console.log("⚠️ [Delegation] Status check failed, will retry in 10s...");
+        }
+      }
+    }
+
+    const allDelegated = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.delegated);
 
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { delegationComplete: true }
+      data: {
+        delegationComplete: allDelegated,
+        mailboxStatuses
+      }
     });
   }
 
@@ -1006,7 +1186,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       data: { currentStep: "Enabling sign-in...", progress: 90 }
     });
 
-    for (const mailbox of mailboxData) {
+    for (const mailbox of filteredMailboxData) {
       try {
         const userId = await resolveUserId(mailbox.email);
         if (!userId) continue;
@@ -1034,7 +1214,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
 
     const cloudAppAdminTemplateId = "158c047a-c907-4556-b7ef-446551a6b5f7";
 
-    for (const mailbox of mailboxData) {
+    for (const mailbox of filteredMailboxData) {
       try {
         const userId = await resolveUserId(mailbox.email);
         if (!userId) continue;
@@ -1062,8 +1242,8 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   }
 
   const csvRows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
-  for (const mailbox of mailboxData) {
-    csvRows.push([mailbox.displayName, mailbox.email, mailbox.password || resolvedAdminPassword]);
+  for (const mailbox of filteredMailboxData) {
+    csvRows.push([mailbox.displayName, mailbox.email, resolvedAdminPassword]);
   }
 
   const csvBody = toCsv(csvRows);
@@ -1083,7 +1263,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     }
   });
 
-  console.log(`✅ [Microsoft] Phase 3 complete for ${domain} — ${mailboxData.length} shared mailboxes ready`);
+  console.log(`✅ [Microsoft] Phase 3 complete for ${domain} — ${filteredMailboxData.length} shared mailboxes ready`);
 }
 
 export async function configureDkim(tenantDbId: string): Promise<void> {

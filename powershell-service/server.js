@@ -9,6 +9,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PS_SERVICE_PORT || 3099;
+const delegationJobs = new Map();
 
 function escapePowerShellString(value) {
   return String(value || "")
@@ -201,15 +202,22 @@ $results | ConvertTo-Json -Compress
   }
 });
 
-app.post("/set-delegation", async (req, res) => {
-  let tmpFile;
+app.post("/start-delegation", async (req, res) => {
   try {
     const { adminUpn, adminPassword, licensedUserUpn, emails } = req.body;
     if (!adminUpn || !adminPassword || !licensedUserUpn || !Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    tmpFile = path.join(os.tmpdir(), `delegation-emails-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const jobId = Date.now().toString();
+    const job = { status: "running", completed: 0, total: emails.length, errors: [], results: [] };
+    delegationJobs.set(jobId, job);
+
+    // Respond immediately with jobId
+    res.json({ success: true, jobId, status: "started", total: emails.length });
+
+    // Run delegation in background (don't await in the request handler)
+    const tmpFile = path.join(os.tmpdir(), `delegation-${jobId}.json`);
     fs.writeFileSync(tmpFile, JSON.stringify(emails));
 
     const escapedAdminUpn = escapePowerShellString(adminUpn);
@@ -229,14 +237,20 @@ $emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 $counter = 1
 
 foreach ($email in $emails) {
-  try {
-    Add-MailboxPermission -Identity $email -User $licensedUser -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false | Out-Null
-    Add-RecipientPermission -Identity $email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false | Out-Null
-    Set-Mailbox -Identity $email -GrantSendOnBehalfTo $licensedUser | Out-Null
-    $results += @{ email = $email; status = "delegated" }
-  } catch {
-    $results += @{ email = $email; status = "failed"; error = $_.Exception.Message }
-  }
+  $stepErrors = @()
+
+  try { Add-MailboxPermission -Identity $email -User $licensedUser -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false -ErrorAction Stop | Out-Null }
+  catch { if ($_.Exception.Message -notmatch 'already|duplicate') { $stepErrors += "FullAccess: $($_.Exception.Message)" } }
+
+  try { Add-RecipientPermission -Identity $email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null }
+  catch { if ($_.Exception.Message -notmatch 'already|duplicate') { $stepErrors += "SendAs: $($_.Exception.Message)" } }
+
+  try { Set-Mailbox -Identity $email -GrantSendOnBehalfTo $licensedUser -ErrorAction Stop | Out-Null }
+  catch { if ($_.Exception.Message -notmatch 'already|duplicate') { $stepErrors += "SendOnBehalf: $($_.Exception.Message)" } }
+
+  if ($stepErrors.Count -eq 0) { $results += @{ email = $email; status = "delegated" } }
+  else { $results += @{ email = $email; status = "partial"; errors = ($stepErrors -join "; ") } }
+
   Write-Host "[$counter/$($emails.Count)] $email -> $($results[-1].status)"
   $counter++
 }
@@ -245,17 +259,31 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    const output = await runPowerShell(script, 1200000);
-    res.json({ success: true, results: JSON.parse(output) });
+    runPowerShell(script, 1200000)
+      .then((output) => {
+        job.status = "completed";
+        job.completed = emails.length;
+        try { job.results = JSON.parse(output); } catch { job.results = output; }
+        console.log(`Delegation job ${jobId} completed: ${emails.length} mailboxes`);
+      })
+      .catch((error) => {
+        job.status = "failed";
+        job.error = error.message;
+        console.error(`Delegation job ${jobId} failed:`, error.message);
+      })
+      .finally(() => {
+        try { fs.unlinkSync(tmpFile); } catch {}
+      });
+
   } catch (error) {
     res.status(500).json({ error: error.message });
-  } finally {
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
   }
+});
+
+app.get("/delegation-status/:jobId", (req, res) => {
+  const job = delegationJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
 });
 
 app.post("/configure-dkim", async (req, res) => {
