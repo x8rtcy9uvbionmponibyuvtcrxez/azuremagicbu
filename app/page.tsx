@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { extractApiError, parseJsonResponse } from "@/lib/http-client";
 
 const nameRegex = /^[A-Za-z]+\s+[A-Za-z]+$/;
 const tenantRegex = /^[A-Za-z0-9-]+$/;
@@ -25,6 +26,7 @@ const domainRegex = /^(?!-)(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,}$/;
 
 const singleTenantSchema = z.object({
   tenantName: z.string().trim().min(1, "Tenant name is required").regex(tenantRegex, "Use letters, numbers, and hyphens only"),
+  clientName: z.string().trim().min(1, "Client name is required"),
   domain: z.string().trim().toLowerCase().min(1, "Domain is required").regex(domainRegex, "Enter a valid domain"),
   forwardingUrl: z
     .string()
@@ -61,6 +63,7 @@ type BulkRow = {
   raw: Record<string, string>;
   parsed?: {
     tenantName: string;
+    clientName: string;
     adminEmail: string;
     adminPassword: string;
     domain: string;
@@ -73,6 +76,7 @@ type BulkRow = {
 
 const csvHeaders = [
   "tenant_name",
+  "client_name",
   "admin_email",
   "admin_password",
   "domain",
@@ -161,6 +165,7 @@ function toCsvContent(rows: Array<Record<string, string>>): string {
 function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRow {
   const errors: string[] = [];
   const tenantName = (row.tenant_name ?? "").trim();
+  const clientName = (row.client_name ?? "").trim() || tenantName;
   const adminEmail = (row.admin_email ?? "").trim().toLowerCase();
   const adminPassword = row.admin_password ?? "";
   const domain = (row.domain ?? "").trim().toLowerCase();
@@ -169,6 +174,7 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
   const inboxNames = parseInboxNames(row.inbox_names ?? "");
 
   if (!tenantName || !tenantRegex.test(tenantName)) errors.push("tenant_name must be alphanumeric with hyphens");
+  if (!clientName) errors.push("client_name is required");
   if (!adminEmail.endsWith(".onmicrosoft.com")) errors.push("admin_email must end with .onmicrosoft.com");
   if (adminPassword.length < 8) errors.push("admin_password must be at least 8 characters");
   if (!/[A-Z]/.test(adminPassword) || !/[a-z]/.test(adminPassword) || !/\d/.test(adminPassword) || !/[^A-Za-z0-9]/.test(adminPassword)) {
@@ -194,6 +200,7 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
       errors.length === 0
         ? {
             tenantName,
+            clientName,
             adminEmail,
             adminPassword,
             domain,
@@ -216,10 +223,10 @@ async function uploadCsvAndCreateBatch(csvContent: string): Promise<BatchRespons
     body: formData
   });
 
-  const payload = await response.json();
+  const payload = await parseJsonResponse<BatchResponse & { error?: string; details?: unknown }>(response);
 
   if (!response.ok) {
-    throw new Error(payload.error ? `${payload.error}${payload.details ? `: ${JSON.stringify(payload.details)}` : ""}` : "Batch upload failed");
+    throw new Error(extractApiError(payload, "Batch upload failed"));
   }
 
   return payload as BatchResponse;
@@ -242,6 +249,7 @@ export default function HomePage() {
     mode: "onChange",
     defaultValues: {
       tenantName: "",
+      clientName: "",
       domain: "",
       forwardingUrl: "",
       adminEmail: "",
@@ -303,6 +311,7 @@ export default function HomePage() {
       const csvContent = toCsvContent([
         {
           tenant_name: values.tenantName.trim(),
+          client_name: values.clientName.trim(),
           admin_email: values.adminEmail.trim().toLowerCase(),
           admin_password: values.adminPassword,
           domain: values.domain.trim().toLowerCase(),
@@ -377,6 +386,7 @@ export default function HomePage() {
       const csvContent = toCsvContent(
         validBulkRows.map((row) => ({
           tenant_name: row.parsed?.tenantName ?? "",
+          client_name: row.parsed?.clientName ?? "",
           admin_email: row.parsed?.adminEmail ?? "",
           admin_password: row.parsed?.adminPassword ?? "",
           domain: row.parsed?.domain ?? "",
@@ -399,6 +409,7 @@ export default function HomePage() {
     const csvContent = toCsvContent([
       {
         tenant_name: "TN-001",
+        client_name: "Acme Corp",
         admin_email: "admin@tenant001.onmicrosoft.com",
         admin_password: "StrongP@ssw0rd!",
         domain: "example.com",
@@ -478,6 +489,24 @@ export default function HomePage() {
                               }} />
                             </FormControl>
                             <FormDescription>Example: TN-001, client-acme-1</FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name="clientName"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Client Name</FormLabel>
+                            <FormControl>
+                              <Input placeholder="Acme Corp" {...field} onChange={(event) => {
+                                field.onChange(event);
+                                setSingleValidated(false);
+                              }} />
+                            </FormControl>
+                            <FormDescription>Used for tracking which client owns this tenant.</FormDescription>
                             <FormMessage />
                           </FormItem>
                         )}
@@ -670,7 +699,7 @@ export default function HomePage() {
                   >
                     <input {...getInputProps()} />
                     <p className="text-sm font-medium">Drag and drop CSV here, or click to browse</p>
-                    <p className="mt-2 text-xs text-muted-foreground">Required: tenant_name, admin_email, admin_password, domain, inbox_names, forwarding_url, inbox_count</p>
+                    <p className="mt-2 text-xs text-muted-foreground">Required: tenant_name, client_name, admin_email, admin_password, domain, inbox_names, forwarding_url, inbox_count</p>
                     {bulkFileName ? <p className="mt-2 text-xs">Loaded: {bulkFileName}</p> : null}
                   </div>
                   <Button type="button" variant="outline" onClick={downloadExampleCsv}>
@@ -689,6 +718,7 @@ export default function HomePage() {
                           <tr>
                             <th className="px-3 py-2">Row</th>
                             <th className="px-3 py-2">Tenant</th>
+                            <th className="px-3 py-2">Client</th>
                             <th className="px-3 py-2">Domain</th>
                             <th className="px-3 py-2">Inboxes</th>
                             <th className="px-3 py-2">Status</th>
@@ -699,6 +729,7 @@ export default function HomePage() {
                             <tr key={`${row.rowNumber}-${row.raw.tenant_name ?? ""}`} className="border-t">
                               <td className="px-3 py-2">{row.rowNumber}</td>
                               <td className="px-3 py-2">{row.raw.tenant_name || "-"}</td>
+                              <td className="px-3 py-2">{row.raw.client_name || row.raw.tenant_name || "-"}</td>
                               <td className="px-3 py-2">{row.raw.domain || "-"}</td>
                               <td className="px-3 py-2">{row.raw.inbox_count || "99"}</td>
                               <td className="px-3 py-2">

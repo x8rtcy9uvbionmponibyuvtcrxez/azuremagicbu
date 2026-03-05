@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { extractApiError, parseJsonResponse } from "@/lib/http-client";
 
 type BatchStatus = "uploading" | "processing" | "completed" | "failed";
 type TenantStatus =
@@ -49,6 +50,7 @@ type BatchPayload = {
   tenants: Array<{
     id: string;
     tenantName: string;
+    clientName: string;
     domain: string;
     status: TenantStatus;
     progress: number;
@@ -69,6 +71,53 @@ type PageProps = {
     id: string;
   };
 };
+
+type BatchEvent = {
+  id: string;
+  batchId: string;
+  tenantId: string | null;
+  level: string;
+  eventType: string;
+  message: string;
+  details: unknown;
+  createdAt: string;
+  tenant: {
+    id: string;
+    tenantName: string;
+    clientName: string;
+    domain: string;
+    tenantId: string | null;
+  } | null;
+};
+
+type EventFilterKey =
+  | "all"
+  | "errors"
+  | "retries"
+  | "auth"
+  | "domain"
+  | "mailboxes"
+  | "dkim"
+  | "integration"
+  | "worker"
+  | "submission"
+  | "other";
+
+type EventPhaseTag = "auth" | "domain" | "mailboxes" | "dkim" | "integration" | "retry" | "submission" | "worker" | "error" | "other";
+
+const eventFilterOptions: Array<{ key: EventFilterKey; label: string }> = [
+  { key: "all", label: "All" },
+  { key: "errors", label: "Errors" },
+  { key: "retries", label: "Retries" },
+  { key: "auth", label: "Auth" },
+  { key: "domain", label: "Domain" },
+  { key: "mailboxes", label: "Mailboxes" },
+  { key: "dkim", label: "DKIM" },
+  { key: "integration", label: "Integration" },
+  { key: "worker", label: "Worker" },
+  { key: "submission", label: "Submission" },
+  { key: "other", label: "Other" }
+];
 
 function statusDisplay(status: TenantStatus): string {
   switch (status) {
@@ -147,10 +196,137 @@ function formatCountdown(expiry: string | null): string {
   return `${mins}m ${secs.toString().padStart(2, "0")}s`;
 }
 
+function parseStepCounter(step: string | null): { current: number; total: number } | null {
+  if (!step) return null;
+  const match = step.match(/(\d+)\s*\/\s*(\d+)/);
+  if (!match) return null;
+
+  const current = Number.parseInt(match[1], 10);
+  const total = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) return null;
+
+  return {
+    current: Math.max(0, Math.min(current, total)),
+    total
+  };
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
+function levelBadgeClass(level: string): string {
+  if (level === "error") return "bg-rose-100 text-rose-900 border-rose-200";
+  if (level === "warn") return "bg-amber-100 text-amber-900 border-amber-200";
+  return "bg-blue-100 text-blue-900 border-blue-200";
+}
+
+function summarizeDetails(details: unknown): string {
+  if (!details) return "";
+  if (typeof details === "string") return details;
+  try {
+    return JSON.stringify(details);
+  } catch {
+    return String(details);
+  }
+}
+
+function inferEventTags(event: BatchEvent): EventPhaseTag[] {
+  const tags = new Set<EventPhaseTag>();
+  const text = `${event.eventType} ${event.message}`.toLowerCase();
+
+  if (event.level === "error" || text.includes("failed") || text.includes("error")) {
+    tags.add("error");
+  }
+  if (event.eventType === "retry_requested") {
+    tags.add("retry");
+  }
+  if (event.eventType === "csv_submitted") {
+    tags.add("submission");
+  }
+  if (event.eventType.startsWith("auth_") || event.eventType === "processing_blocked") {
+    tags.add("auth");
+  }
+  if (text.includes("domain")) {
+    tags.add("domain");
+  }
+  if (text.includes("mailbox")) {
+    tags.add("mailboxes");
+  }
+  if (text.includes("dkim")) {
+    tags.add("dkim");
+  }
+  if (text.includes("smartlead") || text.includes("instantly") || text.includes("integration") || text.includes("sequencer")) {
+    tags.add("integration");
+  }
+  if (
+    event.eventType === "worker_started" ||
+    event.eventType === "worker_failed" ||
+    event.eventType === "phase_start" ||
+    event.eventType === "phase_complete" ||
+    event.eventType === "phase_failed" ||
+    event.eventType === "tenant_completed" ||
+    event.eventType === "test_mode_path"
+  ) {
+    tags.add("worker");
+  }
+
+  if (tags.size === 0) {
+    tags.add("other");
+  }
+
+  return Array.from(tags);
+}
+
+function tagBadgeClass(tag: EventPhaseTag): string {
+  switch (tag) {
+    case "error":
+      return "bg-rose-100 text-rose-900 border-rose-200";
+    case "retry":
+      return "bg-amber-100 text-amber-900 border-amber-200";
+    case "auth":
+      return "bg-sky-100 text-sky-900 border-sky-200";
+    case "domain":
+      return "bg-indigo-100 text-indigo-900 border-indigo-200";
+    case "mailboxes":
+      return "bg-violet-100 text-violet-900 border-violet-200";
+    case "dkim":
+      return "bg-cyan-100 text-cyan-900 border-cyan-200";
+    case "integration":
+      return "bg-emerald-100 text-emerald-900 border-emerald-200";
+    case "worker":
+      return "bg-slate-100 text-slate-900 border-slate-200";
+    case "submission":
+      return "bg-lime-100 text-lime-900 border-lime-200";
+    default:
+      return "bg-zinc-100 text-zinc-900 border-zinc-200";
+  }
+}
+
+function tagLabel(tag: EventPhaseTag): string {
+  switch (tag) {
+    case "dkim":
+      return "DKIM";
+    default:
+      return tag.charAt(0).toUpperCase() + tag.slice(1);
+  }
+}
+
 export default function BatchPage({ params }: PageProps) {
   const [data, setData] = useState<BatchPayload | null>(null);
+  const [events, setEvents] = useState<BatchEvent[]>([]);
+  const [selectedEventFilter, setSelectedEventFilter] = useState<EventFilterKey>("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<Record<string, boolean>>({});
   const [retryStatusByTenant, setRetryStatusByTenant] = useState<Record<string, string>>({});
   const [batchActionBusy, setBatchActionBusy] = useState<Record<string, boolean>>({});
@@ -158,10 +334,10 @@ export default function BatchPage({ params }: PageProps) {
   const fetchBatch = useCallback(async () => {
     try {
       const response = await fetch(`/api/batch/${params.id}`, { cache: "no-store" });
-      const payload = (await response.json()) as BatchPayload & { error?: string };
+      const payload = await parseJsonResponse<BatchPayload & { error?: string; message?: string }>(response);
 
       if (!response.ok) {
-        throw new Error(payload.error || "Failed to load batch");
+        throw new Error(extractApiError(payload, "Failed to load batch"));
       }
 
       setData(payload);
@@ -177,6 +353,24 @@ export default function BatchPage({ params }: PageProps) {
     void fetchBatch();
   }, [fetchBatch]);
 
+  const fetchEvents = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/batch/${params.id}/events?limit=400`, { cache: "no-store" });
+      const payload = await parseJsonResponse<{ events?: BatchEvent[]; error?: string; message?: string }>(response);
+      if (!response.ok) {
+        throw new Error(extractApiError(payload, "Failed to load activity log"));
+      }
+      setEvents(Array.isArray(payload.events) ? payload.events : []);
+      setEventsError(null);
+    } catch (err) {
+      setEventsError(err instanceof Error ? err.message : "Failed to load activity log");
+    }
+  }, [params.id]);
+
+  useEffect(() => {
+    void fetchEvents();
+  }, [fetchEvents]);
+
   const isTerminal = data?.batch.status === "completed" || data?.batch.status === "failed";
 
   useEffect(() => {
@@ -184,10 +378,11 @@ export default function BatchPage({ params }: PageProps) {
 
     const timer = setInterval(() => {
       void fetchBatch();
+      void fetchEvents();
     }, 2000);
 
     return () => clearInterval(timer);
-  }, [data, fetchBatch, isTerminal]);
+  }, [data, fetchBatch, fetchEvents, isTerminal]);
 
   const counts = useMemo(() => {
     if (!data) return { completed: 0, failed: 0, inProgress: 0, queued: 0, remaining: 0 };
@@ -247,6 +442,78 @@ export default function BatchPage({ params }: PageProps) {
     return data.tenants.find((tenant) => processingStatuses.has(tenant.status)) || null;
   }, [data]);
 
+  const isSingleTenant = data?.batch.totalCount === 1 && (data?.tenants.length ?? 0) <= 1;
+  const singleTenant = isSingleTenant ? data?.tenants[0] ?? null : null;
+
+  const taggedEvents = useMemo(() => events.map((event) => ({ event, tags: inferEventTags(event) })), [events]);
+
+  const eventFilterCounts = useMemo(() => {
+    const counts: Record<EventFilterKey, number> = {
+      all: taggedEvents.length,
+      errors: 0,
+      retries: 0,
+      auth: 0,
+      domain: 0,
+      mailboxes: 0,
+      dkim: 0,
+      integration: 0,
+      worker: 0,
+      submission: 0,
+      other: 0
+    };
+
+    for (const item of taggedEvents) {
+      if (item.tags.includes("error")) counts.errors += 1;
+      if (item.tags.includes("retry")) counts.retries += 1;
+      if (item.tags.includes("auth")) counts.auth += 1;
+      if (item.tags.includes("domain")) counts.domain += 1;
+      if (item.tags.includes("mailboxes")) counts.mailboxes += 1;
+      if (item.tags.includes("dkim")) counts.dkim += 1;
+      if (item.tags.includes("integration")) counts.integration += 1;
+      if (item.tags.includes("worker")) counts.worker += 1;
+      if (item.tags.includes("submission")) counts.submission += 1;
+      if (item.tags.includes("other")) counts.other += 1;
+    }
+
+    return counts;
+  }, [taggedEvents]);
+
+  const filteredEvents = useMemo(() => {
+    const matches = (tags: EventPhaseTag[]) => {
+      switch (selectedEventFilter) {
+        case "all":
+          return true;
+        case "errors":
+          return tags.includes("error");
+        case "retries":
+          return tags.includes("retry");
+        case "auth":
+          return tags.includes("auth");
+        case "domain":
+          return tags.includes("domain");
+        case "mailboxes":
+          return tags.includes("mailboxes");
+        case "dkim":
+          return tags.includes("dkim");
+        case "integration":
+          return tags.includes("integration");
+        case "worker":
+          return tags.includes("worker");
+        case "submission":
+          return tags.includes("submission");
+        case "other":
+          return tags.includes("other");
+        default:
+          return true;
+      }
+    };
+
+    return taggedEvents
+      .filter((item) => matches(item.tags))
+      .slice()
+      .reverse();
+  }, [selectedEventFilter, taggedEvents]);
+
   const callTenantAction = async (tenantId: string, endpoint: string, body?: Record<string, boolean>) => {
     const key = `${tenantId}:${endpoint}`;
     setActionBusy((prev) => ({ ...prev, [key]: true }));
@@ -258,9 +525,11 @@ export default function BatchPage({ params }: PageProps) {
         body: body ? JSON.stringify(body) : undefined
       });
 
-      const payload = (await response.json()) as { error?: string; restartStatus?: string };
+      const payload = await parseJsonResponse<{ error?: string; message?: string; details?: unknown; restartStatus?: string }>(
+        response
+      );
       if (!response.ok) {
-        throw new Error(payload.error || "Action failed");
+        throw new Error(extractApiError(payload, "Action failed"));
       }
 
       if (endpoint === "retry" && payload.restartStatus) {
@@ -281,13 +550,19 @@ export default function BatchPage({ params }: PageProps) {
       const response = await fetch(`/api/batch/${params.id}/${endpoint}`, {
         method: "POST"
       });
-      const payload = (await response.json()) as { error?: string; notReady?: Array<{ tenantName?: string; error?: string }> };
+      const payload = await parseJsonResponse<{
+        error?: string;
+        message?: string;
+        details?: unknown;
+        notReady?: Array<{ tenantName?: string; error?: string }>;
+      }>(response);
       if (!response.ok) {
+        const baseMessage = extractApiError(payload, "Batch action failed");
         const notReadyMessage =
           payload.notReady && payload.notReady.length > 0
             ? ` (${payload.notReady.map((item) => `${item.tenantName || "tenant"}: ${item.error || "pending"}`).join(" | ")})`
             : "";
-        throw new Error((payload.error || "Batch action failed") + notReadyMessage);
+        throw new Error(baseMessage + notReadyMessage);
       }
       await fetchBatch();
     } catch (err) {
@@ -322,11 +597,22 @@ export default function BatchPage({ params }: PageProps) {
     <main className="mx-auto min-h-screen w-full max-w-6xl p-6 md:p-10">
       <div className="mb-6 flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Batch {data.batch.id}</h1>
-          <p className="text-sm text-muted-foreground">Auto-refresh every 2 seconds until batch reaches completed or failed.</p>
+          <h1 className="text-3xl font-semibold tracking-tight">
+            {isSingleTenant ? `Tenant Setup ${singleTenant?.domain ? `for ${singleTenant.domain}` : ""}`.trim() : `Batch ${data.batch.id}`}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {isSingleTenant
+              ? "Auto-refresh every 2 seconds while setup is in progress."
+              : "Auto-refresh every 2 seconds until batch reaches completed or failed."}
+          </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={() => void fetchBatch()}>
+          <Button
+            variant="outline"
+            onClick={async () => {
+              await Promise.all([fetchBatch(), fetchEvents()]);
+            }}
+          >
             <RefreshCcw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
@@ -346,9 +632,11 @@ export default function BatchPage({ params }: PageProps) {
       {showAuthGrid ? (
         <Card className="mb-6">
           <CardHeader>
-            <CardTitle>Batch Auth Grid</CardTitle>
+            <CardTitle>{isSingleTenant ? "Device Authorization" : "Batch Auth Grid"}</CardTitle>
             <CardDescription>
-              Generate device codes for all tenants, authorize each at microsoft.com/devicelogin, then start processing.
+              {isSingleTenant
+                ? "Generate the device code, authorize it at microsoft.com/devicelogin, then start processing."
+                : "Generate device codes for all tenants, authorize each at microsoft.com/devicelogin, then start processing."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -357,25 +645,35 @@ export default function BatchPage({ params }: PageProps) {
                 onClick={() => void callBatchAction("generate-all-codes")}
                 disabled={Boolean(batchActionBusy["generate-all-codes"])}
               >
-                {batchActionBusy["generate-all-codes"] ? "Generating..." : "Generate All Codes"}
+                {batchActionBusy["generate-all-codes"] ? "Generating..." : isSingleTenant ? "Generate Code" : "Generate All Codes"}
               </Button>
               <Button
                 variant="outline"
                 onClick={() => void callBatchAction("start-processing")}
                 disabled={Boolean(batchActionBusy["start-processing"]) || authGridTenants.length === 0}
               >
-                {batchActionBusy["start-processing"] ? "Starting..." : "I've Authorized All - Start Processing"}
+                {batchActionBusy["start-processing"]
+                  ? "Starting..."
+                  : isSingleTenant
+                    ? "I've Authorized - Start Processing"
+                    : "I've Authorized All - Start Processing"}
               </Button>
             </div>
 
             {authGridTenants.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No auth codes generated yet. Click Generate All Codes.</p>
+              <p className="text-sm text-muted-foreground">
+                {isSingleTenant ? "No code generated yet. Click Generate Code." : "No auth codes generated yet. Click Generate All Codes."}
+              </p>
             ) : (
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              <div className={isSingleTenant ? "max-w-md" : "grid gap-3 md:grid-cols-2 xl:grid-cols-3"}>
                 {authGridTenants.map((tenant) => (
                   <div key={tenant.id} className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-                    <div className="mb-1 text-sm font-medium text-amber-900">{tenant.domain}</div>
-                    <div className="text-xs text-amber-800">{tenant.tenantName}</div>
+                    <div className="mb-1 text-sm font-medium text-amber-900">
+                      {isSingleTenant ? "Authorization Code" : tenant.domain}
+                    </div>
+                    <div className="text-xs text-amber-800">
+                      {isSingleTenant ? tenant.domain : `${tenant.clientName} • ${tenant.tenantName}`}
+                    </div>
                     <div className="mt-2 text-2xl font-mono font-bold tracking-[0.12em] text-amber-950">
                       {tenant.authCode || "CODE_PENDING"}
                     </div>
@@ -443,6 +741,83 @@ export default function BatchPage({ params }: PageProps) {
         </CardContent>
       </Card>
 
+      <Card className="mb-6">
+        <CardHeader>
+          <CardTitle>Activity Log</CardTitle>
+          <CardDescription>
+            Timeline of submissions, auth, processing, retries, and errors for this {isSingleTenant ? "tenant" : "batch"}.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {eventsError ? <p className="text-sm text-rose-700">{eventsError}</p> : null}
+          {events.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No activity events yet.</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {eventFilterOptions.map((option) => {
+                  const active = selectedEventFilter === option.key;
+                  const count = eventFilterCounts[option.key];
+                  return (
+                    <Button
+                      key={option.key}
+                      size="sm"
+                      variant={active ? "default" : "outline"}
+                      className={active ? "" : "h-7 px-2 text-xs"}
+                      onClick={() => setSelectedEventFilter(option.key)}
+                    >
+                      {option.label} ({count})
+                    </Button>
+                  );
+                })}
+              </div>
+
+              <div className="max-h-96 overflow-auto rounded-lg border">
+              <table className="min-w-full text-xs md:text-sm">
+                <thead className="bg-muted/50 text-left">
+                  <tr>
+                    <th className="px-3 py-2">Time</th>
+                    <th className="px-3 py-2">Level</th>
+                    <th className="px-3 py-2">Tags</th>
+                    <th className="px-3 py-2">Tenant</th>
+                    <th className="px-3 py-2">Event</th>
+                    <th className="px-3 py-2">Details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredEvents.map(({ event, tags }) => {
+                    const detailText = summarizeDetails(event.details);
+                      return (
+                        <tr key={event.id} className="border-t align-top">
+                          <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">{formatTimestamp(event.createdAt)}</td>
+                          <td className="px-3 py-2">
+                            <Badge className={levelBadgeClass(event.level)}>{event.level}</Badge>
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2">
+                            <div className="flex flex-wrap gap-1">
+                              {tags.map((tag) => (
+                                <Badge key={`${event.id}-${tag}`} className={tagBadgeClass(tag)}>
+                                  {tagLabel(tag)}
+                                </Badge>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2">
+                            {event.tenant ? `${event.tenant.clientName} • ${event.tenant.tenantName} (${event.tenant.domain})` : "Batch"}
+                          </td>
+                          <td className="max-w-md px-3 py-2 font-medium">{event.message}</td>
+                          <td className="max-w-lg px-3 py-2 text-muted-foreground">{detailText || "—"}</td>
+                        </tr>
+                      );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid gap-4">
         {data.tenants.map((tenant) => {
           const isBusy = (endpoint: string) => actionBusy[`${tenant.id}:${endpoint}`];
@@ -454,7 +829,7 @@ export default function BatchPage({ params }: PageProps) {
                   <div>
                     <CardTitle className="text-xl">{tenant.domain}</CardTitle>
                     <CardDescription>
-                      {tenant.tenantName} • {statusDisplay(tenant.status)}
+                      {tenant.clientName} • {tenant.tenantName} • {statusDisplay(tenant.status)}
                     </CardDescription>
                   </div>
                   <Badge className={statusClasses(tenant.status)}>{statusDisplay(tenant.status)}</Badge>
@@ -462,11 +837,33 @@ export default function BatchPage({ params }: PageProps) {
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
+                  {(() => {
+                    const stepLabel =
+                      tenant.status === "auth_pending"
+                        ? "Waiting for device code confirmation"
+                        : tenant.currentStep || "Waiting for next action";
+                    const stepCounter = parseStepCounter(stepLabel);
+                    return (
+                      <>
                   <Progress value={tenant.progress} />
                   <p className="text-sm text-muted-foreground">
                     Progress: {tenant.progress}% • Step:{" "}
-                    {tenant.status === "auth_pending" ? "Waiting for device code confirmation" : tenant.currentStep || "Waiting for next action"}
+                    {stepLabel}
                   </p>
+                        {stepCounter ? (
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between text-xs text-muted-foreground">
+                              <span>Sub-step progress</span>
+                              <span>
+                                {stepCounter.current}/{stepCounter.total}
+                              </span>
+                            </div>
+                            <Progress value={Math.round((stepCounter.current / stepCounter.total) * 100)} className="h-1.5" />
+                          </div>
+                        ) : null}
+                      </>
+                    );
+                  })()}
                   {retryStatusByTenant[tenant.id] ? (
                     <Badge variant="outline">Retry from: {retryStatusByTenant[tenant.id]}</Badge>
                   ) : null}
@@ -538,15 +935,22 @@ export default function BatchPage({ params }: PageProps) {
                       <span className="text-sm font-medium">Tenant failed</span>
                     </div>
                     <p className="text-sm text-rose-900">{tenant.errorMessage || "No error message provided."}</p>
-                    <div className="mt-3">
-                      <Button
-                        variant="outline"
-                        onClick={() => void callTenantAction(tenant.id, "retry")}
-                        disabled={Boolean(isBusy("retry"))}
-                      >
-                        Retry
-                      </Button>
-                    </div>
+                  </div>
+                ) : null}
+
+                <div className="mt-3">
+                  <Button
+                    variant="outline"
+                    onClick={() => void callTenantAction(tenant.id, "retry")}
+                    disabled={Boolean(isBusy("retry"))}
+                  >
+                    Retry
+                  </Button>
+                </div>
+
+                {tenant.status !== "failed" && tenant.status !== "completed" ? (
+                  <div className="mt-3">
+                    <p className="text-xs text-muted-foreground">Retry is always available if the flow gets stuck.</p>
                   </div>
                 ) : null}
 

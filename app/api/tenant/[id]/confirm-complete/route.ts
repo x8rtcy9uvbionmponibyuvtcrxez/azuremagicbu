@@ -20,8 +20,17 @@ export async function POST(request: Request, { params }: Params) {
     const body = await request.json();
     schema.parse(body);
 
-    const tenant = await prisma.tenant.update({
+    const existing = await prisma.tenant.findUnique({
       where: { id: params.id },
+      select: { id: true }
+    });
+
+    if (!existing) {
+      return NextResponse.json({ error: "Tenant not found" }, { status: 404 });
+    }
+
+    const tenant = await prisma.tenant.update({
+      where: { id: existing.id },
       data: {
         setupConfirmed: true
       }

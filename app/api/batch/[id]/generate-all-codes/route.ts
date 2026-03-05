@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { prisma } from "@/lib/prisma";
 import { initiateDeviceAuth } from "@/lib/services/microsoft";
+import { logTenantEvent } from "@/lib/tenant-events";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,81 +14,132 @@ type Params = {
 };
 
 export async function POST(_request: Request, { params }: Params) {
-  const batch = await prisma.batch.findUnique({
-    where: { id: params.id },
-    select: {
-      id: true,
-      tenants: {
-        orderBy: { createdAt: "asc" },
-        select: {
-          id: true,
-          tenantName: true,
-          domain: true,
-          status: true,
-          authCode: true,
-          authCodeExpiry: true
+  try {
+    const batch = await prisma.batch.findUnique({
+      where: { id: params.id },
+      select: {
+        id: true,
+        tenants: {
+          orderBy: { createdAt: "asc" },
+          select: {
+            id: true,
+            tenantName: true,
+            domain: true,
+            status: true,
+            authCode: true,
+            authCodeExpiry: true
+          }
         }
       }
+    });
+
+    if (!batch) {
+      return NextResponse.json({ error: "Batch not found" }, { status: 404 });
     }
-  });
 
-  if (!batch) {
-    return NextResponse.json({ error: "Batch not found" }, { status: 404 });
-  }
+    const now = Date.now();
+    const tenantsForAuth = batch.tenants.filter((tenant) => !["completed", "failed"].includes(tenant.status));
 
-  const now = Date.now();
-  const tenantsForAuth = batch.tenants.filter((tenant) => !["completed", "failed"].includes(tenant.status));
+    const generationResults = await Promise.allSettled(
+      tenantsForAuth.map(async (tenant) => {
+        const hasActiveCode =
+          Boolean(tenant.authCode) &&
+          Boolean(tenant.authCodeExpiry) &&
+          (tenant.authCodeExpiry?.getTime() || 0) > now;
 
-  const generationResults = await Promise.allSettled(
-    tenantsForAuth.map(async (tenant) => {
-      const hasActiveCode =
-        Boolean(tenant.authCode) &&
-        Boolean(tenant.authCodeExpiry) &&
-        (tenant.authCodeExpiry?.getTime() || 0) > now;
+        if (!hasActiveCode) {
+          await initiateDeviceAuth(tenant.id);
+          return { tenantId: tenant.id, mode: "generated" as const };
+        }
+        return { tenantId: tenant.id, mode: "reused" as const };
+      })
+    );
 
-      if (!hasActiveCode) {
-        await initiateDeviceAuth(tenant.id);
+    const failures = generationResults
+      .map((result, index) => ({ result, tenant: tenantsForAuth[index] }))
+      .filter((entry): entry is { result: PromiseRejectedResult; tenant: (typeof tenantsForAuth)[number] } => entry.result.status === "rejected")
+      .map((entry) => ({
+        tenantId: entry.tenant.id,
+        tenantName: entry.tenant.tenantName,
+        domain: entry.tenant.domain,
+        error: entry.result.reason instanceof Error ? entry.result.reason.message : String(entry.result.reason)
+      }));
+
+    const successes = generationResults
+      .map((result, index) => ({ result, tenant: tenantsForAuth[index] }))
+      .filter(
+        (entry): entry is { result: PromiseFulfilledResult<{ tenantId: string; mode: "generated" | "reused" }>; tenant: (typeof tenantsForAuth)[number] } =>
+          entry.result.status === "fulfilled"
+      );
+
+    await Promise.all([
+      ...successes.map((entry) =>
+        logTenantEvent({
+          batchId: batch.id,
+          tenantId: entry.tenant.id,
+          eventType: entry.result.value.mode === "generated" ? "auth_code_generated" : "auth_code_reused",
+          message:
+            entry.result.value.mode === "generated"
+              ? "Generated new Microsoft device code"
+              : "Reused active Microsoft device code",
+          details: {
+            tenantName: entry.tenant.tenantName,
+            domain: entry.tenant.domain
+          }
+        })
+      ),
+      ...failures.map((failure) =>
+        logTenantEvent({
+          batchId: batch.id,
+          tenantId: failure.tenantId,
+          eventType: "auth_code_failed",
+          level: "error",
+          message: "Failed to generate Microsoft device code",
+          details: {
+            tenantName: failure.tenantName,
+            domain: failure.domain,
+            error: failure.error
+          }
+        })
+      )
+    ]);
+
+    const refreshed = await prisma.tenant.findMany({
+      where: { batchId: batch.id },
+      orderBy: { createdAt: "asc" },
+      select: {
+        id: true,
+        tenantName: true,
+        domain: true,
+        status: true,
+        authCode: true,
+        authCodeExpiry: true
       }
-    })
-  );
+    });
 
-  const failures = generationResults
-    .map((result, index) => ({ result, tenant: tenantsForAuth[index] }))
-    .filter((entry): entry is { result: PromiseRejectedResult; tenant: (typeof tenantsForAuth)[number] } => entry.result.status === "rejected")
-    .map((entry) => ({
-      tenantId: entry.tenant.id,
-      tenantName: entry.tenant.tenantName,
-      domain: entry.tenant.domain,
-      error: entry.result.reason instanceof Error ? entry.result.reason.message : String(entry.result.reason)
-    }));
+    const codes = refreshed
+      .filter((tenant) => tenant.authCode && tenant.status === "auth_pending")
+      .map((tenant) => ({
+        tenantId: tenant.id,
+        tenantName: tenant.tenantName,
+        domain: tenant.domain,
+        code: tenant.authCode as string,
+        expiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null
+      }));
 
-  const refreshed = await prisma.tenant.findMany({
-    where: { batchId: batch.id },
-    orderBy: { createdAt: "asc" },
-    select: {
-      id: true,
-      tenantName: true,
-      domain: true,
-      status: true,
-      authCode: true,
-      authCodeExpiry: true
-    }
-  });
-
-  const codes = refreshed
-    .filter((tenant) => tenant.authCode && tenant.status === "auth_pending")
-    .map((tenant) => ({
-      tenantId: tenant.id,
-      tenantName: tenant.tenantName,
-      domain: tenant.domain,
-      code: tenant.authCode as string,
-      expiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null
-    }));
-
-  return NextResponse.json({
-    codes,
-    generatedCount: codes.length,
-    failedCount: failures.length,
-    failures
-  });
+    return NextResponse.json({
+      codes,
+      generatedCount: codes.length,
+      failedCount: failures.length,
+      failures
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: "Failed to generate authentication codes.",
+        details: error instanceof Error ? error.message : String(error)
+      },
+      { status: 500 }
+    );
+  }
 }

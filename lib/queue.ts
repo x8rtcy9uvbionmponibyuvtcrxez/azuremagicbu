@@ -25,6 +25,11 @@ const defaultJobOptions: JobsOptions = {
   removeOnFail: 1000
 };
 
+function normalizeJobId(jobId: string): string {
+  // BullMQ reserves ":" as an internal separator and rejects custom ids containing it.
+  return jobId.replace(/:/g, "__");
+}
+
 const globalQueue = globalThis as unknown as {
   tenantProcessingQueue?: Queue<TenantProcessingJobData>;
 };
@@ -46,8 +51,10 @@ export async function enqueueTenantProcessingJob(
   options?: { delayMs?: number; jobId?: string }
 ) {
   const queue = getTenantQueue();
+  const rawJobId = options?.jobId || `${data.batchId}:${data.tenantId}:${Date.now()}`;
+  const jobId = normalizeJobId(rawJobId);
   const job = await queue.add("process-tenant", data, {
-    jobId: options?.jobId || `${data.batchId}:${data.tenantId}:${Date.now()}`,
+    jobId,
     delay: options?.delayMs || 0
   });
   console.log("🔄 [Queue] Adding job:", job.id);

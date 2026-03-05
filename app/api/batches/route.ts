@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import { encryptSecret, ensureEncryptionKey } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
+import { logTenantEvent } from "@/lib/tenant-events";
 import { mapTenantCsvRow } from "@/lib/validation";
 import type { ParsedTenantRecord } from "@/lib/validation";
 import { serializeInboxNames } from "@/lib/utils";
@@ -14,7 +15,18 @@ export const runtime = "nodejs";
 const fileFieldName = "file";
 
 export async function POST(request: Request) {
-  const formData = await request.formData();
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: "Invalid request payload.",
+        details: error instanceof Error ? error.message : String(error)
+      },
+      { status: 400 }
+    );
+  }
   const candidate = formData.get(fileFieldName);
 
   if (!(candidate instanceof File)) {
@@ -125,6 +137,7 @@ export async function POST(request: Request) {
         tenants: {
           create: parsedTenants.map((tenant) => ({
             tenantName: tenant.tenantName,
+            clientName: tenant.clientName,
             adminEmail: tenant.adminEmail.toLowerCase(),
             adminPassword: encryptSecret(tenant.adminPassword),
             encryptionVersion: 1,
@@ -141,11 +154,28 @@ export async function POST(request: Request) {
           select: {
             id: true,
             tenantName: true,
+            clientName: true,
             status: true
           }
         }
       }
     });
+
+    await Promise.all(
+      batch.tenants.map((tenant) =>
+        logTenantEvent({
+          batchId: batch.id,
+          tenantId: tenant.id,
+          eventType: "csv_submitted",
+          message: `CSV row accepted for ${tenant.tenantName}`,
+          details: {
+            tenantName: tenant.tenantName,
+            clientName: tenant.clientName,
+            domain: parsedTenants.find((item) => item.tenantName === tenant.tenantName)?.domain || null
+          }
+        })
+      )
+    );
 
     return NextResponse.json(
       {

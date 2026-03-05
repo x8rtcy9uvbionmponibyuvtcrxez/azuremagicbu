@@ -8,11 +8,31 @@ import {
   redisConnection,
   type TenantProcessingJobData
 } from "@/lib/queue";
+import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { setupCloudflare } from "@/lib/services/cloudflare";
-import { configureDkim, initiateDeviceAuth, setupDomainAndUser, setupSharedMailboxes, setupTenantPrep } from "@/lib/services/microsoft";
+import {
+  configureDkim,
+  createMailboxes,
+  initiateDeviceAuth,
+  setupDomainAndUser,
+  setupSharedMailboxes,
+  setupTenantPrep
+} from "@/lib/services/microsoft";
 import { connectMailboxesToSequencer } from "@/lib/services/sequencer";
+import { logTenantEvent } from "@/lib/tenant-events";
 
 const TERMINAL_BATCH_STATUSES: BatchStatus[] = ["completed", "failed"];
+const DOMAIN_PROPAGATION_RETRY_DELAY_MS = Math.max(30_000, Number(process.env.DOMAIN_PROPAGATION_RETRY_DELAY_MS || 120_000));
+
+function isDomainPropagationError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("updates to unverified domains are not allowed") ||
+    (normalized.includes("resource") &&
+      normalized.includes("does not exist") &&
+      normalized.includes("reference-property"))
+  );
+}
 
 async function updateBatchStatus(batchId: string) {
   const tenants = await prisma.tenant.findMany({
@@ -98,9 +118,29 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     return { state: tenant.status };
   }
 
+  await logTenantEvent({
+    batchId,
+    tenantId: tenant.id,
+    eventType: "worker_started",
+    message: "Worker picked up tenant for processing",
+    details: { status: tenant.status }
+  });
+
   if (!tenant.zoneId) {
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_start",
+      message: "Starting Cloudflare setup"
+    });
     await setupCloudflare(tenant.id);
     console.log("✅ [Worker] Cloudflare complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "Cloudflare setup completed"
+    });
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
@@ -111,8 +151,20 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   if (!tenant.tenantId && !tenant.deviceCode && !tenant.authConfirmed) {
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_start",
+      message: "Starting tenant prep and device auth bootstrap"
+    });
     await setupTenantPrep(tenant.id);
     console.log("✅ [Worker] Tenant prep complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "Tenant prep completed"
+    });
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
@@ -128,8 +180,20 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     console.log(`⚠️ [Worker] Device code already exists for ${tenant.tenantName}, waiting for confirmation`);
   } else {
     console.log(`🔄 [Worker] Generating new device code for ${tenant.tenantName}`);
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "auth_code_generating",
+      message: "Generating new Microsoft device code"
+    });
     await initiateDeviceAuth(tenant.id);
     console.log("✅ [Worker] Device auth initiated");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "auth_code_generated",
+      message: "Device code generated. Waiting for user authorization."
+    });
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
@@ -139,20 +203,127 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
 
   if (!tenant.authConfirmed) {
     console.log(`⚠️ [Worker] Waiting for auth confirmation for ${tenant.tenantName}`);
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "auth_pending",
+      level: "warn",
+      message: "Waiting for device code confirmation"
+    });
     await updateBatchStatus(batchId);
     return { state: "waiting_for_auth_confirmation" };
+  }
+
+  if (tenant.tenantId && (isSyntheticTestTenantId(tenant.tenantId) || !isLikelyTenantIdentifier(tenant.tenantId))) {
+    console.log(`⚠️ [Worker] Invalid tenant identifier '${tenant.tenantId}' detected for ${tenant.tenantName}. Resetting auth flow.`);
+    await prisma.tenant.update({
+      where: { id: tenant.id },
+      data: {
+        authConfirmed: false,
+        tenantId: null,
+        authCode: null,
+        deviceCode: null,
+        authCodeExpiry: null,
+        status: "tenant_prep",
+        progress: 55,
+        errorMessage: null,
+        currentStep: "Stale tenant identifier detected. Regenerating authentication code..."
+      }
+    });
+
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "auth_reset",
+      level: "warn",
+      message: "Stale tenant identifier detected. Resetting auth flow."
+    });
+
+    await initiateDeviceAuth(tenant.id);
+    await updateBatchStatus(batchId);
+    return { state: "waiting_for_auth_confirmation" };
+  }
+
+  if (process.env.TEST_MODE === "true") {
+    console.log(`🧪 [Worker] TEST_MODE active, using synthetic mailbox flow for ${tenant.tenantName}`);
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "test_mode_path",
+      message: "Running synthetic mailbox flow in TEST_MODE"
+    });
+    await createMailboxes(tenant.id);
+    await updateBatchStatus(batchId);
+    const finalTenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { status: true }
+    });
+    return { state: finalTenant?.status || "unknown" };
   }
 
   const phaseTwoComplete =
     tenant.domainAdded && tenant.domainVerified && tenant.domainDefault && Boolean(tenant.licensedUserId);
 
   if (!phaseTwoComplete) {
-    await setupDomainAndUser(tenant.id);
-    console.log("✅ [Worker] Domain setup + licensed user complete");
-    tenant = await loadTenant();
-    if (!tenant || tenant.status === "failed") {
-      await updateBatchStatus(batchId);
-      return { state: "failed" };
+    try {
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_start",
+        message: "Starting domain setup + licensed user provisioning"
+      });
+      await setupDomainAndUser(tenant.id);
+      console.log("✅ [Worker] Domain setup + licensed user complete");
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_complete",
+        message: "Domain setup + licensed user provisioning completed"
+      });
+      tenant = await loadTenant();
+      if (!tenant || tenant.status === "failed") {
+        await updateBatchStatus(batchId);
+        return { state: "failed" };
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isDomainPropagationError(message)) {
+        const retryAfterMinutes = Math.max(1, Math.round(DOMAIN_PROPAGATION_RETRY_DELAY_MS / 60000));
+        const resumeStatus = tenant.domainAdded ? "domain_verify" : "domain_add";
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            status: resumeStatus,
+            progress: tenant.domainAdded ? 74 : 62,
+            errorMessage: null,
+            currentStep: `Domain propagation delay detected. Auto-retrying in ${retryAfterMinutes} minute${retryAfterMinutes === 1 ? "" : "s"}...`
+          }
+        });
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "phase_warning",
+          level: "warn",
+          message: "Domain propagation delay detected; scheduled automatic retry",
+          details: { error: message, retryAfterMs: DOMAIN_PROPAGATION_RETRY_DELAY_MS, resumeStatus }
+        });
+        await enqueueTenantProcessingJob(
+          { tenantId: tenant.id, batchId },
+          { delayMs: DOMAIN_PROPAGATION_RETRY_DELAY_MS }
+        );
+        await updateBatchStatus(batchId);
+        return { state: "waiting_for_domain_propagation" };
+      }
+
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_failed",
+        level: "error",
+        message: "Domain setup + licensed user provisioning failed",
+        details: { error: message }
+      });
+      throw error;
     }
   } else {
     console.log(`✓ [Worker] Domain setup already complete for ${tenant.tenantName}, skipping`);
@@ -168,13 +339,33 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
 
   if (!phaseThreeComplete && tenant.status !== "completed") {
     try {
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_start",
+        message: "Starting shared mailbox pipeline"
+      });
       await setupSharedMailboxes(tenant.id);
     } catch (error: any) {
       console.error("❌ [Worker] Phase 3 failed:", error.message);
       console.error("❌ [Worker] Stack:", error.stack);
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_failed",
+        level: "error",
+        message: "Shared mailbox pipeline failed",
+        details: { error: error instanceof Error ? error.message : String(error) }
+      });
       throw error;
     }
     console.log("✅ [Worker] Shared mailbox pipeline complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "Shared mailbox pipeline completed"
+    });
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
@@ -185,16 +376,32 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   if (!tenant.dkimConfigured) {
-    try {
-      await configureDkim(tenant.id);
-      console.log("✅ [Worker] DKIM configured");
-    } catch (error: any) {
-      console.log("⚠️ [Worker] DKIM skipped (non-fatal):", error.message);
-      await prisma.tenant.update({
-        where: { id: tenant.id },
-        data: { dkimConfigured: true }
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_start",
+      message: "Starting DKIM setup"
+    });
+    const dkimResult = await configureDkim(tenant.id);
+    if (dkimResult.verificationDeferred) {
+      console.log("⚠️ [Worker] DKIM enable deferred due to propagation. Continuing pipeline.");
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "phase_warning",
+        level: "warn",
+        message: "DKIM propagation pending; tenant continued without blocking",
+        details: { reason: dkimResult.reason || "Propagation pending" }
       });
+    } else {
+      console.log("✅ [Worker] DKIM configured");
     }
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "DKIM setup completed"
+    });
     tenant = await loadTenant();
     if (!tenant || tenant.status === "failed") {
       await updateBatchStatus(batchId);
@@ -213,8 +420,20 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   if (shouldConnectSmartlead && !tenant.smartleadConnected) {
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_start",
+      message: "Starting Smartlead mailbox connection"
+    });
     await connectMailboxesToSequencer(tenant.id, "smartlead");
     console.log("✅ [Worker] Smartlead integration complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "Smartlead mailbox connection completed"
+    });
     tenant = await loadTenant();
   } else if (shouldConnectSmartlead) {
     console.log(`✓ [Worker] Smartlead already connected for ${tenant.tenantName}, skipping`);
@@ -228,8 +447,20 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   if (shouldConnectInstantly && !tenant.instantlyConnected) {
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_start",
+      message: "Starting Instantly mailbox connection"
+    });
     await connectMailboxesToSequencer(tenant.id, "instantly");
     console.log("✅ [Worker] Instantly integration complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_complete",
+      message: "Instantly mailbox connection completed"
+    });
     tenant = await loadTenant();
   } else if (shouldConnectInstantly) {
     console.log(`✓ [Worker] Instantly already connected for ${tenant.tenantName}, skipping`);
@@ -243,6 +474,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   }
 
   const phaseFourComplete =
+    phaseThreeComplete &&
     tenant.dkimConfigured &&
     (!shouldConnectSmartlead || tenant.smartleadConnected) &&
     (!shouldConnectInstantly || tenant.instantlyConnected);
@@ -257,6 +489,12 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       }
     });
     console.log("✅ [Worker] Phase 4 complete");
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "tenant_completed",
+      message: "Tenant completed successfully"
+    });
   }
 
   await updateBatchStatus(batchId);
@@ -302,6 +540,14 @@ function attachWorkerEvents(worker: Worker<TenantProcessingJobData>) {
           errorMessage: message,
           currentStep: "Failed after retries"
         }
+      });
+      await logTenantEvent({
+        batchId: job.data.batchId,
+        tenantId: job.data.tenantId,
+        eventType: "worker_failed",
+        level: "error",
+        message: "Worker job failed after retries",
+        details: { error: message }
       });
       await updateBatchStatus(job.data.batchId);
     }

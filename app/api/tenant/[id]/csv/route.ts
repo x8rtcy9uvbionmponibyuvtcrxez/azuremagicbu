@@ -12,23 +12,23 @@ type Params = {
 };
 
 export async function GET(_request: Request, { params }: Params) {
-  const tenant = await prisma.tenant.findUnique({
-    where: { id: params.id },
-    select: {
-      id: true,
-      tenantName: true,
-      domain: true,
-      inboxCount: true,
-      inboxNames: true,
-      csvUrl: true
-    }
-  });
-
-  if (!tenant) {
-    return NextResponse.json({ error: "Tenant not found" }, { status: 404 });
-  }
-
   try {
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: params.id },
+      select: {
+        id: true,
+        tenantName: true,
+        domain: true,
+        inboxCount: true,
+        inboxNames: true,
+        csvUrl: true
+      }
+    });
+
+    if (!tenant) {
+      return NextResponse.json({ error: "Tenant not found" }, { status: 404 });
+    }
+
     const csv = await getTenantCsvContent(tenant);
     const filename = tenantCsvFilename(tenant.tenantName, tenant.domain);
 

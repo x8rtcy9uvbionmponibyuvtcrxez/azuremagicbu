@@ -10,6 +10,7 @@ app.use(express.json());
 
 const PORT = process.env.PS_SERVICE_PORT || 3099;
 const delegationJobs = new Map();
+const mailboxCreationJobs = new Map();
 
 function escapePowerShellString(value) {
   return String(value || "")
@@ -19,6 +20,57 @@ function escapePowerShellString(value) {
 
 function stripAnsi(str) {
   return str.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function parseJsonFromPowerShellOutput(output) {
+  const cleaned = stripAnsi(String(output || "")).trim();
+  if (!cleaned) {
+    throw new Error("PowerShell returned empty output");
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
+
+  const lines = cleaned.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!(line.startsWith("[") || line.startsWith("{"))) continue;
+    try {
+      return JSON.parse(line);
+    } catch {}
+  }
+
+  const candidateStarts = [cleaned.lastIndexOf("["), cleaned.lastIndexOf("{")]
+    .filter((index) => index >= 0)
+    .sort((a, b) => b - a);
+  for (const start of candidateStarts) {
+    const candidate = cleaned.slice(start).trim();
+    try {
+      return JSON.parse(candidate);
+    } catch {}
+  }
+
+  throw new Error(`Unable to parse JSON payload from PowerShell output: ${cleaned.slice(0, 300)}`);
+}
+
+function parseDelegationResultsFromLogs(output) {
+  const cleaned = stripAnsi(String(output || ""));
+  const lines = cleaned.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const results = [];
+
+  for (const line of lines) {
+    const match = line.match(/\[\d+\s*\/\s*\d+\]\s+(.+?)\s+->\s+([a-zA-Z]+)/);
+    if (!match) continue;
+
+    const email = match[1].trim();
+    const status = match[2].trim().toLowerCase();
+    if (!email) continue;
+
+    results.push({ email, status });
+  }
+
+  return results;
 }
 
 function runPowerShell(script, timeout = 1200000) {
@@ -49,6 +101,79 @@ function runPowerShell(script, timeout = 1200000) {
 
     ps.on("error", (error) => reject(error));
   });
+}
+
+function runPowerShellStreaming(script, { timeout = 1200000, onStdout, onStderr } = {}) {
+  return new Promise((resolve, reject) => {
+    const ps = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      env: { ...process.env }
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        ps.kill("SIGTERM");
+      } catch {}
+    }, timeout);
+
+    ps.stdout.on("data", (data) => {
+      const text = stripAnsi(data.toString());
+      stdout += text;
+      if (typeof onStdout === "function") {
+        onStdout(text);
+      }
+    });
+
+    ps.stderr.on("data", (data) => {
+      const text = stripAnsi(data.toString());
+      stderr += text;
+      if (typeof onStderr === "function") {
+        onStderr(text);
+      }
+    });
+
+    ps.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`PowerShell timed out after ${Math.round(timeout / 1000)}s`));
+        return;
+      }
+
+      if (code !== 0) {
+        reject(new Error(`PowerShell exited with code ${code}: ${stripAnsi(stderr)}`));
+      } else {
+        resolve(stripAnsi(stdout.trim()));
+      }
+    });
+
+    ps.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+function updateProgressFromChunk(job, chunk, state) {
+  state.buffer += String(chunk || "");
+  const parts = state.buffer.split(/\r?\n/);
+  state.buffer = parts.pop() || "";
+
+  for (const line of parts) {
+    const match = line.match(/\[(\d+)\s*\/\s*(\d+)\]/);
+    if (!match) continue;
+    const completed = Number(match[1]);
+    const total = Number(match[2]);
+    if (Number.isFinite(total) && total > 0) {
+      job.total = total;
+    }
+    if (Number.isFinite(completed) && completed >= 0) {
+      job.completed = Math.max(job.completed || 0, completed);
+    }
+  }
 }
 
 app.get("/health", (_req, res) => {
@@ -121,7 +246,7 @@ foreach ($mb in $mailboxData) {
       $results += @{ email = $mb.email; status = "failed"; error = $msg }
     }
   }
-  Write-Host "[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)"
+  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)")
   $counter++
 }
 
@@ -130,11 +255,16 @@ $results | ConvertTo-Json -Compress
 `;
 
     const output = await runPowerShell(script, 600000);
-    let results;
-    try {
-      results = JSON.parse(output);
-    } catch {
-      results = { raw: output };
+    const parsed = parseJsonFromPowerShellOutput(output);
+    const results = Array.isArray(parsed)
+      ? parsed
+      : (Array.isArray(parsed?.results) ? parsed.results : null);
+
+    if (!results) {
+      return res.status(502).json({
+        error: "PowerShell returned an unexpected mailbox result payload",
+        details: typeof parsed === "object" ? parsed : String(parsed)
+      });
     }
 
     res.json({ success: true, results });
@@ -148,6 +278,123 @@ $results | ConvertTo-Json -Compress
       } catch {}
     }
   }
+});
+
+app.post("/start-create-shared-mailboxes", async (req, res) => {
+  let tmpFile;
+  try {
+    const { adminUpn, adminPassword, organizationId, mailboxes } = req.body;
+
+    if (!adminUpn || !adminPassword || !organizationId || !Array.isArray(mailboxes) || mailboxes.length === 0) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const jobId = `create-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const job = { status: "running", completed: 0, total: mailboxes.length, error: null, results: [] };
+    mailboxCreationJobs.set(jobId, job);
+
+    res.json({ success: true, jobId, status: "started", total: mailboxes.length });
+
+    tmpFile = path.join(os.tmpdir(), `mailboxes-${jobId}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(mailboxes));
+
+    const escapedClientId = escapePowerShellString(process.env.GRAPH_CLIENT_ID || "");
+    const escapedClientSecret = escapePowerShellString(process.env.GRAPH_CLIENT_SECRET || "");
+    const escapedOrgId = escapePowerShellString(organizationId);
+    const escapedAdminUpn = escapePowerShellString(adminUpn);
+    const escapedAdminPassword = escapePowerShellString(adminPassword);
+    const escapedTmpFile = escapePowerShellString(tmpFile);
+
+    const script = `
+$ErrorActionPreference = "Continue"
+
+$clientId = "${escapedClientId}"
+$clientSecret = "${escapedClientSecret}"
+$orgId = "${escapedOrgId}"
+
+$secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($clientId, $secureSecret)
+
+try {
+  Connect-ExchangeOnline -CertificateThumbprint $null -AppId $clientId -Organization $orgId -Credential $credential -ShowBanner:$false 2>$null
+} catch {
+$securePassword = ConvertTo-SecureString "${escapedAdminPassword}" -AsPlainText -Force
+$userCredential = New-Object System.Management.Automation.PSCredential("${escapedAdminUpn}", $securePassword)
+Connect-ExchangeOnline -Credential $userCredential -ShowBanner:$false
+}
+
+$results = @()
+$mailboxData = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
+$counter = 1
+
+foreach ($mb in $mailboxData) {
+  try {
+    # Check if mailbox already exists
+    $existing = $null
+    try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
+    
+    if ($existing) {
+      # Already exists - treat as success
+      try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    } else {
+      $tempName = "$($mb.displayName) $counter"
+      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
+      Start-Sleep -Seconds 2
+      try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      $results += @{ email = $mb.email; status = "created"; error = $null }
+    }
+  } catch {
+    $msg = $_.Exception.Message
+    if ($msg -like "*already*" -or $msg -like "*proxy address*") {
+      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    } else {
+      $results += @{ email = $mb.email; status = "failed"; error = $msg }
+    }
+  }
+  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)")
+  $counter++
+}
+
+Disconnect-ExchangeOnline -Confirm:$false 2>$null
+$results | ConvertTo-Json -Compress
+`;
+
+    const progressState = { buffer: "" };
+    runPowerShellStreaming(script, {
+      timeout: 600000,
+      onStdout: (text) => updateProgressFromChunk(job, text, progressState),
+      onStderr: (text) => updateProgressFromChunk(job, text, progressState)
+    })
+      .then((output) => {
+        const parsed = parseJsonFromPowerShellOutput(output);
+        const results = Array.isArray(parsed)
+          ? parsed
+          : (Array.isArray(parsed?.results) ? parsed.results : []);
+        job.status = "completed";
+        job.completed = job.total;
+        job.results = results;
+      })
+      .catch((error) => {
+        job.status = "failed";
+        job.error = error.message || String(error);
+      })
+      .finally(() => {
+        if (tmpFile) {
+          try {
+            fs.unlinkSync(tmpFile);
+          } catch {}
+        }
+      });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/create-shared-mailboxes-status/:jobId", (req, res) => {
+  const job = mailboxCreationJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
 });
 
 app.post("/enable-smtp-auth", async (req, res) => {
@@ -259,11 +506,25 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    runPowerShell(script, 1200000)
+    const progressState = { buffer: "" };
+    runPowerShellStreaming(script, {
+      timeout: 1200000,
+      onStdout: (text) => updateProgressFromChunk(job, text, progressState),
+      onStderr: (text) => updateProgressFromChunk(job, text, progressState)
+    })
       .then((output) => {
         job.status = "completed";
         job.completed = emails.length;
-        try { job.results = JSON.parse(output); } catch { job.results = output; }
+        try {
+          const parsed = parseJsonFromPowerShellOutput(output);
+          job.results = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          const parsedFromLogs = parseDelegationResultsFromLogs(output);
+          job.results = parsedFromLogs;
+          if (parsedFromLogs.length === 0) {
+            job.errors = ["Delegation output could not be parsed into structured results"];
+          }
+        }
         console.log(`Delegation job ${jobId} completed: ${emails.length} mailboxes`);
       })
       .catch((error) => {
@@ -306,7 +567,7 @@ Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 $domain = "${escapedDomain}"
 
 try {
-  New-DkimSigningConfig -DomainName $domain -Enabled $false
+  New-DkimSigningConfig -DomainName $domain -Enabled $false | Out-Null
 } catch {
   if (-not ($_.Exception.Message -like "*already exists*")) {
     throw $_
@@ -328,7 +589,15 @@ $result | ConvertTo-Json -Compress
 `;
 
     const output = await runPowerShell(script, 120000);
-    res.json({ success: true, ...JSON.parse(output) });
+    const parsed = parseJsonFromPowerShellOutput(output);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return res.status(502).json({
+        error: "PowerShell returned an unexpected DKIM payload",
+        details: String(output).slice(0, 500)
+      });
+    }
+
+    res.json({ success: true, ...parsed });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -351,14 +620,22 @@ $securePassword = ConvertTo-SecureString "${escapedAdminPassword}" -AsPlainText 
 $credential = New-Object System.Management.Automation.PSCredential("${escapedAdminUpn}", $securePassword)
 Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 
-Set-DkimSigningConfig -Identity "${escapedDomain}" -Enabled $true
+Set-DkimSigningConfig -Identity "${escapedDomain}" -Enabled $true | Out-Null
 
 Disconnect-ExchangeOnline -Confirm:$false 2>$null
 @{ status = "enabled"; domain = "${escapedDomain}" } | ConvertTo-Json -Compress
 `;
 
     const output = await runPowerShell(script, 120000);
-    res.json({ success: true, ...JSON.parse(output) });
+    const parsed = parseJsonFromPowerShellOutput(output);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return res.status(502).json({
+        error: "PowerShell returned an unexpected DKIM enable payload",
+        details: String(output).slice(0, 500)
+      });
+    }
+
+    res.json({ success: true, ...parsed });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -2,6 +2,8 @@ import { readFile } from "fs/promises";
 import path from "path";
 import type { Prisma } from "@prisma/client";
 
+import { parseInboxNamesValue } from "@/lib/utils";
+
 type TenantCsvInput = {
   tenantName: string;
   domain: string;
@@ -9,23 +11,6 @@ type TenantCsvInput = {
   inboxNames: Prisma.JsonValue | string;
   csvUrl: string | null;
 };
-
-function parseInboxNamesValue(value: Prisma.JsonValue | string): string[] {
-  if (Array.isArray(value)) {
-    return value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
-  }
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
-      }
-    } catch {
-      // fall through
-    }
-  }
-  return [];
-}
 
 function normalizeLocalPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");

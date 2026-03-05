@@ -7,14 +7,25 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  startTenantProcessorWorker();
-  const counts = await getTenantQueue().getJobCounts("waiting", "active", "completed", "failed", "delayed");
+  try {
+    startTenantProcessorWorker();
+    const counts = await getTenantQueue().getJobCounts("waiting", "active", "completed", "failed", "delayed");
 
-  return NextResponse.json({
-    ok: true,
-    worker: "tenant-processing",
-    counts
-  });
+    return NextResponse.json({
+      ok: true,
+      worker: "tenant-processing",
+      counts
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        worker: "tenant-processing",
+        error: error instanceof Error ? error.message : String(error)
+      },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST() {

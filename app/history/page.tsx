@@ -9,15 +9,22 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { extractApiError, parseJsonResponse } from "@/lib/http-client";
 
 type HistoryTenant = {
   id: string;
   tenantName: string;
+  clientName: string;
+  adminEmail: string;
+  adminPassword: string;
+  tenantId: string | null;
   domain: string;
+  inboxNames: string[];
   status: string;
   progress: number;
   currentStep: string | null;
   inboxCount: number;
+  forwardingUrl: string;
   csvUrl: string | null;
   createdAt: string;
   updatedAt: string;
@@ -79,9 +86,11 @@ export default function HistoryPage() {
   const loadHistory = useCallback(async () => {
     try {
       const response = await fetch("/api/history", { cache: "no-store" });
-      const payload = (await response.json()) as HistoryBatch[] & { error?: string };
+      const payload = await parseJsonResponse<HistoryBatch[] & { error?: string; message?: string; details?: unknown }>(
+        response
+      );
       if (!response.ok) {
-        throw new Error(payload.error || "Failed to load history");
+        throw new Error(extractApiError(payload, "Failed to load history"));
       }
       setHistory(Array.isArray(payload) ? payload : []);
       setError(null);
@@ -255,6 +264,7 @@ export default function HistoryPage() {
                                     <tr>
                                       <th className="px-3 py-2">Tenant</th>
                                       <th className="px-3 py-2">Domain</th>
+                                      <th className="px-3 py-2">Submitted Input</th>
                                       <th className="px-3 py-2">Status</th>
                                       <th className="px-3 py-2">Progress</th>
                                       <th className="px-3 py-2">Current Step</th>
@@ -272,6 +282,49 @@ export default function HistoryPage() {
                                           </div>
                                         </td>
                                         <td className="px-3 py-2">{tenant.domain || "-"}</td>
+                                        <td className="max-w-lg px-3 py-2 text-[11px] text-muted-foreground">
+                                          <div>
+                                            <span className="font-medium text-foreground">Client:</span>{" "}
+                                            <span>{tenant.clientName || "—"}</span>
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Admin:</span>{" "}
+                                            <span>{tenant.adminEmail || "—"}</span>
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Password:</span>{" "}
+                                            <code className="rounded bg-muted px-1 py-0.5 text-[10px] text-foreground">
+                                              {tenant.adminPassword || "—"}
+                                            </code>
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Tenant ID:</span>{" "}
+                                            <span>{tenant.tenantId || "—"}</span>
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Forwarding URL:</span>{" "}
+                                            {tenant.forwardingUrl ? (
+                                              <a
+                                                className="text-blue-700 underline underline-offset-2"
+                                                href={tenant.forwardingUrl}
+                                                rel="noreferrer"
+                                                target="_blank"
+                                              >
+                                                {tenant.forwardingUrl}
+                                              </a>
+                                            ) : (
+                                              "—"
+                                            )}
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Inbox Count:</span>{" "}
+                                            <span>{tenant.inboxCount}</span>
+                                          </div>
+                                          <div>
+                                            <span className="font-medium text-foreground">Inbox Names:</span>{" "}
+                                            <span>{tenant.inboxNames.length ? tenant.inboxNames.join(", ") : "—"}</span>
+                                          </div>
+                                        </td>
                                         <td className="px-3 py-2">
                                           <Badge className={tenantStatusClass(tenant.status)}>{tenant.status}</Badge>
                                         </td>

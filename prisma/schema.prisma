@@ -39,12 +39,14 @@ model Batch {
   updatedAt      DateTime    @updatedAt
 
   tenants Tenant[]
+  events  TenantEvent[]
 }
 
 model Tenant {
   id                String       @id @default(cuid())
   batchId           String
   tenantName        String
+  clientName        String       @default("Unknown")
   adminEmail        String
   adminPassword     String
   encryptionVersion Int          @default(1)
@@ -93,8 +95,26 @@ model Tenant {
   updatedAt         DateTime     @updatedAt
 
   batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  events TenantEvent[]
 
   @@index([batchId, status])
   @@index([domain])
+}
+
+model TenantEvent {
+  id        String   @id @default(cuid())
+  batchId   String
+  tenantId  String?
+  level     String   @default("info")
+  eventType String
+  message   String
+  details   String?
+  createdAt DateTime @default(now())
+
+  batch  Batch  @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([batchId, createdAt])
+  @@index([tenantId, createdAt])
 }
 

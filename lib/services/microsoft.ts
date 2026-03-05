@@ -4,6 +4,7 @@ import path from "path";
 import { decryptSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 import { generateEmailVariations } from "@/lib/services/email-generator";
+import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { parseInboxNamesValue } from "@/lib/utils";
 
 const GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0";
@@ -133,11 +134,25 @@ type MailboxCheckpointState = {
 type MailboxCheckpointMap = Record<string, MailboxCheckpointState>;
 
 function normalizeMailboxStatuses(raw: unknown): MailboxCheckpointMap {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  if (!raw) {
     return {};
   }
 
-  const input = raw as Record<string, unknown>;
+  let parsed: unknown = raw;
+
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const input = parsed as Record<string, unknown>;
   const normalized: MailboxCheckpointMap = {};
 
   for (const [email, value] of Object.entries(input)) {
@@ -157,6 +172,10 @@ function normalizeMailboxStatuses(raw: unknown): MailboxCheckpointMap {
   return normalized;
 }
 
+function serializeMailboxStatuses(statuses: MailboxCheckpointMap): string {
+  return JSON.stringify(statuses);
+}
+
 function isDomainAlreadyExistsError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -165,6 +184,16 @@ function isDomainAlreadyExistsError(message: string): boolean {
     normalized.includes("already been added") ||
     normalized.includes("object reference already exists")
   );
+}
+
+function isDomainMissingInTenantError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes("does not exist") && normalized.includes("resource");
+}
+
+function isDomainUnverifiedUpdateError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes("unverified domains are not allowed");
 }
 
 async function waitForPowerShellService(maxWaitMs = 30000): Promise<void> {
@@ -482,14 +511,40 @@ export async function verifyDomainWithDns(
     data: { currentStep: "Getting domain verification record...", progress: 63 }
   });
 
-  const dnsRecords = await graphRequest<{
+  let dnsRecords: {
     value: Array<{
       recordType: string;
       label: string;
       text: string;
       supportedService: string;
     }>;
-  }>(accessToken, `/domains/${encodeURIComponent(domain)}/verificationDnsRecords`);
+  } | null = null;
+
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      dnsRecords = await graphRequest<{
+        value: Array<{
+          recordType: string;
+          label: string;
+          text: string;
+          supportedService: string;
+        }>;
+      }>(accessToken, `/domains/${encodeURIComponent(domain)}/verificationDnsRecords`);
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isDomainMissingInTenantError(message) && attempt < 8) {
+        console.log(`⚠️ [Microsoft] Domain ${domain} not visible yet (attempt ${attempt}/8). Retrying in 10s...`);
+        await sleep(10000);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  if (!dnsRecords) {
+    throw new Error(`Domain ${domain} not visible in Microsoft after multiple retries`);
+  }
 
   const txtRecord = dnsRecords.value?.find((record) => record.recordType === "Txt");
 
@@ -592,20 +647,51 @@ export async function setDomainAsDefault(tenantDbId: string, domain: string, acc
     data: { currentStep: "Setting domain as default...", progress: 75 }
   });
 
-  try {
-    await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ isDefault: true })
-    });
+  let defaultSet = false;
+  let lastError: string | null = null;
 
-    console.log(`✅ [Microsoft] Domain ${domain} set as default`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.toLowerCase().includes("already")) {
-      console.log(`ℹ️ [Microsoft] Domain ${domain} is already default (or already updated), skipping`);
-    } else {
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ isDefault: true })
+      });
+      console.log(`✅ [Microsoft] Domain ${domain} set as default`);
+      defaultSet = true;
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastError = message;
+
+      if (message.toLowerCase().includes("already")) {
+        console.log(`ℹ️ [Microsoft] Domain ${domain} is already default (or already updated), skipping`);
+        defaultSet = true;
+        break;
+      }
+
+      const canRetry =
+        (isDomainUnverifiedUpdateError(message) || isDomainMissingInTenantError(message)) &&
+        attempt < 8;
+
+      if (canRetry) {
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: {
+            currentStep: `Domain verification still propagating (attempt ${attempt}/8). Retrying default domain...`,
+            progress: 74
+          }
+        });
+        console.log(`⚠️ [Microsoft] Domain ${domain} not ready for default update (attempt ${attempt}/8). Retrying in 10s...`);
+        await sleep(10000);
+        continue;
+      }
+
       throw error;
     }
+  }
+
+  if (!defaultSet) {
+    throw new Error(lastError || `Unable to set ${domain} as default domain`);
   }
 
   await prisma.tenant.update({
@@ -631,28 +717,7 @@ export async function createLicensedUser(
     select: { inboxNames: true }
   });
 
-  const extractedNames: string[] = [];
-  const rawInboxNames = tenant?.inboxNames;
-
-  if (Array.isArray(rawInboxNames)) {
-    for (const entry of rawInboxNames) {
-      if (typeof entry === "string") {
-        extractedNames.push(
-          ...entry
-            .split(",")
-            .map((value) => value.trim())
-            .filter(Boolean)
-        );
-      }
-    }
-  } else if (typeof rawInboxNames === "string") {
-    extractedNames.push(
-      ...rawInboxNames
-        .split(",")
-        .map((value) => value.trim())
-        .filter(Boolean)
-    );
-  }
+  const extractedNames = parseInboxNamesValue(tenant?.inboxNames);
 
   const fallbackLocalPart = adminEmail.split("@")[0].replace(/[^a-zA-Z0-9]/g, "").toLowerCase() || "admin";
   const firstInboxName = extractedNames[0] || fallbackLocalPart;
@@ -695,6 +760,21 @@ export async function createLicensedUser(
     } else {
       throw error;
     }
+  }
+
+  try {
+    await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        displayName,
+        mailNickname
+      })
+    });
+  } catch (error) {
+    console.log(
+      `⚠️ [Microsoft] Could not normalize licensed user profile for ${userPrincipalName}:`,
+      error instanceof Error ? error.message : String(error)
+    );
   }
 
   await prisma.tenant.update({
@@ -778,6 +858,12 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
     throw new Error("Missing admin credentials for domain setup");
   }
 
+  if (isSyntheticTestTenantId(organizationId) || !isLikelyTenantIdentifier(organizationId)) {
+    throw new Error(
+      `Invalid tenant identifier '${organizationId}'. Re-authorize this tenant before continuing.`
+    );
+  }
+
   const resolvedAdminPassword = (() => {
     try {
       return decryptSecret(adminPassword);
@@ -788,9 +874,40 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
 
   const accessToken = await requestTenantGraphToken(organizationId);
 
-  if (!tenant.domainAdded) {
+  let domainAdded = tenant.domainAdded;
+  let domainVerified = tenant.domainVerified;
+  let domainDefault = tenant.domainDefault;
+
+  if (domainAdded) {
+    try {
+      await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isDomainMissingInTenantError(message)) {
+        console.log(`⚠️ [Microsoft] Domain ${domain} flag was set but resource is missing. Re-adding domain.`);
+        domainAdded = false;
+        domainVerified = false;
+        domainDefault = false;
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: {
+            domainAdded: false,
+            domainVerified: false,
+            domainDefault: false,
+            currentStep: "Domain missing in tenant. Re-adding domain...",
+            progress: 60
+          }
+        });
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  if (!domainAdded) {
     try {
       await addDomainToTenant(tenantDbId, domain, accessToken);
+      domainAdded = true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isDomainAlreadyExistsError(message)) {
@@ -799,18 +916,21 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
           where: { id: tenantDbId },
           data: { domainAdded: true }
         });
+        domainAdded = true;
       } else {
         throw error;
       }
     }
   }
 
-  if (!tenant.domainVerified) {
+  if (!domainVerified) {
     await verifyDomainWithDns(tenantDbId, domain, zoneId, accessToken);
+    domainVerified = true;
   }
 
-  if (!tenant.domainDefault) {
+  if (!domainDefault) {
     await setDomainAsDefault(tenantDbId, domain, accessToken);
+    domainDefault = true;
   }
 
   if (!tenant.licensedUserId) {
@@ -853,6 +973,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   }));
   const filteredMailboxData = mailboxData.filter((mb) => mb.email !== licensedUserUpn);
   const mailboxStatuses = normalizeMailboxStatuses(tenant.mailboxStatuses);
+  const totalMailboxTarget = filteredMailboxData.length;
+  const countCreated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.created).length;
+  const countDelegated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.delegated).length;
 
   for (const mailbox of filteredMailboxData) {
     if (!mailboxStatuses[mailbox.email]) {
@@ -893,13 +1016,18 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   const pendingCreate = filteredMailboxData.filter((mailbox) => !mailboxStatuses[mailbox.email]?.created);
 
   if (!tenant.sharedMailboxesCreated || pendingCreate.length > 0) {
+    const createdAtStart = countCreated();
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { currentStep: "Creating shared mailboxes...", progress: 60, status: "mailboxes" }
+      data: {
+        currentStep: `Creating shared mailboxes... (${createdAtStart}/${totalMailboxTarget})`,
+        progress: 60,
+        status: "mailboxes"
+      }
     });
 
     if (pendingCreate.length > 0) {
-      const createResult = await callPowerShellService("/create-shared-mailboxes", {
+      const startResult = await callPowerShellService("/start-create-shared-mailboxes", {
         adminUpn: adminEmail,
         adminPassword: resolvedAdminPassword,
         organizationId,
@@ -912,11 +1040,76 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         error?: string | null;
       };
 
-      const resultArray: MailboxCreateStatus[] = Array.isArray(
-        (createResult as { results?: unknown })?.results
-      )
-        ? ((createResult as { results: MailboxCreateStatus[] }).results || [])
-        : [];
+      const createJobId = (startResult as { jobId?: string })?.jobId;
+      if (!createJobId) {
+        throw new Error("Mailbox creation job did not return a jobId");
+      }
+
+      let resultArray: MailboxCreateStatus[] = [];
+      let createDone = false;
+      const pollIntervalMs = 5000;
+      const maxPollAttempts = 180; // 15 minutes
+      let pollAttempts = 0;
+      let lastPollError: string | null = null;
+
+      while (!createDone && pollAttempts < maxPollAttempts) {
+        pollAttempts += 1;
+        await sleep(pollIntervalMs);
+
+        try {
+          const statusResponse = await fetch(`${PS_SERVICE_URL}/create-shared-mailboxes-status/${createJobId}`, {
+            signal: AbortSignal.timeout(8000)
+          });
+          if (!statusResponse.ok) {
+            throw new Error(`Mailbox create status endpoint returned ${statusResponse.status}`);
+          }
+
+          const status = (await statusResponse.json()) as {
+            status?: string;
+            completed?: number;
+            total?: number;
+            error?: string;
+            results?: MailboxCreateStatus[];
+          };
+
+          const statusLabel = status.status || "unknown";
+          const completed = status.completed ?? 0;
+          const total = status.total ?? pendingCreate.length;
+          const completedClamped = Math.max(0, Math.min(completed, total));
+          const overallCreated = Math.min(totalMailboxTarget, createdAtStart + completedClamped);
+          lastPollError = null;
+
+          await prisma.tenant.update({
+            where: { id: tenantDbId },
+            data: {
+              currentStep: `Creating shared mailboxes... (${overallCreated}/${totalMailboxTarget}) • ${statusLabel}`
+            }
+          });
+
+          if (statusLabel === "completed") {
+            createDone = true;
+            resultArray = Array.isArray(status.results) ? status.results : [];
+          } else if (statusLabel === "failed") {
+            createDone = true;
+            throw new Error(`Mailbox creation failed: ${status.error || "unknown error"}`);
+          }
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          lastPollError = message;
+          if (message.includes("Mailbox creation failed")) throw error;
+          console.log(`⚠️ [MailboxCreate] Status check failed (${pollAttempts}/${maxPollAttempts}), retrying in 5s...`);
+        }
+      }
+
+      if (!createDone) {
+        const elapsedMinutes = Math.round((maxPollAttempts * pollIntervalMs) / 60000);
+        const suffix = lastPollError ? ` Last error: ${lastPollError}` : "";
+        throw new Error(`Mailbox creation status timed out after ${elapsedMinutes} minutes.${suffix}`);
+      }
+
+      if (resultArray.length === 0 && pendingCreate.length > 0) {
+        throw new Error(`Mailbox creation returned no usable results for ${pendingCreate.length} mailboxes.`);
+      }
 
       for (const result of resultArray) {
         if (!result.email) continue;
@@ -949,13 +1142,15 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       }
     }
 
+    const createdNow = countCreated();
     const allCreated = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.created);
 
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: {
         sharedMailboxesCreated: allCreated,
-        mailboxStatuses
+        currentStep: `Shared mailboxes ready (${createdNow}/${totalMailboxTarget})`,
+        mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
       }
     });
 
@@ -1037,7 +1232,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       where: { id: tenantDbId },
       data: {
         passwordsSet: allPasswordsSet,
-        mailboxStatuses
+        mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
       }
     });
   }
@@ -1091,7 +1286,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       where: { id: tenantDbId },
       data: {
         smtpAuthEnabled: allSmtpEnabled,
-        mailboxStatuses
+        mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
       }
     });
 
@@ -1104,15 +1299,19 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     .map((mailbox) => mailbox.email);
 
   if (!tenant.delegationComplete || pendingDelegationEmails.length > 0) {
+    const delegatedAtStart = countDelegated();
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { currentStep: "Setting mailbox delegation...", progress: 85 }
+      data: {
+        currentStep: `Setting mailbox delegation... (${delegatedAtStart}/${totalMailboxTarget})`,
+        progress: 85
+      }
     });
 
     if (pendingDelegationEmails.length > 0) {
       // Start delegation as async job
       const startResult = await callPowerShellService("/start-delegation", {
-        adminUpn: licensedUserUpn || adminEmail,
+        adminUpn: adminEmail,
         adminPassword: resolvedAdminPassword,
         licensedUserUpn: exchangeLicensedUser,
         emails: pendingDelegationEmails
@@ -1123,48 +1322,92 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
 
       // Poll for completion every 10 seconds
       let delegationDone = false;
-      while (!delegationDone) {
-        await sleep(10000);
+      const pollIntervalMs = 10000;
+      const maxPollAttempts = 90; // 15 minutes
+      let pollAttempts = 0;
+      let lastPollError: string | null = null;
+
+      while (!delegationDone && pollAttempts < maxPollAttempts) {
+        pollAttempts += 1;
+        await sleep(pollIntervalMs);
 
         try {
-          const statusResponse = await fetch(`${PS_SERVICE_URL}/delegation-status/${jobId}`);
-          const status = await statusResponse.json() as any;
+          const statusResponse = await fetch(`${PS_SERVICE_URL}/delegation-status/${jobId}`, {
+            signal: AbortSignal.timeout(8000)
+          });
+          if (!statusResponse.ok) {
+            throw new Error(`Delegation status endpoint returned ${statusResponse.status}`);
+          }
 
-          console.log(`📡 [Delegation] Progress: ${status.completed}/${status.total} - ${status.status}`);
+          const status = (await statusResponse.json()) as {
+            status?: string;
+            completed?: number;
+            total?: number;
+            error?: string;
+            results?: Array<{ email?: string; status?: string }> | string;
+          };
+          const statusLabel = status.status || "unknown";
+          const completed = status.completed ?? 0;
+          const total = status.total ?? pendingDelegationEmails.length;
+          const completedClamped = Math.max(0, Math.min(completed, total));
+          lastPollError = null;
+
+          console.log(`📡 [Delegation] Progress: ${completed}/${total} - ${statusLabel}`);
 
           await prisma.tenant.update({
             where: { id: tenantDbId },
-            data: { currentStep: `Delegating mailboxes... (${status.status})` }
+            data: { currentStep: `Delegating mailboxes... (${completedClamped}/${total}) • ${statusLabel}` }
           });
 
-          if (status.status === "completed") {
+          if (statusLabel === "completed") {
             delegationDone = true;
-            console.log(`✅ [Delegation] All ${status.total} mailboxes delegated`);
+            console.log(`✅ [Delegation] All ${total} mailboxes delegated`);
 
-            if (Array.isArray(status.results)) {
-              for (const item of status.results as Array<{ email?: string; status?: string }>) {
-                if (!item.email) continue;
-                if (item.status === "delegated") {
-                  mailboxStatuses[item.email] = {
-                    ...(mailboxStatuses[item.email] || {
-                      created: false,
-                      passwordSet: false,
-                      smtpEnabled: false,
-                      delegated: false
-                    }),
-                    delegated: true
-                  };
-                }
+            const normalizedResults = Array.isArray(status.results)
+              ? status.results
+              : typeof status.results === "string"
+                ? status.results
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .map((line) => {
+                      const match = line.match(/\[\d+\s*\/\s*\d+\]\s+(.+?)\s+->\s+([a-zA-Z]+)/);
+                      if (!match) return null;
+                      return { email: match[1]?.trim(), status: match[2]?.trim().toLowerCase() };
+                    })
+                    .filter((item): item is { email: string; status: string } => Boolean(item?.email && item?.status))
+                : [];
+
+            for (const item of normalizedResults) {
+              if (!item.email) continue;
+              if (item.status === "delegated") {
+                mailboxStatuses[item.email] = {
+                  ...(mailboxStatuses[item.email] || {
+                    created: false,
+                    passwordSet: false,
+                    smtpEnabled: false,
+                    delegated: false
+                  }),
+                  delegated: true
+                };
               }
             }
-          } else if (status.status === "failed") {
+          } else if (statusLabel === "failed") {
             delegationDone = true;
             throw new Error(`Delegation failed: ${status.error}`);
           }
-        } catch (error: any) {
-          if (error.message?.includes("Delegation failed")) throw error;
-          console.log("⚠️ [Delegation] Status check failed, will retry in 10s...");
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          lastPollError = message;
+          if (message.includes("Delegation failed")) throw error;
+          console.log(`⚠️ [Delegation] Status check failed (${pollAttempts}/${maxPollAttempts}), retrying in 10s...`);
         }
+      }
+
+      if (!delegationDone) {
+        const elapsedMinutes = Math.round((maxPollAttempts * pollIntervalMs) / 60000);
+        const suffix = lastPollError ? ` Last error: ${lastPollError}` : "";
+        throw new Error(`Delegation status timed out after ${elapsedMinutes} minutes.${suffix}`);
       }
     }
 
@@ -1174,9 +1417,20 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       where: { id: tenantDbId },
       data: {
         delegationComplete: allDelegated,
-        mailboxStatuses
+        mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
       }
     });
+
+    if (!allDelegated) {
+      const undelegated = filteredMailboxData
+        .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+        .map((mailbox) => mailbox.email);
+      const preview = undelegated.slice(0, 5).join(", ");
+      throw new Error(
+        `Delegation incomplete: ${undelegated.length}/${filteredMailboxData.length} mailboxes missing delegated permissions` +
+          (preview ? ` (examples: ${preview})` : "")
+      );
+    }
   }
 
   if (!tenant.signInEnabled) {
@@ -1265,7 +1519,18 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   console.log(`✅ [Microsoft] Phase 3 complete for ${domain} — ${filteredMailboxData.length} shared mailboxes ready`);
 }
 
-export async function configureDkim(tenantDbId: string): Promise<void> {
+type DkimConfigurationResult =
+  | { status: "configured"; verificationDeferred?: boolean; reason?: string };
+
+function isDkimPropagationPendingError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("cname record does not exist for this config") ||
+    (normalized.includes("sync will take") && normalized.includes("retry this step later"))
+  );
+}
+
+export async function configureDkim(tenantDbId: string): Promise<DkimConfigurationResult> {
   const tenant = await prisma.tenant.findUniqueOrThrow({
     where: { id: tenantDbId }
   });
@@ -1358,57 +1623,29 @@ export async function configureDkim(tenantDbId: string): Promise<void> {
     }
   }
 
-  console.log("⏳ [DKIM] Waiting for DNS propagation...");
-  let dnsReady = false;
-  for (let attempt = 1; attempt <= 12; attempt++) {
-    await sleep(15000);
-    try {
-      const checkResponse = await fetch(
-        `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=CNAME&name=selector1._domainkey.${domain}`,
-        {
-          headers: {
-            "X-Auth-Key": cfApiKey,
-            "X-Auth-Email": cfEmail,
-            "Content-Type": "application/json"
-          }
-        }
-      );
-      const checkData = (await checkResponse.json()) as any;
-      if (checkData.result && checkData.result.length > 0) {
-        console.log(`✅ [DKIM] DNS records found after ${attempt * 15}s`);
-        dnsReady = true;
-        break;
+  try {
+    await callPowerShellService("/enable-dkim", {
+      adminUpn,
+      adminPassword: resolvedAdminPassword,
+      domain
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const propagationPending = isDkimPropagationPendingError(message);
+    await prisma.tenant.update({
+      where: { id: tenantDbId },
+      data: {
+        dkimConfigured: true,
+        currentStep: propagationPending
+          ? "DKIM DNS submitted. Microsoft may finish propagation in the background."
+          : "DKIM DNS submitted. Exchange enable check failed but processing will continue.",
+        progress: 98
       }
-      console.log(`⏳ [DKIM] DNS not ready yet, attempt ${attempt}/12...`);
-    } catch (_error) {
-      console.log(`⏳ [DKIM] DNS check failed, attempt ${attempt}/12, retrying...`);
-    }
-  }
-  if (!dnsReady) {
-    console.log("⚠️ [DKIM] DNS records not confirmed after 3 minutes. Attempting enable anyway...");
-  }
-
-  let dkimEnabled = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await callPowerShellService("/enable-dkim", {
-        adminUpn,
-        adminPassword: resolvedAdminPassword,
-        domain
-      });
-      dkimEnabled = true;
-      console.log(`✅ [DKIM] Enabled on attempt ${attempt}`);
-      break;
-    } catch (error: any) {
-      console.log(`⚠️ [DKIM] Enable attempt ${attempt}/3 failed: ${error.message}`);
-      if (attempt < 3) {
-        console.log("⏳ [DKIM] Waiting 30s before retry...");
-        await sleep(30000);
-      }
-    }
-  }
-  if (!dkimEnabled) {
-    throw new Error("DKIM could not be enabled after 3 attempts. DNS may need more propagation time.");
+    });
+    console.log(
+      `⚠️ [DKIM] Enable call failed for ${domain}. Continuing without blocking completion. Reason: ${message}`
+    );
+    return { status: "configured", verificationDeferred: true, reason: message };
   }
 
   await prisma.tenant.update({
@@ -1421,6 +1658,7 @@ export async function configureDkim(tenantDbId: string): Promise<void> {
   });
 
   console.log(`✅ [DKIM] Enabled for ${domain}`);
+  return { status: "configured" };
 }
 
 export async function initiateDeviceAuth(tenantId: string): Promise<void> {
@@ -1581,7 +1819,7 @@ export async function createMailboxes(tenantId: string): Promise<void> {
       }
     })();
 
-  const names = parseInboxNamesValue(tenant.inboxNames);
+    const names = parseInboxNamesValue(tenant.inboxNames);
 
     const generated = generateEmailVariations(names, tenant.domain, tenant.inboxCount);
     const rows: string[][] = [["DisplayName", "EmailAddress", "Password"]];

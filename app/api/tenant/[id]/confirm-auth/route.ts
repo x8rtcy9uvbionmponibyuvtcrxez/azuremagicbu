@@ -4,6 +4,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { enqueueTenantProcessingJob } from "@/lib/queue";
 import { pollDeviceAuthToken } from "@/lib/services/microsoft";
+import { logTenantEvent } from "@/lib/tenant-events";
 
 export const runtime = "nodejs";
 
@@ -50,6 +51,12 @@ export async function POST(request: Request, { params }: Params) {
 
     if (tenant.authConfirmed) {
       await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+      await logTenantEvent({
+        batchId: tenant.batchId,
+        tenantId: tenant.id,
+        eventType: "auth_confirmed",
+        message: "Auth already confirmed. Resuming processing."
+      });
       return NextResponse.json({ ok: true, tenantId: tenant.id, resumed: true });
     }
 
@@ -66,6 +73,13 @@ export async function POST(request: Request, { params }: Params) {
           }
         });
         await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+        await logTenantEvent({
+          batchId: tenant.batchId,
+          tenantId: tenant.id,
+          eventType: "auth_bypassed",
+          level: "warn",
+          message: "Device code missing but tenant already authorized. Resumed mailbox setup."
+        });
         return NextResponse.json({
           ok: true,
           tenantId: tenant.id,
@@ -89,6 +103,13 @@ export async function POST(request: Request, { params }: Params) {
     const verification = await pollDeviceAuthToken(tenant.id, tenant.deviceCode);
 
     if (!verification.verified) {
+      await logTenantEvent({
+        batchId: tenant.batchId,
+        tenantId: tenant.id,
+        eventType: "auth_pending",
+        level: "warn",
+        message: "Authorization still pending; waiting for device login."
+      });
       return NextResponse.json(
         { error: "Authorization still pending. Complete device login and try again." },
         { status: 409 }
@@ -107,6 +128,13 @@ export async function POST(request: Request, { params }: Params) {
     });
 
     await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+    await logTenantEvent({
+      batchId: tenant.batchId,
+      tenantId: tenant.id,
+      eventType: "auth_confirmed",
+      message: "Device code confirmed. Tenant queued for processing.",
+      details: { organizationId: verification.organizationId || null }
+    });
 
     return NextResponse.json({ ok: true, tenantId: tenant.id, resumed: true });
   } catch (error) {
@@ -138,6 +166,13 @@ export async function POST(request: Request, { params }: Params) {
           }
         });
         await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+        await logTenantEvent({
+          batchId: tenant.batchId,
+          tenantId: tenant.id,
+          eventType: "auth_code_expired",
+          level: "warn",
+          message: "Device code expired. Triggered fresh auth code generation."
+        });
       }
 
       return NextResponse.json(

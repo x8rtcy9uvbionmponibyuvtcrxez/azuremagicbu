@@ -32,6 +32,7 @@ export const tenantCsvRowSchema = z
       .regex(tenantNameRegex, {
         message: "tenant_name may contain only letters, numbers, and hyphens"
       }),
+    client_name: z.string().trim().optional().default(""),
     admin_email: z
       .string()
       .trim()
@@ -116,6 +117,7 @@ export type TenantCsvRow = z.infer<typeof tenantCsvRowSchema> & {
 
 export type ParsedTenantRecord = {
   tenantName: string;
+  clientName: string;
   adminEmail: string;
   adminPassword: string;
   domain: string;
@@ -128,6 +130,7 @@ export function mapTenantCsvRow(row: Record<string, string>): ParsedTenantRecord
   const parsed = tenantCsvRowSchema.parse(row);
   return {
     tenantName: parsed.tenant_name,
+    clientName: parsed.client_name || parsed.tenant_name,
     adminEmail: parsed.admin_email,
     adminPassword: parsed.admin_password,
     domain: parsed.domain,

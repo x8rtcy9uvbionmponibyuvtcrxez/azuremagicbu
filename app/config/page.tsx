@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { parseJsonResponse } from "@/lib/http-client";
 
 type AppConfig = {
   graphClientId: string;
@@ -64,11 +65,11 @@ export default function ConfigPage() {
   const saveConfig = () => {
     setSaving(true);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-    setStatus({
-      variant: "default",
-      title: "Saved",
-      description: "Configuration saved to localStorage and ready for this browser."
-    });
+      setStatus({
+        variant: "default",
+        title: "Saved",
+        description: "Configuration saved to localStorage for this page's connection tests. Batch processing uses server env vars."
+      });
     setTimeout(() => setSaving(false), 200);
   };
 
@@ -98,7 +99,7 @@ export default function ConfigPage() {
           }
         })
       });
-      const payload = (await response.json()) as { ok: boolean; message: string; details?: string };
+      const payload = await parseJsonResponse<{ ok: boolean; message: string; details?: string }>(response);
       setStatus({
         variant: payload.ok ? "default" : "destructive",
         title: payload.ok ? "Graph connected" : "Graph test failed",
@@ -140,7 +141,7 @@ export default function ConfigPage() {
           }
         })
       });
-      const payload = (await response.json()) as { ok: boolean; message: string; details?: string };
+      const payload = await parseJsonResponse<{ ok: boolean; message: string; details?: string }>(response);
       setStatus({
         variant: payload.ok ? "default" : "destructive",
         title: payload.ok ? "Cloudflare connected" : "Cloudflare test failed",
@@ -162,7 +163,9 @@ export default function ConfigPage() {
       <div className="mb-6 flex items-center justify-between gap-3">
         <div>
           <h1 className="text-3xl font-semibold tracking-tight">Configuration</h1>
-          <p className="text-sm text-muted-foreground">Set Graph + Cloudflare credentials used by this browser session.</p>
+          <p className="text-sm text-muted-foreground">
+            Test Graph + Cloudflare credentials from this browser. Actual batch processing reads server environment variables.
+          </p>
         </div>
         <Button asChild variant="outline">
           <Link href="/">Back to Dashboard</Link>
@@ -253,7 +256,7 @@ export default function ConfigPage() {
         <Button type="button" onClick={saveConfig} disabled={saving}>
           {saving ? "Saving..." : "Save Configuration"}
         </Button>
-        <p className="text-sm text-muted-foreground">Config auto-loads from localStorage on this browser.</p>
+        <p className="text-sm text-muted-foreground">Config auto-loads from localStorage for this page only.</p>
       </div>
     </main>
   );

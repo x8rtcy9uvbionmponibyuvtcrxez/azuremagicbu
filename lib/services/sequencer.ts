@@ -260,28 +260,35 @@ export async function connectMailboxesToSequencer(
 
   const connected = results.filter((result) => result.status === "connected").length;
   const failed = results.filter((result) => result.status === "failed").length;
+  const allConnected = failed === 0 && (connected > 0 || results.length === 0);
   console.log(`✅ [${sequencer}] Connected: ${connected}, Failed: ${failed}`);
 
   if (sequencer === "smartlead") {
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: {
-        smartleadConnected: true,
+        smartleadConnected: allConnected,
         smartleadConnectedCount: connected,
         smartleadFailedCount: failed,
         currentStep: `${sequencer}: ${connected} connected, ${failed} failed`
       }
     });
+    if (failed > 0) {
+      throw new Error(`Smartlead connection failed for ${failed} mailbox(es).`);
+    }
     return;
   }
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
     data: {
-      instantlyConnected: true,
+      instantlyConnected: allConnected,
       instantlyConnectedCount: connected,
       instantlyFailedCount: failed,
       currentStep: `${sequencer}: ${connected} connected, ${failed} failed`
     }
   });
+  if (failed > 0) {
+    throw new Error(`Instantly connection failed for ${failed} mailbox(es).`);
+  }
 }

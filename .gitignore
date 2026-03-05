@@ -1,9 +1,17 @@
 node_modules
 .next
+.next-dev
+.next_*
+.next-*
 out
 .env
 .env.local
 *.log
+*.db
+*.sqlite
+*.sqlite3
+.data
+tsconfig.tsbuildinfo
 pnpm-lock.yaml
 yarn.lock
 .DS_Store
