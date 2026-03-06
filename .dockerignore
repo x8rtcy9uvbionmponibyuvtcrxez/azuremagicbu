@@ -1,0 +1,15 @@
+.git
+.gitignore
+.next
+.next-dev
+node_modules
+npm-debug.log
+.env
+.env.local
+.data
+dev.db
+dev 2.db
+dev 3.db
+dev 4.db
+dev 5.db
+tsconfig.tsbuildinfo

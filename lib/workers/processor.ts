@@ -288,6 +288,9 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       if (isDomainPropagationError(message)) {
+        if (!tenant) {
+          throw error;
+        }
         const retryAfterMinutes = Math.max(1, Math.round(DOMAIN_PROPAGATION_RETRY_DELAY_MS / 60000));
         const resumeStatus = tenant.domainAdded ? "domain_verify" : "domain_add";
         await prisma.tenant.update({
@@ -317,7 +320,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
 
       await logTenantEvent({
         batchId,
-        tenantId: tenant.id,
+        tenantId: tenant?.id,
         eventType: "phase_failed",
         level: "error",
         message: "Domain setup + licensed user provisioning failed",

@@ -5,7 +5,6 @@ import { prisma } from "@/lib/prisma";
 import { enqueueTenantProcessingJob, getTenantQueue } from "@/lib/queue";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { logTenantEvent } from "@/lib/tenant-events";
-import { startTenantProcessorWorker } from "@/lib/workers/processor";
 
 export const runtime = "nodejs";
 
@@ -51,7 +50,6 @@ export async function POST(_request: Request, { params }: Params) {
       return NextResponse.json({ error: "Tenant not found" }, { status: 404 });
     }
 
-    startTenantProcessorWorker();
     const queue = getTenantQueue();
     const activeJobs = await queue.getJobs(["active"], 0, 2000, true);
     const queuedJobs = await queue.getJobs(["waiting", "delayed"], 0, -1, true);

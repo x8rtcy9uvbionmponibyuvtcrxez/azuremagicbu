@@ -8,10 +8,12 @@
     "dev:clean": "npm run clean:next && next dev -p 3000",
     "build": "next build",
     "start": "next start",
+    "worker": "tsx -r tsconfig-paths/register scripts/start-worker.ts",
     "lint": "next lint",
     "postinstall": "prisma generate",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev"
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -38,6 +40,8 @@
     "react-hook-form": "^7.71.2",
     "tailwind-merge": "^2.5.2",
     "tailwindcss-animate": "^1.0.7",
+    "tsconfig-paths": "^4.2.0",
+    "tsx": "^4.20.6",
     "zod": "^4.3.6"
   },
   "devDependencies": {

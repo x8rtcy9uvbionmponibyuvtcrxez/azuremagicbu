@@ -1,7 +1,9 @@
 import { PHASE_DEVELOPMENT_SERVER } from "next/constants.js";
 
 /** @type {import('next').NextConfig} */
-const baseConfig = {};
+const baseConfig = {
+  output: "standalone"
+};
 
 export default function nextConfig(phase) {
   return {

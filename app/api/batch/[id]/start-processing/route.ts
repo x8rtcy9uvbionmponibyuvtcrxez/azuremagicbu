@@ -5,7 +5,6 @@ import { enqueueTenantProcessingJob } from "@/lib/queue";
 import { pollDeviceAuthToken } from "@/lib/services/microsoft";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { logTenantEvent } from "@/lib/tenant-events";
-import { startTenantProcessorWorker } from "@/lib/workers/processor";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -159,8 +158,6 @@ export async function POST(_request: Request, { params }: Params) {
         })
       )
     );
-
-    startTenantProcessorWorker();
 
     const seed = Date.now();
     const staggerMs = 2500;
