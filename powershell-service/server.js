@@ -75,10 +75,11 @@ function parseDelegationResultsFromLogs(output) {
 
 function runPowerShell(script, timeout = 1200000) {
   return new Promise((resolve, reject) => {
-    const ps = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      timeout,
-      env: { ...process.env }
-    });
+    const spawnOptions = { env: { ...process.env } };
+    if (Number.isFinite(timeout) && timeout > 0) {
+      spawnOptions.timeout = timeout;
+    }
+    const ps = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], spawnOptions);
 
     let stdout = "";
     let stderr = "";
@@ -103,7 +104,7 @@ function runPowerShell(script, timeout = 1200000) {
   });
 }
 
-function runPowerShellStreaming(script, { timeout = 1200000, onStdout, onStderr } = {}) {
+function runPowerShellStreaming(script, { timeout = null, inactivityTimeout = 1200000, onStdout, onStderr } = {}) {
   return new Promise((resolve, reject) => {
     const ps = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
       env: { ...process.env }
@@ -111,18 +112,47 @@ function runPowerShellStreaming(script, { timeout = 1200000, onStdout, onStderr 
 
     let stdout = "";
     let stderr = "";
-    let timedOut = false;
+    let timeoutReason = null;
+    let runtimeTimer = null;
+    let inactivityTimer = null;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const clearTimers = () => {
+      if (runtimeTimer) {
+        clearTimeout(runtimeTimer);
+      }
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+      }
+    };
+
+    const killPowerShell = (reason) => {
+      timeoutReason = reason;
       try {
         ps.kill("SIGTERM");
       } catch {}
-    }, timeout);
+    };
+
+    const resetInactivityTimer = () => {
+      if (!Number.isFinite(inactivityTimeout) || inactivityTimeout <= 0) return;
+      if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+      }
+      inactivityTimer = setTimeout(() => {
+        killPowerShell("inactivity");
+      }, inactivityTimeout);
+    };
+
+    if (Number.isFinite(timeout) && timeout > 0) {
+      runtimeTimer = setTimeout(() => {
+        killPowerShell("runtime");
+      }, timeout);
+    }
+    resetInactivityTimer();
 
     ps.stdout.on("data", (data) => {
       const text = stripAnsi(data.toString());
       stdout += text;
+      resetInactivityTimer();
       if (typeof onStdout === "function") {
         onStdout(text);
       }
@@ -131,15 +161,20 @@ function runPowerShellStreaming(script, { timeout = 1200000, onStdout, onStderr 
     ps.stderr.on("data", (data) => {
       const text = stripAnsi(data.toString());
       stderr += text;
+      resetInactivityTimer();
       if (typeof onStderr === "function") {
         onStderr(text);
       }
     });
 
     ps.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) {
+      clearTimers();
+      if (timeoutReason === "runtime") {
         reject(new Error(`PowerShell timed out after ${Math.round(timeout / 1000)}s`));
+        return;
+      }
+      if (timeoutReason === "inactivity") {
+        reject(new Error(`PowerShell stalled with no output for ${Math.round(inactivityTimeout / 1000)}s`));
         return;
       }
 
@@ -151,10 +186,51 @@ function runPowerShellStreaming(script, { timeout = 1200000, onStdout, onStderr 
     });
 
     ps.on("error", (error) => {
-      clearTimeout(timer);
+      clearTimers();
       reject(error);
     });
   });
+}
+
+function parseEnvInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getMailboxStallTimeoutMs() {
+  return parseEnvInt(process.env.MAILBOX_STALL_TIMEOUT_MS, 1800000);
+}
+
+function getDelegationStallTimeoutMs() {
+  return parseEnvInt(process.env.DELEGATION_STALL_TIMEOUT_MS, 1800000);
+}
+
+function upsertMailboxResult(job, state, result) {
+  if (!state || !(state.resultsByEmail instanceof Map)) return;
+  if (!result || typeof result !== "object") return;
+  const email = typeof result.email === "string" ? result.email.trim().toLowerCase() : "";
+  if (!email) return;
+
+  const status = typeof result.status === "string" ? result.status.trim().toLowerCase() : "";
+  if (!status) return;
+
+  const existing = state.resultsByEmail.get(email) || { email, error: null };
+  const merged = {
+    ...existing,
+    email,
+    status,
+    error: result.error == null ? (existing.error ?? null) : String(result.error)
+  };
+
+  state.resultsByEmail.set(email, merged);
+  job.results = Array.from(state.resultsByEmail.values());
+}
+
+function mergeMailboxResults(job, state, results) {
+  if (!Array.isArray(results)) return;
+  for (const result of results) {
+    upsertMailboxResult(job, state, result);
+  }
 }
 
 function updateProgressFromChunk(job, chunk, state) {
@@ -163,15 +239,23 @@ function updateProgressFromChunk(job, chunk, state) {
   state.buffer = parts.pop() || "";
 
   for (const line of parts) {
-    const match = line.match(/\[(\d+)\s*\/\s*(\d+)\]/);
-    if (!match) continue;
-    const completed = Number(match[1]);
-    const total = Number(match[2]);
+    const progressMatch = line.match(/\[(\d+)\s*\/\s*(\d+)\]/);
+    if (!progressMatch) continue;
+    const completed = Number(progressMatch[1]);
+    const total = Number(progressMatch[2]);
     if (Number.isFinite(total) && total > 0) {
       job.total = total;
     }
     if (Number.isFinite(completed) && completed >= 0) {
       job.completed = Math.max(job.completed || 0, completed);
+    }
+
+    const resultMatch = line.match(/\[\d+\s*\/\s*\d+\]\s+(.+?)\s+->\s+([a-zA-Z]+)/);
+    if (resultMatch) {
+      upsertMailboxResult(job, state, {
+        email: resultMatch[1],
+        status: resultMatch[2]
+      });
     }
   }
 }
@@ -254,7 +338,7 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    const output = await runPowerShell(script, 600000);
+    const output = await runPowerShell(script, null);
     const parsed = parseJsonFromPowerShellOutput(output);
     const results = Array.isArray(parsed)
       ? parsed
@@ -360,9 +444,10 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    const progressState = { buffer: "" };
+    const progressState = { buffer: "", resultsByEmail: new Map() };
     runPowerShellStreaming(script, {
-      timeout: 600000,
+      timeout: null,
+      inactivityTimeout: getMailboxStallTimeoutMs(),
       onStdout: (text) => updateProgressFromChunk(job, text, progressState),
       onStderr: (text) => updateProgressFromChunk(job, text, progressState)
     })
@@ -371,9 +456,9 @@ $results | ConvertTo-Json -Compress
         const results = Array.isArray(parsed)
           ? parsed
           : (Array.isArray(parsed?.results) ? parsed.results : []);
+        mergeMailboxResults(job, progressState, results);
         job.status = "completed";
         job.completed = job.total;
-        job.results = results;
       })
       .catch((error) => {
         job.status = "failed";
@@ -451,7 +536,7 @@ $results | ConvertTo-Json -Compress
 
 app.post("/start-delegation", async (req, res) => {
   try {
-    const { adminUpn, adminPassword, licensedUserUpn, emails } = req.body;
+    const { adminUpn, adminPassword, licensedUserUpn, staleDelegateUpn, emails } = req.body;
     if (!adminUpn || !adminPassword || !licensedUserUpn || !Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ error: "Missing required fields" });
     }
@@ -470,6 +555,7 @@ app.post("/start-delegation", async (req, res) => {
     const escapedAdminUpn = escapePowerShellString(adminUpn);
     const escapedAdminPassword = escapePowerShellString(adminPassword);
     const escapedLicensedUser = escapePowerShellString(licensedUserUpn);
+    const escapedStaleDelegate = escapePowerShellString(staleDelegateUpn || "");
     const escapedTmpFile = escapePowerShellString(tmpFile);
 
     const script = `
@@ -479,12 +565,76 @@ $credential = New-Object System.Management.Automation.PSCredential("${escapedAdm
 Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
 
 $licensedUser = "${escapedLicensedUser}"
+$staleDelegate = "${escapedStaleDelegate}"
 $results = @()
 $emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 $counter = 1
 
+$delegateRecipient = $null
+try {
+  $delegateRecipient = Get-Recipient -Identity $licensedUser -ErrorAction Stop
+} catch {}
+
+if (-not $delegateRecipient) {
+  throw "Delegation principal '$licensedUser' was not found in Exchange. Wait for user propagation and retry."
+}
+
+function Test-DelegationState {
+  param(
+    [string]$MailboxIdentity,
+    [string]$DelegateUpn
+  )
+
+  $fullAccess = $false
+  $sendAs = $false
+  $sendOnBehalf = $false
+  $delegateLower = $DelegateUpn.ToLower()
+
+  try {
+    $fullAccess = @(
+      Get-MailboxPermission -Identity $MailboxIdentity -User $DelegateUpn -ErrorAction SilentlyContinue |
+      Where-Object { $_.AccessRights -contains "FullAccess" -and -not $_.Deny }
+    ).Count -gt 0
+  } catch {}
+
+  try {
+    $sendAs = @(
+      Get-RecipientPermission -Identity $MailboxIdentity -Trustee $DelegateUpn -ErrorAction SilentlyContinue |
+      Where-Object { $_.AccessRights -contains "SendAs" -and -not $_.Deny }
+    ).Count -gt 0
+  } catch {}
+
+  try {
+    $mailbox = Get-Mailbox -Identity $MailboxIdentity -ErrorAction SilentlyContinue
+    if ($mailbox) {
+      $sendOnBehalf = @($mailbox.GrantSendOnBehalfTo | ForEach-Object { $_.ToString().ToLower() }) -contains $delegateLower
+    }
+  } catch {}
+
+  return @{
+    fullAccess = $fullAccess
+    sendAs = $sendAs
+    sendOnBehalf = $sendOnBehalf
+  }
+}
+
 foreach ($email in $emails) {
   $stepErrors = @()
+
+  if ($staleDelegate -and $staleDelegate.ToLower() -ne $licensedUser.ToLower()) {
+    try { Remove-MailboxPermission -Identity $email -User $staleDelegate -AccessRights FullAccess -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try { Remove-RecipientPermission -Identity $email -Trustee $staleDelegate -AccessRights SendAs -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+    try {
+      $mbExisting = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+      if ($mbExisting) {
+        $existingDelegates = @($mbExisting.GrantSendOnBehalfTo | ForEach-Object { $_.ToString() })
+        if ($existingDelegates.Count -gt 0) {
+          $updatedDelegates = @($existingDelegates | Where-Object { $_.ToLower() -ne $staleDelegate.ToLower() })
+          Set-Mailbox -Identity $email -GrantSendOnBehalfTo $updatedDelegates -ErrorAction SilentlyContinue | Out-Null
+        }
+      }
+    } catch {}
+  }
 
   try { Add-MailboxPermission -Identity $email -User $licensedUser -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false -ErrorAction Stop | Out-Null }
   catch { if ($_.Exception.Message -notmatch 'already|duplicate') { $stepErrors += "FullAccess: $($_.Exception.Message)" } }
@@ -495,20 +645,51 @@ foreach ($email in $emails) {
   try { Set-Mailbox -Identity $email -GrantSendOnBehalfTo $licensedUser -ErrorAction Stop | Out-Null }
   catch { if ($_.Exception.Message -notmatch 'already|duplicate') { $stepErrors += "SendOnBehalf: $($_.Exception.Message)" } }
 
-  if ($stepErrors.Count -eq 0) { $results += @{ email = $email; status = "delegated" } }
-  else { $results += @{ email = $email; status = "partial"; errors = ($stepErrors -join "; ") } }
+  if ($stepErrors.Count -eq 0) {
+    $results += @{ email = $email; status = "applied"; errors = $null }
+  } else {
+    $results += @{ email = $email; status = "partial"; errors = ($stepErrors -join "; ") }
+  }
 
   Write-Host "[$counter/$($emails.Count)] $email -> $($results[-1].status)"
   $counter++
+}
+
+# Give Exchange time to converge permission writes before final verification.
+Start-Sleep -Seconds 10
+
+$verifyCounter = 1
+foreach ($result in $results) {
+  $email = $result.email
+  $verification = Test-DelegationState -MailboxIdentity $email -DelegateUpn $licensedUser
+  $verified = $verification.fullAccess -and $verification.sendAs
+
+  if ($verified) {
+    $result.status = "delegated"
+    $result.errors = $null
+  } else {
+    $verifyError = "Verification failed: FullAccess=$($verification.fullAccess), SendAs=$($verification.sendAs), SendOnBehalf=$($verification.sendOnBehalf)"
+    if ($result.errors) {
+      $result.errors = "$($result.errors); $verifyError"
+    } else {
+      $result.errors = $verifyError
+    }
+    $result.status = "partial"
+  }
+
+  $result.verification = $verification
+  [Console]::Error.WriteLine("[$verifyCounter/$($results.Count)] $email -> $($result.status)")
+  $verifyCounter++
 }
 
 Disconnect-ExchangeOnline -Confirm:$false 2>$null
 $results | ConvertTo-Json -Compress
 `;
 
-    const progressState = { buffer: "" };
+    const progressState = { buffer: "", resultsByEmail: new Map() };
     runPowerShellStreaming(script, {
-      timeout: 1200000,
+      timeout: null,
+      inactivityTimeout: getDelegationStallTimeoutMs(),
       onStdout: (text) => updateProgressFromChunk(job, text, progressState),
       onStderr: (text) => updateProgressFromChunk(job, text, progressState)
     })
@@ -517,7 +698,11 @@ $results | ConvertTo-Json -Compress
         job.completed = emails.length;
         try {
           const parsed = parseJsonFromPowerShellOutput(output);
-          job.results = Array.isArray(parsed) ? parsed : [];
+          const parsedResults = Array.isArray(parsed) ? parsed : [];
+          mergeMailboxResults(job, progressState, parsedResults);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            job.results = parsed;
+          }
         } catch {
           const parsedFromLogs = parseDelegationResultsFromLogs(output);
           job.results = parsedFromLogs;
@@ -545,6 +730,85 @@ app.get("/delegation-status/:jobId", (req, res) => {
   const job = delegationJobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Job not found" });
   res.json(job);
+});
+
+app.post("/verify-delegation", async (req, res) => {
+  let tmpFile;
+  try {
+    const { adminUpn, adminPassword, licensedUserUpn, emails } = req.body;
+    if (!adminUpn || !adminPassword || !licensedUserUpn || !Array.isArray(emails) || emails.length === 0) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    tmpFile = path.join(os.tmpdir(), `delegation-verify-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(tmpFile, JSON.stringify(emails));
+
+    const escapedAdminUpn = escapePowerShellString(adminUpn);
+    const escapedAdminPassword = escapePowerShellString(adminPassword);
+    const escapedLicensedUser = escapePowerShellString(licensedUserUpn);
+    const escapedTmpFile = escapePowerShellString(tmpFile);
+
+    const script = `
+$ErrorActionPreference = "Continue"
+$securePassword = ConvertTo-SecureString "${escapedAdminPassword}" -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential("${escapedAdminUpn}", $securePassword)
+Connect-ExchangeOnline -Credential $credential -ShowBanner:$false
+
+$licensedUser = "${escapedLicensedUser}"
+$delegateLower = $licensedUser.ToLower()
+$emails = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
+$results = @()
+
+foreach ($email in $emails) {
+  $fullAccess = $false
+  $sendAs = $false
+  $sendOnBehalf = $false
+
+  try {
+    $fullAccess = @(
+      Get-MailboxPermission -Identity $email -User $licensedUser -ErrorAction SilentlyContinue |
+      Where-Object { $_.AccessRights -contains "FullAccess" -and -not $_.Deny }
+    ).Count -gt 0
+  } catch {}
+
+  try {
+    $sendAs = @(
+      Get-RecipientPermission -Identity $email -Trustee $licensedUser -ErrorAction SilentlyContinue |
+      Where-Object { $_.AccessRights -contains "SendAs" -and -not $_.Deny }
+    ).Count -gt 0
+  } catch {}
+
+  try {
+    $mailbox = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+    if ($mailbox) {
+      $sendOnBehalf = @($mailbox.GrantSendOnBehalfTo | ForEach-Object { $_.ToString().ToLower() }) -contains $delegateLower
+    }
+  } catch {}
+
+  if ($fullAccess -and $sendAs) {
+    $results += @{ email = $email; status = "delegated"; errors = $null; verification = @{ fullAccess = $fullAccess; sendAs = $sendAs; sendOnBehalf = $sendOnBehalf } }
+  } else {
+    $results += @{ email = $email; status = "partial"; errors = "Verification failed: FullAccess=$fullAccess, SendAs=$sendAs, SendOnBehalf=$sendOnBehalf"; verification = @{ fullAccess = $fullAccess; sendAs = $sendAs; sendOnBehalf = $sendOnBehalf } }
+  }
+}
+
+Disconnect-ExchangeOnline -Confirm:$false 2>$null
+$results | ConvertTo-Json -Compress
+`;
+
+    const output = await runPowerShell(script, 300000);
+    const parsed = parseJsonFromPowerShellOutput(output);
+    const results = Array.isArray(parsed) ? parsed : [];
+    res.json({ success: true, results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+  }
 });
 
 app.post("/configure-dkim", async (req, res) => {

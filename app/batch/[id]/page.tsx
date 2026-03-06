@@ -104,6 +104,12 @@ type EventFilterKey =
   | "other";
 
 type EventPhaseTag = "auth" | "domain" | "mailboxes" | "dkim" | "integration" | "retry" | "submission" | "worker" | "error" | "other";
+type AutoRetryWaitState = {
+  startedAtMs: number;
+  totalMs: number;
+  reason: string;
+  bufferMultiplier: number | null;
+};
 
 const eventFilterOptions: Array<{ key: EventFilterKey; label: string }> = [
   { key: "all", label: "All" },
@@ -118,6 +124,37 @@ const eventFilterOptions: Array<{ key: EventFilterKey; label: string }> = [
   { key: "submission", label: "Submission" },
   { key: "other", label: "Other" }
 ];
+
+function readNumericDetail(details: unknown, key: string): number | null {
+  if (!details || typeof details !== "object") return null;
+  const value = (details as Record<string, unknown>)[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function extractRetryAfterMs(details: unknown): number | null {
+  const value = readNumericDetail(details, "retryAfterMs");
+  if (!value || value <= 0) return null;
+  return value;
+}
+
+function extractBufferMultiplier(details: unknown): number | null {
+  const value = readNumericDetail(details, "bufferMultiplier");
+  if (!value || value < 1) return null;
+  return value;
+}
+
+function formatDurationMs(ms: number): string {
+  const safeMs = Math.max(0, Math.round(ms));
+  const totalSeconds = Math.ceil(safeMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+}
 
 function statusDisplay(status: TenantStatus): string {
   switch (status) {
@@ -323,6 +360,7 @@ function tagLabel(tag: EventPhaseTag): string {
 export default function BatchPage({ params }: PageProps) {
   const [data, setData] = useState<BatchPayload | null>(null);
   const [events, setEvents] = useState<BatchEvent[]>([]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [selectedEventFilter, setSelectedEventFilter] = useState<EventFilterKey>("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -370,6 +408,13 @@ export default function BatchPage({ params }: PageProps) {
   useEffect(() => {
     void fetchEvents();
   }, [fetchEvents]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   const isTerminal = data?.batch.status === "completed" || data?.batch.status === "failed";
 
@@ -446,6 +491,47 @@ export default function BatchPage({ params }: PageProps) {
   const singleTenant = isSingleTenant ? data?.tenants[0] ?? null : null;
 
   const taggedEvents = useMemo(() => events.map((event) => ({ event, tags: inferEventTags(event) })), [events]);
+
+  const autoRetryWaitByTenant = useMemo(() => {
+    const waits = new Map<string, AutoRetryWaitState>();
+    const resolvedTenants = new Set<string>();
+
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (!event.tenantId) continue;
+      if (resolvedTenants.has(event.tenantId)) continue;
+
+      if (
+        event.eventType === "worker_started" ||
+        event.eventType === "retry_requested" ||
+        event.eventType === "phase_start" ||
+        event.eventType === "phase_complete" ||
+        event.eventType === "phase_failed" ||
+        event.eventType === "tenant_completed"
+      ) {
+        resolvedTenants.add(event.tenantId);
+        continue;
+      }
+
+      if (event.eventType !== "phase_warning") continue;
+
+      const retryAfterMs = extractRetryAfterMs(event.details);
+      if (!retryAfterMs) continue;
+
+      const startedAtMs = new Date(event.createdAt).getTime();
+      if (!Number.isFinite(startedAtMs)) continue;
+
+      waits.set(event.tenantId, {
+        startedAtMs,
+        totalMs: retryAfterMs,
+        reason: event.message,
+        bufferMultiplier: extractBufferMultiplier(event.details)
+      });
+      resolvedTenants.add(event.tenantId);
+    }
+
+    return waits;
+  }, [events]);
 
   const eventFilterCounts = useMemo(() => {
     const counts: Record<EventFilterKey, number> = {
@@ -843,6 +929,14 @@ export default function BatchPage({ params }: PageProps) {
                         ? "Waiting for device code confirmation"
                         : tenant.currentStep || "Waiting for next action";
                     const stepCounter = parseStepCounter(stepLabel);
+                    const waitState = autoRetryWaitByTenant.get(tenant.id) || null;
+                    const waitDeadlineMs = waitState ? waitState.startedAtMs + waitState.totalMs : 0;
+                    const waitRemainingMs = waitState ? Math.max(0, waitDeadlineMs - nowMs) : 0;
+                    const waitElapsedMs = waitState ? Math.min(waitState.totalMs, Math.max(0, nowMs - waitState.startedAtMs)) : 0;
+                    const waitProgress = waitState && waitState.totalMs > 0 ? Math.round((waitElapsedMs / waitState.totalMs) * 100) : 0;
+                    const autoRetryBufferPct = waitState?.bufferMultiplier ? Math.round((waitState.bufferMultiplier - 1) * 100) : 0;
+                    const isAutoRetryStep = stepLabel.toLowerCase().includes("auto-retrying");
+                    const showAutoRetryTimer = Boolean(waitState && isAutoRetryStep);
                     return (
                       <>
                   <Progress value={tenant.progress} />
@@ -850,6 +944,19 @@ export default function BatchPage({ params }: PageProps) {
                     Progress: {tenant.progress}% • Step:{" "}
                     {stepLabel}
                   </p>
+                        {showAutoRetryTimer ? (
+                          <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 p-2">
+                            <div className="flex items-center justify-between text-xs text-amber-900">
+                              <span>
+                                Waiting for auto-retry
+                                {autoRetryBufferPct > 0 ? ` (+${autoRetryBufferPct}% safety buffer)` : ""}
+                              </span>
+                              <span>{waitRemainingMs > 0 ? `${formatDurationMs(waitRemainingMs)} remaining` : "Retrying now..."}</span>
+                            </div>
+                            <Progress value={waitProgress} className="h-1.5" />
+                            <p className="text-[11px] text-amber-800">{waitState.reason}</p>
+                          </div>
+                        ) : null}
                         {stepCounter ? (
                           <div className="space-y-1">
                             <div className="flex items-center justify-between text-xs text-muted-foreground">

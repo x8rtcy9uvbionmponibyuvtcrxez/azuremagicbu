@@ -176,6 +176,11 @@ function serializeMailboxStatuses(statuses: MailboxCheckpointMap): string {
   return JSON.stringify(statuses);
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function isDomainAlreadyExistsError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -950,7 +955,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   const adminEmail = tenant.adminEmail;
   const adminPassword = tenant.adminPassword;
   const licensedUserUpn = tenant.licensedUserUpn;
-  const exchangeLicensedUser = licensedUserUpn || `admin@${domain}`;
+  const licensedUserId = tenant.licensedUserId;
 
   if (!domain || !organizationId || !adminEmail || !adminPassword) {
     throw new Error("Missing tenant data for mailbox setup");
@@ -994,6 +999,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   }
 
   const accessToken = await requestTenantGraphToken(organizationId);
+  const normalizeEmail = (value?: string | null) => (value || "").trim().toLowerCase();
   const userIdByEmail = new Map<string, string>();
 
   const resolveUserId = async (email: string): Promise<string | null> => {
@@ -1011,6 +1017,75 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       userIdByEmail.set(email, userId);
     }
     return userId;
+  };
+
+  const resolveDelegationPrincipal = async (): Promise<string> => {
+    const preferredUpn = normalizeEmail(licensedUserUpn);
+    if (preferredUpn) {
+      const preferredFilter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(preferredUpn)}'`);
+      const preferredUsers = await graphRequest<{
+        value: Array<{ userPrincipalName?: string; assignedLicenses?: unknown[] }>;
+      }>(accessToken, `/users?$filter=${preferredFilter}&$select=userPrincipalName,assignedLicenses`);
+      const preferredMatch = preferredUsers.value?.find((user) => {
+        const upn = normalizeEmail(user.userPrincipalName);
+        return upn === preferredUpn && Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0;
+      });
+      if (preferredMatch?.userPrincipalName) {
+        return normalizeEmail(preferredMatch.userPrincipalName);
+      }
+      throw new Error(
+        `Configured licensed user '${preferredUpn}' is missing or unlicensed. Re-run licensed user setup before delegation.`
+      );
+    }
+
+    if (licensedUserId) {
+      const user = await graphRequest<{ userPrincipalName?: string; assignedLicenses?: unknown[] }>(
+        accessToken,
+        `/users/${licensedUserId}?$select=userPrincipalName,assignedLicenses`
+      );
+      const resolvedUpn = normalizeEmail(user.userPrincipalName);
+      if (resolvedUpn && Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0) {
+        return resolvedUpn;
+      }
+    }
+
+    throw new Error(
+      "Licensed user identity is missing for delegation. Complete licensed user setup before mailbox delegation."
+    );
+  };
+
+  type MailboxCreateStatus = {
+    email?: string;
+    status?: string;
+    error?: string | null;
+  };
+
+  const markCreatedFromResults = (results: MailboxCreateStatus[]): { created: number; failed: number } => {
+    let created = 0;
+    let failed = 0;
+
+    for (const result of results) {
+      const email = result.email?.trim().toLowerCase();
+      const status = result.status?.trim().toLowerCase();
+      if (!email || !status) continue;
+
+      if (status === "created" || status === "exists") {
+        mailboxStatuses[email] = {
+          ...(mailboxStatuses[email] || {
+            created: false,
+            passwordSet: false,
+            smtpEnabled: false,
+            delegated: false
+          }),
+          created: true
+        };
+        created += 1;
+      } else if (status === "failed") {
+        failed += 1;
+      }
+    }
+
+    return { created, failed };
   };
 
   const pendingCreate = filteredMailboxData.filter((mailbox) => !mailboxStatuses[mailbox.email]?.created);
@@ -1034,12 +1109,6 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         mailboxes: pendingCreate
       });
 
-      type MailboxCreateStatus = {
-        email?: string;
-        status?: string;
-        error?: string | null;
-      };
-
       const createJobId = (startResult as { jobId?: string })?.jobId;
       if (!createJobId) {
         throw new Error("Mailbox creation job did not return a jobId");
@@ -1048,11 +1117,35 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       let resultArray: MailboxCreateStatus[] = [];
       let createDone = false;
       const pollIntervalMs = 5000;
-      const maxPollAttempts = 180; // 15 minutes
       let pollAttempts = 0;
       let lastPollError: string | null = null;
+      let consecutiveStatusErrors = 0;
+      const maxConsecutiveStatusErrors = parsePositiveInt(process.env.MAILBOX_CREATE_MAX_STATUS_ERRORS, 6);
+      const mailboxCreateStallPollLimit = parsePositiveInt(process.env.MAILBOX_CREATE_STALL_POLLS, 36);
+      let stallPolls = 0;
+      let bestProgress = createdAtStart;
+      let persistedCreatedCount = createdAtStart;
 
-      while (!createDone && pollAttempts < maxPollAttempts) {
+      const persistMailboxCreateProgress = async (statusLabel: string, overallCreated: number, forcePersist = false) => {
+        const createdNow = countCreated();
+        const shouldPersistStatuses = forcePersist || createdNow > persistedCreatedCount;
+
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: {
+            currentStep: `Creating shared mailboxes... (${overallCreated}/${totalMailboxTarget}) • ${statusLabel}`,
+            ...(shouldPersistStatuses
+              ? { mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) } }
+              : {})
+          }
+        });
+
+        if (shouldPersistStatuses) {
+          persistedCreatedCount = createdNow;
+        }
+      };
+
+      while (!createDone) {
         pollAttempts += 1;
         await sleep(pollIntervalMs);
 
@@ -1076,19 +1169,40 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
           const completed = status.completed ?? 0;
           const total = status.total ?? pendingCreate.length;
           const completedClamped = Math.max(0, Math.min(completed, total));
-          const overallCreated = Math.min(totalMailboxTarget, createdAtStart + completedClamped);
+          const polledResults = Array.isArray(status.results) ? status.results : [];
+          if (polledResults.length > 0) {
+            markCreatedFromResults(polledResults);
+          }
+          const checkpointCreated = countCreated();
+          const overallCreated = Math.min(
+            totalMailboxTarget,
+            Math.max(checkpointCreated, createdAtStart + completedClamped)
+          );
           lastPollError = null;
+          consecutiveStatusErrors = 0;
 
-          await prisma.tenant.update({
-            where: { id: tenantDbId },
-            data: {
-              currentStep: `Creating shared mailboxes... (${overallCreated}/${totalMailboxTarget}) • ${statusLabel}`
+          if (statusLabel === "running") {
+            if (overallCreated > bestProgress) {
+              bestProgress = overallCreated;
+              stallPolls = 0;
+            } else {
+              stallPolls += 1;
+              if (stallPolls >= mailboxCreateStallPollLimit) {
+                throw new Error(
+                  `Mailbox creation stalled: no progress for ${(stallPolls * pollIntervalMs) / 1000}s (job ${createJobId})`
+                );
+              }
             }
-          });
+          } else if (overallCreated > bestProgress) {
+            bestProgress = overallCreated;
+            stallPolls = 0;
+          }
+
+          await persistMailboxCreateProgress(statusLabel, overallCreated, statusLabel !== "running");
 
           if (statusLabel === "completed") {
             createDone = true;
-            resultArray = Array.isArray(status.results) ? status.results : [];
+            resultArray = polledResults;
           } else if (statusLabel === "failed") {
             createDone = true;
             throw new Error(`Mailbox creation failed: ${status.error || "unknown error"}`);
@@ -1096,37 +1210,28 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
           lastPollError = message;
-          if (message.includes("Mailbox creation failed")) throw error;
-          console.log(`⚠️ [MailboxCreate] Status check failed (${pollAttempts}/${maxPollAttempts}), retrying in 5s...`);
+          if (message.includes("Mailbox creation failed") || message.includes("Mailbox creation stalled")) throw error;
+          consecutiveStatusErrors += 1;
+          if (consecutiveStatusErrors >= maxConsecutiveStatusErrors) {
+            throw new Error(
+              `Mailbox creation status unavailable after ${consecutiveStatusErrors} consecutive checks. Last error: ${message}`
+            );
+          }
+          console.log(
+            `⚠️ [MailboxCreate] Status check failed (${consecutiveStatusErrors}/${maxConsecutiveStatusErrors}), retrying in 5s...`
+          );
         }
       }
 
-      if (!createDone) {
-        const elapsedMinutes = Math.round((maxPollAttempts * pollIntervalMs) / 60000);
-        const suffix = lastPollError ? ` Last error: ${lastPollError}` : "";
-        throw new Error(`Mailbox creation status timed out after ${elapsedMinutes} minutes.${suffix}`);
+      if (resultArray.length > 0) {
+        markCreatedFromResults(resultArray);
       }
 
-      if (resultArray.length === 0 && pendingCreate.length > 0) {
+      if (resultArray.length === 0 && pendingCreate.length > 0 && countCreated() === createdAtStart) {
         throw new Error(`Mailbox creation returned no usable results for ${pendingCreate.length} mailboxes.`);
       }
 
-      for (const result of resultArray) {
-        if (!result.email) continue;
-        if (result.status === "created" || result.status === "exists") {
-          mailboxStatuses[result.email] = {
-            ...(mailboxStatuses[result.email] || {
-              created: false,
-              passwordSet: false,
-              smtpEnabled: false,
-              delegated: false
-            }),
-            created: true
-          };
-        }
-      }
-
-      const created = resultArray.filter((result) => result.status === "created" || result.status === "exists").length;
+      const created = Math.max(0, countCreated() - createdAtStart);
       const failed = resultArray.filter((result) => result.status === "failed").length;
       console.log(`✅ [Microsoft] Shared mailboxes: ${created} created/existing, ${failed} failed out of ${pendingCreate.length}`);
 
@@ -1294,12 +1399,33 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     await sleep(5000);
   }
 
-  const pendingDelegationEmails = filteredMailboxData
+  let pendingDelegationEmails = filteredMailboxData
     .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
     .map((mailbox) => mailbox.email);
 
   if (!tenant.delegationComplete || pendingDelegationEmails.length > 0) {
+    const previousDelegationPrincipal = normalizeEmail(tenant.licensedUserUpn);
+    const delegationPrincipalUpn = await resolveDelegationPrincipal();
+    const staleDelegateUpn =
+      previousDelegationPrincipal && previousDelegationPrincipal !== delegationPrincipalUpn
+        ? previousDelegationPrincipal
+        : null;
+
+    if (delegationPrincipalUpn !== previousDelegationPrincipal) {
+      await prisma.tenant.update({
+        where: { id: tenantDbId },
+        data: { licensedUserUpn: delegationPrincipalUpn }
+      });
+      console.log(
+        `ℹ️ [Delegation] Updated delegation principal for ${domain}: ${tenant.licensedUserUpn || "none"} -> ${delegationPrincipalUpn}`
+      );
+    }
+
     const delegatedAtStart = countDelegated();
+    const maxDelegationAttempts = parsePositiveInt(process.env.DELEGATION_MAX_ATTEMPTS, 4);
+    const delegationRetryDelayMs = parsePositiveInt(process.env.DELEGATION_RETRY_DELAY_MS, 5000);
+    const forceCompletePolls = parsePositiveInt(process.env.DELEGATION_FORCE_COMPLETE_POLLS, 2);
+
     await prisma.tenant.update({
       where: { id: tenantDbId },
       data: {
@@ -1309,105 +1435,311 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     });
 
     if (pendingDelegationEmails.length > 0) {
-      // Start delegation as async job
-      const startResult = await callPowerShellService("/start-delegation", {
-        adminUpn: adminEmail,
-        adminPassword: resolvedAdminPassword,
-        licensedUserUpn: exchangeLicensedUser,
-        emails: pendingDelegationEmails
-      });
+      for (let attempt = 1; attempt <= maxDelegationAttempts; attempt += 1) {
+        const attemptLabel = `${attempt}/${maxDelegationAttempts}`;
 
-      const jobId = (startResult as any).jobId;
-      console.log(`📡 [Delegation] Started async job: ${jobId}`);
+        pendingDelegationEmails = filteredMailboxData
+          .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+          .map((mailbox) => mailbox.email);
 
-      // Poll for completion every 10 seconds
-      let delegationDone = false;
-      const pollIntervalMs = 10000;
-      const maxPollAttempts = 90; // 15 minutes
-      let pollAttempts = 0;
-      let lastPollError: string | null = null;
+        if (pendingDelegationEmails.length === 0) {
+          console.log(`✅ [Delegation] No pending mailbox delegation before attempt ${attemptLabel}`);
+          break;
+        }
 
-      while (!delegationDone && pollAttempts < maxPollAttempts) {
-        pollAttempts += 1;
-        await sleep(pollIntervalMs);
+        if (attempt > 1) {
+          await prisma.tenant.update({
+            where: { id: tenantDbId },
+            data: {
+              currentStep:
+                `Retrying mailbox delegation (attempt ${attemptLabel})... ` +
+                `(${countDelegated()}/${totalMailboxTarget} delegated, ${pendingDelegationEmails.length} pending)`,
+              progress: 85
+            }
+          });
+          await sleep(delegationRetryDelayMs);
+        }
 
         try {
-          const statusResponse = await fetch(`${PS_SERVICE_URL}/delegation-status/${jobId}`, {
-            signal: AbortSignal.timeout(8000)
+          const attemptEmails = [...pendingDelegationEmails];
+          const startResult = await callPowerShellService("/start-delegation", {
+            adminUpn: adminEmail,
+            adminPassword: resolvedAdminPassword,
+            licensedUserUpn: delegationPrincipalUpn,
+            staleDelegateUpn,
+            emails: attemptEmails
           });
-          if (!statusResponse.ok) {
-            throw new Error(`Delegation status endpoint returned ${statusResponse.status}`);
+
+          const jobId = (startResult as { jobId?: string }).jobId;
+          if (!jobId) {
+            throw new Error("Delegation job did not return a jobId");
+          }
+          console.log(`📡 [Delegation] Started async job: ${jobId} (attempt ${attemptLabel})`);
+
+          let delegationDone = false;
+          const pollIntervalMs = 10000;
+          let pollAttempts = 0;
+          let consecutiveStatusErrors = 0;
+          const maxConsecutiveStatusErrors = parsePositiveInt(process.env.DELEGATION_MAX_STATUS_ERRORS, 6);
+          const delegationStallPollLimit = parsePositiveInt(process.env.DELEGATION_STALL_POLLS, 36);
+          let stallPolls = 0;
+          let bestCheckedProgress = countDelegated();
+          let persistedDelegatedCount = countDelegated();
+          let normalizedResults: Array<{ email?: string; status?: string; errors?: string }> = [];
+          let fullProgressRunningPolls = 0;
+
+          while (!delegationDone) {
+            pollAttempts += 1;
+            await sleep(pollIntervalMs);
+
+            try {
+              const statusResponse = await fetch(`${PS_SERVICE_URL}/delegation-status/${jobId}`, {
+                signal: AbortSignal.timeout(8000)
+              });
+              if (!statusResponse.ok) {
+                throw new Error(`Delegation status endpoint returned ${statusResponse.status}`);
+              }
+
+              const status = (await statusResponse.json()) as {
+                status?: string;
+                completed?: number;
+                total?: number;
+                error?: string;
+                results?: Array<{ email?: string; status?: string; errors?: string }> | string;
+              };
+              let statusLabel = status.status || "unknown";
+              const completed = status.completed ?? 0;
+              const total = status.total ?? attemptEmails.length;
+              const completedClamped = Math.max(0, Math.min(completed, total));
+              const liveResults = Array.isArray(status.results) ? status.results : [];
+              if (liveResults.length > 0) {
+                for (const item of liveResults) {
+                  const email = item.email?.trim().toLowerCase();
+                  const resultStatus = item.status?.trim().toLowerCase();
+                  if (!email || (resultStatus !== "delegated" && resultStatus !== "applied")) continue;
+                  mailboxStatuses[email] = {
+                    ...(mailboxStatuses[email] || {
+                      created: false,
+                      passwordSet: false,
+                      smtpEnabled: false,
+                      delegated: false
+                    }),
+                    delegated: true
+                  };
+                }
+              }
+
+              const delegatedDone = countDelegated();
+              const checkedOverall = Math.min(totalMailboxTarget, delegatedDone + completedClamped);
+              const shouldPersistDelegated = delegatedDone > persistedDelegatedCount;
+              consecutiveStatusErrors = 0;
+
+              const fullyDoneWhileRunning =
+                statusLabel === "running" &&
+                total > 0 &&
+                completedClamped >= total &&
+                delegatedDone >= totalMailboxTarget;
+              if (fullyDoneWhileRunning) {
+                fullProgressRunningPolls += 1;
+              } else {
+                fullProgressRunningPolls = 0;
+              }
+
+              if (fullyDoneWhileRunning && fullProgressRunningPolls >= forceCompletePolls) {
+                statusLabel = "force-complete";
+                console.log(
+                  `✅ [Delegation] Force-completing job ${jobId} after ${fullProgressRunningPolls} full-progress running polls (attempt ${attemptLabel})`
+                );
+              }
+
+              if (statusLabel === "running") {
+                if (checkedOverall > bestCheckedProgress) {
+                  bestCheckedProgress = checkedOverall;
+                  stallPolls = 0;
+                } else {
+                  stallPolls += 1;
+                  if (stallPolls >= delegationStallPollLimit) {
+                    throw new Error(
+                      `Delegation stalled: no progress for ${(stallPolls * pollIntervalMs) / 1000}s (job ${jobId})`
+                    );
+                  }
+                }
+              } else if (checkedOverall > bestCheckedProgress) {
+                bestCheckedProgress = checkedOverall;
+                stallPolls = 0;
+              }
+
+              console.log(`📡 [Delegation] Progress: ${completed}/${total} - ${statusLabel} (attempt ${attemptLabel})`);
+
+              await prisma.tenant.update({
+                where: { id: tenantDbId },
+                data: {
+                  currentStep:
+                    `Delegating mailboxes... (${delegatedDone}/${totalMailboxTarget} delegated, ` +
+                    `${checkedOverall}/${totalMailboxTarget} checked) • ${statusLabel} (attempt ${attemptLabel})`,
+                  ...(shouldPersistDelegated
+                    ? { mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) } }
+                    : {})
+                }
+              });
+              if (shouldPersistDelegated) {
+                persistedDelegatedCount = delegatedDone;
+              }
+
+              if (statusLabel === "completed" || statusLabel === "force-complete") {
+                delegationDone = true;
+
+                normalizedResults = Array.isArray(status.results)
+                  ? status.results
+                  : typeof status.results === "string"
+                    ? status.results
+                        .split(/\r?\n/)
+                        .map((line) => line.trim())
+                        .filter(Boolean)
+                        .map((line) => {
+                          const match = line.match(/\[\d+\s*\/\s*\d+\]\s+(.+?)\s+->\s+([a-zA-Z]+)/);
+                          if (!match) return null;
+                          return { email: match[1]?.trim(), status: match[2]?.trim().toLowerCase() };
+                        })
+                        .filter((item): item is { email: string; status: string } => Boolean(item?.email && item?.status))
+                    : [];
+              } else if (statusLabel === "failed") {
+                delegationDone = true;
+                throw new Error(`Delegation failed: ${status.error || "unknown error"}`);
+              }
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error);
+              const normalized = message.toLowerCase();
+              if (message.includes("Delegation failed") || message.includes("Delegation stalled")) throw error;
+              if (normalized.includes("returned 404") || normalized.includes("job not found")) {
+                throw new Error(`Delegation status lost for job ${jobId}: ${message}`);
+              }
+              consecutiveStatusErrors += 1;
+              if (consecutiveStatusErrors >= maxConsecutiveStatusErrors) {
+                throw new Error(`Delegation status unavailable after ${consecutiveStatusErrors} consecutive checks: ${message}`);
+              }
+              console.log(
+                `⚠️ [Delegation] Status check failed (${consecutiveStatusErrors}/${maxConsecutiveStatusErrors}), retrying in 10s... (attempt ${attemptLabel})`
+              );
+            }
           }
 
-          const status = (await statusResponse.json()) as {
-            status?: string;
-            completed?: number;
-            total?: number;
-            error?: string;
-            results?: Array<{ email?: string; status?: string }> | string;
-          };
-          const statusLabel = status.status || "unknown";
-          const completed = status.completed ?? 0;
-          const total = status.total ?? pendingDelegationEmails.length;
-          const completedClamped = Math.max(0, Math.min(completed, total));
-          lastPollError = null;
+          for (const item of normalizedResults) {
+            const email = item.email?.trim().toLowerCase();
+            const status = item.status?.trim().toLowerCase();
+            if (!email || (status !== "delegated" && status !== "applied")) continue;
 
-          console.log(`📡 [Delegation] Progress: ${completed}/${total} - ${statusLabel}`);
+            mailboxStatuses[email] = {
+              ...(mailboxStatuses[email] || {
+                created: false,
+                passwordSet: false,
+                smtpEnabled: false,
+                delegated: false
+              }),
+              delegated: true
+            };
+          }
+
+          pendingDelegationEmails = filteredMailboxData
+            .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+            .map((mailbox) => mailbox.email);
 
           await prisma.tenant.update({
             where: { id: tenantDbId },
-            data: { currentStep: `Delegating mailboxes... (${completedClamped}/${total}) • ${statusLabel}` }
+            data: {
+              mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) },
+              currentStep:
+                `Delegation attempt ${attemptLabel} complete ` +
+                `(${countDelegated()}/${totalMailboxTarget} delegated, ${pendingDelegationEmails.length} pending)`
+            }
           });
 
-          if (statusLabel === "completed") {
-            delegationDone = true;
-            console.log(`✅ [Delegation] All ${total} mailboxes delegated`);
-
-            const normalizedResults = Array.isArray(status.results)
-              ? status.results
-              : typeof status.results === "string"
-                ? status.results
-                    .split(/\r?\n/)
-                    .map((line) => line.trim())
-                    .filter(Boolean)
-                    .map((line) => {
-                      const match = line.match(/\[\d+\s*\/\s*\d+\]\s+(.+?)\s+->\s+([a-zA-Z]+)/);
-                      if (!match) return null;
-                      return { email: match[1]?.trim(), status: match[2]?.trim().toLowerCase() };
-                    })
-                    .filter((item): item is { email: string; status: string } => Boolean(item?.email && item?.status))
-                : [];
-
-            for (const item of normalizedResults) {
-              if (!item.email) continue;
-              if (item.status === "delegated") {
-                mailboxStatuses[item.email] = {
-                  ...(mailboxStatuses[item.email] || {
-                    created: false,
-                    passwordSet: false,
-                    smtpEnabled: false,
-                    delegated: false
-                  }),
-                  delegated: true
-                };
-              }
-            }
-          } else if (statusLabel === "failed") {
-            delegationDone = true;
-            throw new Error(`Delegation failed: ${status.error}`);
+          if (pendingDelegationEmails.length === 0) {
+            console.log(`✅ [Delegation] All mailboxes delegated after attempt ${attemptLabel}`);
+            break;
           }
+
+          console.log(
+            `⚠️ [Delegation] ${pendingDelegationEmails.length} mailbox(es) still pending after attempt ${attemptLabel}`
+          );
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
-          lastPollError = message;
-          if (message.includes("Delegation failed")) throw error;
-          console.log(`⚠️ [Delegation] Status check failed (${pollAttempts}/${maxPollAttempts}), retrying in 10s...`);
+          if (attempt >= maxDelegationAttempts) {
+            throw new Error(`Delegation failed after ${attempt}/${maxDelegationAttempts} attempts: ${message}`);
+          }
+          console.log(`⚠️ [Delegation] Attempt ${attemptLabel} failed, will retry: ${message}`);
         }
       }
+    }
 
-      if (!delegationDone) {
-        const elapsedMinutes = Math.round((maxPollAttempts * pollIntervalMs) / 60000);
-        const suffix = lastPollError ? ` Last error: ${lastPollError}` : "";
-        throw new Error(`Delegation status timed out after ${elapsedMinutes} minutes.${suffix}`);
+    let finalPendingDelegationEmails = filteredMailboxData
+      .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+      .map((mailbox) => mailbox.email);
+
+    if (finalPendingDelegationEmails.length > 0) {
+      const finalVerifyAttempts = parsePositiveInt(process.env.DELEGATION_FINAL_VERIFY_ATTEMPTS, 6);
+      const finalVerifyDelayMs = parsePositiveInt(process.env.DELEGATION_FINAL_VERIFY_DELAY_MS, 10000);
+
+      for (let verifyAttempt = 1; verifyAttempt <= finalVerifyAttempts; verifyAttempt += 1) {
+        if (verifyAttempt > 1) {
+          await sleep(finalVerifyDelayMs);
+        }
+
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: {
+            currentStep:
+              `Final delegation verification (${verifyAttempt}/${finalVerifyAttempts})... ` +
+              `(${countDelegated()}/${totalMailboxTarget} delegated, ${finalPendingDelegationEmails.length} pending)`,
+            progress: 85
+          }
+        });
+
+        const verifyResult = await callPowerShellService("/verify-delegation", {
+          adminUpn: adminEmail,
+          adminPassword: resolvedAdminPassword,
+          licensedUserUpn: delegationPrincipalUpn,
+          emails: finalPendingDelegationEmails
+        });
+
+        type VerifyRow = { email?: string; status?: string };
+        const verifyRows: VerifyRow[] = Array.isArray((verifyResult as { results?: unknown })?.results)
+          ? ((verifyResult as { results: VerifyRow[] }).results || [])
+          : [];
+
+        for (const row of verifyRows) {
+          const email = row.email?.trim().toLowerCase();
+          const status = row.status?.trim().toLowerCase();
+          if (!email || status !== "delegated") continue;
+
+          mailboxStatuses[email] = {
+            ...(mailboxStatuses[email] || {
+              created: false,
+              passwordSet: false,
+              smtpEnabled: false,
+              delegated: false
+            }),
+            delegated: true
+          };
+        }
+
+        finalPendingDelegationEmails = filteredMailboxData
+          .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
+          .map((mailbox) => mailbox.email);
+
+        await prisma.tenant.update({
+          where: { id: tenantDbId },
+          data: {
+            mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) },
+            currentStep:
+              `Final delegation verification ${verifyAttempt}/${finalVerifyAttempts} complete ` +
+              `(${countDelegated()}/${totalMailboxTarget} delegated, ${finalPendingDelegationEmails.length} pending)`
+          }
+        });
+
+        if (finalPendingDelegationEmails.length === 0) {
+          break;
+        }
       }
     }
 
@@ -1495,7 +1827,22 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   }
 
   const csvRows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
-  for (const mailbox of filteredMailboxData) {
+  const csvMailboxRows = [...mailboxData];
+  if (
+    licensedUserUpn &&
+    !csvMailboxRows.some((mailbox) => normalizeEmail(mailbox.email) === normalizeEmail(licensedUserUpn))
+  ) {
+    const fallbackDisplayName =
+      parseInboxNamesValue(tenant.inboxNames)[0] ||
+      licensedUserUpn.split("@")[0].replace(/[._-]+/g, " ").trim() ||
+      "Licensed User";
+    csvMailboxRows.unshift({
+      email: licensedUserUpn,
+      displayName: fallbackDisplayName,
+      password: resolvedAdminPassword
+    });
+  }
+  for (const mailbox of csvMailboxRows) {
     csvRows.push([mailbox.displayName, mailbox.email, resolvedAdminPassword]);
   }
 

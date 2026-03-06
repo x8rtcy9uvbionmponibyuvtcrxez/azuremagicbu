@@ -92,10 +92,10 @@ export const tenantCsvRowSchema = z
       .filter(Boolean)
   }))
   .superRefine((value, ctx) => {
-    if (value.inbox_names.length < 2) {
+    if (value.inbox_names.length < 1) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Provide at least two inbox personas",
+        message: "Provide at least one inbox persona",
         path: ["inbox_names"]
       });
     }

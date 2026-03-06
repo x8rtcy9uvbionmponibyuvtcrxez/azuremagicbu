@@ -277,7 +277,16 @@ export async function POST(_request: Request, { params }: Params) {
       data: { status: "processing" }
     });
 
-    await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+    let enqueuedJob = await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+    let enqueueState = await enqueuedJob.getState();
+    const runnableStates = new Set(["waiting", "active", "delayed", "prioritized"]);
+    if (!runnableStates.has(enqueueState)) {
+      enqueuedJob = await enqueueTenantProcessingJob(
+        { tenantId: tenant.id, batchId: tenant.batchId },
+        { jobId: `${tenant.batchId}:${tenant.id}:retry:${Date.now()}` }
+      );
+      enqueueState = await enqueuedJob.getState();
+    }
 
     await logTenantEvent({
       batchId: tenant.batchId,
@@ -291,7 +300,9 @@ export async function POST(_request: Request, { params }: Params) {
         currentStep,
         removedQueuedRetries,
         activeJobId: activeJob?.id || null,
-        removedActiveJob
+        removedActiveJob,
+        enqueuedJobId: enqueuedJob.id,
+        enqueueState
       }
     });
 
@@ -301,7 +312,9 @@ export async function POST(_request: Request, { params }: Params) {
       restartStatus,
       removedQueuedRetries,
       activeJobId: activeJob?.id || null,
-      removedActiveJob
+      removedActiveJob,
+      enqueuedJobId: enqueuedJob.id,
+      enqueueState
     });
   } catch (error) {
     return NextResponse.json(

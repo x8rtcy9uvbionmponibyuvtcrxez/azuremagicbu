@@ -23,6 +23,17 @@ import { logTenantEvent } from "@/lib/tenant-events";
 
 const TERMINAL_BATCH_STATUSES: BatchStatus[] = ["completed", "failed"];
 const DOMAIN_PROPAGATION_RETRY_DELAY_MS = Math.max(30_000, Number(process.env.DOMAIN_PROPAGATION_RETRY_DELAY_MS || 120_000));
+const PRIVILEGE_PROPAGATION_BASE_DELAY_MS = Math.max(
+  60_000,
+  Number(process.env.PRIVILEGE_PROPAGATION_BASE_DELAY_MS || 318_000)
+);
+const PRIVILEGE_PROPAGATION_BUFFER_MULTIPLIER = Math.max(
+  1,
+  Number(process.env.PRIVILEGE_PROPAGATION_BUFFER_MULTIPLIER || 1.2)
+);
+const PRIVILEGE_PROPAGATION_RETRY_DELAY_MS = Math.round(
+  PRIVILEGE_PROPAGATION_BASE_DELAY_MS * PRIVILEGE_PROPAGATION_BUFFER_MULTIPLIER
+);
 
 function isDomainPropagationError(message: string): boolean {
   const normalized = message.toLowerCase();
@@ -32,6 +43,24 @@ function isDomainPropagationError(message: string): boolean {
       normalized.includes("does not exist") &&
       normalized.includes("reference-property"))
   );
+}
+
+function isPermissionPropagationError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("insufficient privileges") ||
+    normalized.includes("authorization_requestdenied") ||
+    normalized.includes("access denied")
+  );
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(1, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  if (seconds === 0) return `${minutes}m`;
+  return `${minutes}m ${seconds}s`;
 }
 
 async function updateBatchStatus(batchId: string) {
@@ -287,6 +316,9 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      if (!tenant) {
+        throw error;
+      }
       if (isDomainPropagationError(message)) {
         if (!tenant) {
           throw error;
@@ -312,10 +344,50 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
         });
         await enqueueTenantProcessingJob(
           { tenantId: tenant.id, batchId },
-          { delayMs: DOMAIN_PROPAGATION_RETRY_DELAY_MS }
+          {
+            delayMs: DOMAIN_PROPAGATION_RETRY_DELAY_MS,
+            jobId: `${batchId}:${tenant.id}:domain-propagation-retry:${Date.now()}`
+          }
         );
         await updateBatchStatus(batchId);
         return { state: "waiting_for_domain_propagation" };
+      }
+
+      if (isPermissionPropagationError(message)) {
+        const waitLabel = formatDuration(PRIVILEGE_PROPAGATION_RETRY_DELAY_MS);
+        const resumeStatus = tenant.domainAdded ? "domain_verify" : "domain_add";
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            status: resumeStatus,
+            progress: tenant.domainAdded ? 74 : 62,
+            errorMessage: null,
+            currentStep: `Permission propagation in Microsoft. Auto-retrying in ${waitLabel}...`
+          }
+        });
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "phase_warning",
+          level: "warn",
+          message: "Permission propagation delay detected; scheduled automatic retry",
+          details: {
+            error: message,
+            retryAfterMs: PRIVILEGE_PROPAGATION_RETRY_DELAY_MS,
+            resumeStatus,
+            measuredBaselineMs: PRIVILEGE_PROPAGATION_BASE_DELAY_MS,
+            bufferMultiplier: PRIVILEGE_PROPAGATION_BUFFER_MULTIPLIER
+          }
+        });
+        await enqueueTenantProcessingJob(
+          { tenantId: tenant.id, batchId },
+          {
+            delayMs: PRIVILEGE_PROPAGATION_RETRY_DELAY_MS,
+            jobId: `${batchId}:${tenant.id}:permission-propagation-retry:${Date.now()}`
+          }
+        );
+        await updateBatchStatus(batchId);
+        return { state: "waiting_for_permission_propagation" };
       }
 
       await logTenantEvent({
@@ -330,6 +402,25 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     }
   } else {
     console.log(`✓ [Worker] Domain setup already complete for ${tenant.tenantName}, skipping`);
+  }
+
+  if (tenant.dkimConfigured && tenant.status !== "completed") {
+    await prisma.tenant.update({
+      where: { id: tenant.id },
+      data: {
+        status: "completed",
+        currentStep: "DKIM configured. Tenant completed.",
+        progress: 100
+      }
+    });
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "tenant_completed",
+      message: "Tenant completed successfully after DKIM"
+    });
+    await updateBatchStatus(batchId);
+    return { state: "completed" };
   }
 
   const phaseThreeComplete =
@@ -476,8 +567,9 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     return { state: "failed" };
   }
 
+  // Completion gate: once DKIM is configured and optional integrations are
+  // either connected or intentionally skipped (no API key), mark tenant done.
   const phaseFourComplete =
-    phaseThreeComplete &&
     tenant.dkimConfigured &&
     (!shouldConnectSmartlead || tenant.smartleadConnected) &&
     (!shouldConnectInstantly || tenant.instantlyConnected);

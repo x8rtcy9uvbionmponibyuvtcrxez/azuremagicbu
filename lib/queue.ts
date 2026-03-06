@@ -30,6 +30,10 @@ function normalizeJobId(jobId: string): string {
   return jobId.replace(/:/g, "__");
 }
 
+function buildRunJobId(baseJobId: string): string {
+  return `${baseJobId}__run__${Date.now()}`;
+}
+
 const globalQueue = globalThis as unknown as {
   tenantProcessingQueue?: Queue<TenantProcessingJobData>;
 };
@@ -51,12 +55,42 @@ export async function enqueueTenantProcessingJob(
   options?: { delayMs?: number; jobId?: string }
 ) {
   const queue = getTenantQueue();
-  const rawJobId = options?.jobId || `${data.batchId}:${data.tenantId}:${Date.now()}`;
-  const jobId = normalizeJobId(rawJobId);
-  const job = await queue.add("process-tenant", data, {
-    jobId,
-    delay: options?.delayMs || 0
-  });
-  console.log("🔄 [Queue] Adding job:", job.id);
-  return job;
+  const rawBaseJobId = options?.jobId || `${data.batchId}:${data.tenantId}`;
+  const baseJobId = normalizeJobId(rawBaseJobId);
+  const createJob = async (jobId: string) =>
+    queue.add("process-tenant", data, {
+      jobId,
+      delay: options?.delayMs || 0
+    });
+
+  try {
+    const job = await createJob(baseJobId);
+    console.log("🔄 [Queue] Adding job:", job.id);
+    return job;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("job") && message.toLowerCase().includes("exists")) {
+      const existing = await queue.getJob(baseJobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state === "waiting" || state === "active" || state === "delayed" || state === "prioritized") {
+          console.log("ℹ️ [Queue] Reusing in-flight job:", existing.id, state);
+          return existing;
+        }
+
+        // Completed/failed/stuck terminal jobs must not block a retry.
+        try {
+          await existing.remove();
+        } catch {
+          // Ignore race if BullMQ already pruned this job.
+        }
+
+        const rerunId = buildRunJobId(baseJobId);
+        const rerun = await createJob(rerunId);
+        console.log("🔄 [Queue] Added rerun job:", rerun.id, "(replaced terminal job)");
+        return rerun;
+      }
+    }
+    throw error;
+  }
 }

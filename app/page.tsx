@@ -138,7 +138,7 @@ function parseInboxNames(value: string): string[] {
 
 function validateInboxNames(names: string[]): string[] {
   const errors: string[] = [];
-  if (names.length < 2) errors.push("At least 2 inbox names are required");
+  if (names.length < 1) errors.push("At least 1 inbox name is required");
   names.forEach((name) => {
     if (!nameRegex.test(name)) {
       errors.push(`Invalid name format: ${name}`);
@@ -651,7 +651,7 @@ export default function HomePage() {
                                 }}
                               />
                             </FormControl>
-                            <FormDescription>Minimum two names, each formatted as FirstName LastName.</FormDescription>
+                            <FormDescription>Minimum one name, formatted as FirstName LastName.</FormDescription>
                             <FormMessage />
                           </FormItem>
                         )}
