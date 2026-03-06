@@ -1961,12 +1961,6 @@ export async function pollDeviceAuthToken(
     device_code: deviceCode
   };
 
-  console.log("🔍 [Debug] Token exchange params:");
-  console.log("- Client ID:", clientId);
-  console.log("- Tenant domain:", tenantIdentifier);
-  console.log("- Device code length:", deviceCode?.length ?? 0);
-  console.log("🔍 [Debug] URLSearchParams keys:", Object.keys(bodyParams));
-
   const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantIdentifier)}/oauth2/v2.0/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1974,10 +1968,6 @@ export async function pollDeviceAuthToken(
   });
 
   const payload = (await response.json()) as { access_token?: string; error?: string; error_description?: string };
-  console.log("🔍 [Debug] Token endpoint response:", response.status, payload.error || "ok");
-  if (payload.error_description) {
-    console.log("🔍 [Debug] Token error description:", payload.error_description);
-  }
 
   if (response.ok && payload.access_token) {
     const organizationId = await getOrganizationIdFromToken(payload.access_token);

@@ -12,14 +12,6 @@ const schema = z.object({
   confirmed: z.literal(true)
 });
 
-function tenantFromAdminEmail(adminEmail?: string | null): string | null {
-  if (!adminEmail) return null;
-  const atIndex = adminEmail.indexOf("@");
-  if (atIndex < 0) return null;
-  const domain = adminEmail.slice(atIndex + 1).trim().toLowerCase();
-  return domain || null;
-}
-
 type Params = {
   params: {
     id: string;
@@ -38,7 +30,6 @@ export async function POST(request: Request, { params }: Params) {
         batchId: true,
         status: true,
         tenantId: true,
-        adminEmail: true,
         authCode: true,
         deviceCode: true,
         authConfirmed: true
@@ -91,14 +82,6 @@ export async function POST(request: Request, { params }: Params) {
 
       return NextResponse.json({ error: "No device code available for this tenant" }, { status: 400 });
     }
-
-    const tenantDomain = tenantFromAdminEmail(tenant.adminEmail) || tenant.tenantId || process.env.GRAPH_TENANT_ID || "common";
-    console.log("🔍 [Debug] Token exchange params:");
-    console.log("- Has client_secret:", Boolean(process.env.GRAPH_CLIENT_SECRET));
-    console.log("- Client ID:", process.env.GRAPH_CLIENT_ID || "(missing)");
-    console.log("- Tenant domain:", tenantDomain);
-    console.log("- Device code length:", tenant.deviceCode?.length ?? 0);
-    console.log("- Param keys being sent:", ["grant_type", "client_id", "client_secret", "device_code"]);
 
     const verification = await pollDeviceAuthToken(tenant.id, tenant.deviceCode);
 

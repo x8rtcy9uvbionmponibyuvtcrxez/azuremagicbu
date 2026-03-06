@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { readFile } from "fs/promises";
 import path from "path";
 import type { Prisma } from "@prisma/client";
@@ -27,6 +28,42 @@ function rowsToCsv(rows: string[][]): string {
   return rows.map((row) => row.map((col) => escapeCsv(col)).join(",")).join("\n");
 }
 
+function buildDeterministicPassword(seed: string, length = 16): string {
+  const bytes = createHash("sha256").update(seed).digest();
+  const uppercase = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const lowercase = "abcdefghijkmnopqrstuvwxyz";
+  const numbers = "23456789";
+  const symbols = "!@#$%&*_+-=?";
+  const alphanumeric = uppercase + lowercase + numbers;
+  const all = alphanumeric + symbols;
+
+  const chars: string[] = [
+    uppercase[bytes[0] % uppercase.length],
+    lowercase[bytes[1] % lowercase.length],
+    numbers[bytes[2] % numbers.length],
+    symbols[bytes[3] % symbols.length]
+  ];
+
+  while (chars.length < length) {
+    const index = chars.length % bytes.length;
+    chars.push(all[bytes[index] % all.length]);
+  }
+
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = bytes[(i + 7) % bytes.length] % (i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+
+  if (/[^A-Za-z0-9]/.test(chars[0])) {
+    const swapIndex = chars.findIndex((char, index) => index > 0 && /[A-Za-z0-9]/.test(char));
+    if (swapIndex > 0) {
+      [chars[0], chars[swapIndex]] = [chars[swapIndex], chars[0]];
+    }
+  }
+
+  return chars.join("");
+}
+
 function generateFallbackCsv(tenant: TenantCsvInput): string {
   const names = parseInboxNamesValue(tenant.inboxNames);
   const safeNames = names.length > 0 ? names : ["Inbox User", "Ops User"];
@@ -37,7 +74,8 @@ function generateFallbackCsv(tenant: TenantCsvInput): string {
     const displayName = safeNames[i % safeNames.length];
     const [first = "user", last = "mail"] = displayName.split(/\s+/);
     const local = `${normalizeLocalPart(first)}.${normalizeLocalPart(last)}${i + 1}`;
-    rows.push([displayName, `${local}@${tenant.domain}`, "TemporaryPass#123"]);
+    const password = buildDeterministicPassword(`${tenant.tenantName}:${tenant.domain}:${local}:${i + 1}`);
+    rows.push([displayName, `${local}@${tenant.domain}`, password]);
   }
 
   return rowsToCsv(rows);
