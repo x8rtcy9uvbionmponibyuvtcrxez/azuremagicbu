@@ -1,3 +1,11 @@
+import { config } from "dotenv";
+import { resolve } from "path";
+
+// Load .env files in the same order as Next.js:
+// .env first, then .env.local overrides
+config({ path: resolve(process.cwd(), ".env") });
+config({ path: resolve(process.cwd(), ".env.local"), override: true });
+
 import { prisma } from "@/lib/prisma";
 import { startTenantProcessorWorker } from "@/lib/workers/processor";
 

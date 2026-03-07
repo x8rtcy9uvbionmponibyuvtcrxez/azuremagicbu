@@ -437,6 +437,9 @@ export default function HomePage() {
           </div>
           <div className="flex items-center gap-2">
             <Button asChild variant="outline">
+              <Link href="/esp-upload">ESP Upload</Link>
+            </Button>
+            <Button asChild variant="outline">
               <Link href="/history">History</Link>
             </Button>
             <Button asChild variant="outline">

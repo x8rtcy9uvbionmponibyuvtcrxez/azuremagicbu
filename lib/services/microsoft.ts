@@ -980,7 +980,15 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     displayName: mailbox.displayName || mailbox.email.split("@")[0],
     password: resolvedAdminPassword
   }));
-  const filteredMailboxData = mailboxData.filter((mb) => mb.email !== licensedUserUpn);
+  // Exclude the delegation principal AND the first-name user (who was provisioned as a regular
+  // user, not a shared mailbox). The first inbox name generates the licensed user UPN, which may
+  // differ from the current delegation target if it was changed after initial provisioning.
+  const firstInboxNameParts = names[0]?.split(/\s+/).filter(Boolean) || [];
+  const firstNameMailNickname = firstInboxNameParts.join(".").toLowerCase().replace(/[^a-z0-9.]/g, "");
+  const firstNameUpn = firstNameMailNickname ? `${firstNameMailNickname}@${domain}` : null;
+  const filteredMailboxData = mailboxData.filter(
+    (mb) => mb.email !== licensedUserUpn && mb.email !== firstNameUpn
+  );
   const mailboxStatuses = normalizeMailboxStatuses(tenant.mailboxStatuses);
   const totalMailboxTarget = filteredMailboxData.length;
   const countCreated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.created).length;
@@ -1032,15 +1040,30 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       const preferredUsers = await graphRequest<{
         value: Array<{ userPrincipalName?: string; assignedLicenses?: unknown[] }>;
       }>(accessToken, `/users?$filter=${preferredFilter}&$select=userPrincipalName,assignedLicenses`);
-      const preferredMatch = preferredUsers.value?.find((user) => {
+
+      // First try: user exists AND is licensed
+      const licensedMatch = preferredUsers.value?.find((user) => {
         const upn = normalizeEmail(user.userPrincipalName);
         return upn === preferredUpn && Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0;
       });
-      if (preferredMatch?.userPrincipalName) {
-        return normalizeEmail(preferredMatch.userPrincipalName);
+      if (licensedMatch?.userPrincipalName) {
+        return normalizeEmail(licensedMatch.userPrincipalName);
       }
+
+      // Fallback: user exists but unlicensed — allow as delegation principal anyway
+      const unlicensedMatch = preferredUsers.value?.find((user) => {
+        const upn = normalizeEmail(user.userPrincipalName);
+        return upn === preferredUpn;
+      });
+      if (unlicensedMatch?.userPrincipalName) {
+        console.warn(
+          `[delegation] Licensed user '${preferredUpn}' exists but has no assigned licenses. Proceeding with delegation anyway.`
+        );
+        return normalizeEmail(unlicensedMatch.userPrincipalName);
+      }
+
       throw new Error(
-        `Configured licensed user '${preferredUpn}' is missing or unlicensed. Re-run licensed user setup before delegation.`
+        `Configured licensed user '${preferredUpn}' is missing from the tenant. Re-run licensed user setup before delegation.`
       );
     }
 
@@ -1050,7 +1073,12 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         `/users/${licensedUserId}?$select=userPrincipalName,assignedLicenses`
       );
       const resolvedUpn = normalizeEmail(user.userPrincipalName);
-      if (resolvedUpn && Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0) {
+      if (resolvedUpn) {
+        if (!(Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0)) {
+          console.warn(
+            `[delegation] Licensed user '${resolvedUpn}' (by ID) exists but has no assigned licenses. Proceeding with delegation anyway.`
+          );
+        }
         return resolvedUpn;
       }
     }

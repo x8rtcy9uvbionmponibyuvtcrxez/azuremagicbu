@@ -954,7 +954,7 @@ export default function BatchPage({ params }: PageProps) {
                               <span>{waitRemainingMs > 0 ? `${formatDurationMs(waitRemainingMs)} remaining` : "Retrying now..."}</span>
                             </div>
                             <Progress value={waitProgress} className="h-1.5" />
-                            <p className="text-[11px] text-amber-800">{waitState.reason}</p>
+                            <p className="text-[11px] text-amber-800">{waitState?.reason}</p>
                           </div>
                         ) : null}
                         {stepCounter ? (
