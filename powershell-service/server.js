@@ -310,16 +310,21 @@ foreach ($mb in $mailboxData) {
     # Check if mailbox already exists
     $existing = $null
     try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
-    
+    $nameParts = $mb.displayName.Trim() -split '\\s+', 2
+    $firstName = $nameParts[0]
+    $lastName = if ($nameParts.Length -gt 1) { $nameParts[1] } else { $nameParts[0] }
+
     if ($existing) {
       # Already exists - treat as success
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "exists"; error = $null }
     } else {
       $tempName = "$($mb.displayName) $counter"
       New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
       Start-Sleep -Seconds 2
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "created"; error = $null }
     }
   } catch {
@@ -416,16 +421,21 @@ foreach ($mb in $mailboxData) {
     # Check if mailbox already exists
     $existing = $null
     try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
-    
+    $nameParts = $mb.displayName.Trim() -split '\\s+', 2
+    $firstName = $nameParts[0]
+    $lastName = if ($nameParts.Length -gt 1) { $nameParts[1] } else { $nameParts[0] }
+
     if ($existing) {
       # Already exists - treat as success
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "exists"; error = $null }
     } else {
       $tempName = "$($mb.displayName) $counter"
       New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
       Start-Sleep -Seconds 2
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
+      try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "created"; error = $null }
     }
   } catch {
@@ -522,7 +532,9 @@ $results | ConvertTo-Json -Compress
 `;
 
     const output = await runPowerShell(script, 300000);
-    res.json({ success: true, results: JSON.parse(output) });
+    const parsed = parseJsonFromPowerShellOutput(output);
+    const results = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.results) ? parsed.results : []);
+    res.json({ success: true, results });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {

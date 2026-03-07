@@ -129,6 +129,8 @@ type MailboxCheckpointState = {
   passwordSet: boolean;
   smtpEnabled: boolean;
   delegated: boolean;
+  signInEnabled: boolean;
+  cloudAppAdminAssigned: boolean;
 };
 
 type MailboxCheckpointMap = Record<string, MailboxCheckpointState>;
@@ -165,7 +167,9 @@ function normalizeMailboxStatuses(raw: unknown): MailboxCheckpointMap {
       created: item.created === true,
       passwordSet: item.passwordSet === true,
       smtpEnabled: item.smtpEnabled === true,
-      delegated: item.delegated === true
+      delegated: item.delegated === true,
+      signInEnabled: item.signInEnabled === true,
+      cloudAppAdminAssigned: item.cloudAppAdminAssigned === true
     };
   }
 
@@ -988,7 +992,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         created: false,
         passwordSet: false,
         smtpEnabled: false,
-        delegated: false
+        delegated: false,
+        signInEnabled: false,
+        cloudAppAdminAssigned: false
       };
     }
   }
@@ -1075,7 +1081,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
             created: false,
             passwordSet: false,
             smtpEnabled: false,
-            delegated: false
+            delegated: false,
+            signInEnabled: false,
+            cloudAppAdminAssigned: false
           }),
           created: true
         };
@@ -1319,7 +1327,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
             created: false,
             passwordSet: false,
             smtpEnabled: false,
-            delegated: false
+            delegated: false,
+            signInEnabled: false,
+            cloudAppAdminAssigned: false
           }),
           passwordSet: true
         };
@@ -1377,7 +1387,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
               created: false,
               passwordSet: false,
               smtpEnabled: false,
-              delegated: false
+              delegated: false,
+              signInEnabled: false,
+              cloudAppAdminAssigned: false
             }),
             smtpEnabled: true
           };
@@ -1522,7 +1534,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
                       created: false,
                       passwordSet: false,
                       smtpEnabled: false,
-                      delegated: false
+                      delegated: false,
+                      signInEnabled: false,
+                      cloudAppAdminAssigned: false
                     }),
                     delegated: true
                   };
@@ -1634,7 +1648,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
                 created: false,
                 passwordSet: false,
                 smtpEnabled: false,
-                delegated: false
+                delegated: false,
+                signInEnabled: false,
+                cloudAppAdminAssigned: false
               }),
               delegated: true
             };
@@ -1717,7 +1733,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
               created: false,
               passwordSet: false,
               smtpEnabled: false,
-              delegated: false
+              delegated: false,
+              signInEnabled: false,
+              cloudAppAdminAssigned: false
             }),
             delegated: true
           };
@@ -1772,6 +1790,8 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     });
 
     for (const mailbox of filteredMailboxData) {
+      if (mailboxStatuses[mailbox.email]?.signInEnabled) continue;
+
       try {
         const userId = await resolveUserId(mailbox.email);
         if (!userId) continue;
@@ -1780,14 +1800,17 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
           method: "PATCH",
           body: JSON.stringify({ accountEnabled: true })
         });
+
+        mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], signInEnabled: true };
       } catch (error) {
         console.log(`⚠️ [Graph] Failed to enable sign-in for ${mailbox.email}:`, error instanceof Error ? error.message : String(error));
       }
     }
 
+    const allSignInEnabled = filteredMailboxData.every((m) => mailboxStatuses[m.email]?.signInEnabled);
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { signInEnabled: true }
+      data: { signInEnabled: allSignInEnabled, mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) } }
     });
   }
 
@@ -1800,6 +1823,8 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     const cloudAppAdminTemplateId = "158c047a-c907-4556-b7ef-446551a6b5f7";
 
     for (const mailbox of filteredMailboxData) {
+      if (mailboxStatuses[mailbox.email]?.cloudAppAdminAssigned) continue;
+
       try {
         const userId = await resolveUserId(mailbox.email);
         if (!userId) continue;
@@ -1812,18 +1837,104 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
             directoryScopeId: "/"
           })
         });
+
+        mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], cloudAppAdminAssigned: true };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes("already exists")) {
+        if (message.includes("already exists")) {
+          // Role already assigned — treat as success
+          mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], cloudAppAdminAssigned: true };
+        } else {
           console.log(`⚠️ [Graph] Failed to assign Cloud App Admin to ${mailbox.email}: ${message}`);
         }
       }
     }
 
+    const allCloudAppAdminAssigned = filteredMailboxData.every((m) => mailboxStatuses[m.email]?.cloudAppAdminAssigned);
     await prisma.tenant.update({
       where: { id: tenantDbId },
-      data: { cloudAppAdminAssigned: true }
+      data: { cloudAppAdminAssigned: allCloudAppAdminAssigned, mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) } }
     });
+  }
+
+  // Final remediation pass — retry any mailboxes that failed sign-in or Cloud App Admin
+  const signInFailed = filteredMailboxData.filter((m) => !mailboxStatuses[m.email]?.signInEnabled);
+  const cloudAppAdminFailed = filteredMailboxData.filter((m) => !mailboxStatuses[m.email]?.cloudAppAdminAssigned);
+
+  if (signInFailed.length > 0 || cloudAppAdminFailed.length > 0) {
+    console.log(
+      `🔄 [Microsoft] Remediation pass: ${signInFailed.length} sign-in failures, ${cloudAppAdminFailed.length} Cloud App Admin failures`
+    );
+
+    await prisma.tenant.update({
+      where: { id: tenantDbId },
+      data: { currentStep: "Remediating failed mailboxes..." }
+    });
+
+    for (const mailbox of signInFailed) {
+      try {
+        const userId = await resolveUserId(mailbox.email);
+        if (!userId) continue;
+        await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ accountEnabled: true })
+        });
+        mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], signInEnabled: true };
+        console.log(`✅ [Graph] Remediated sign-in for ${mailbox.email}`);
+      } catch (error) {
+        console.log(
+          `⚠️ [Graph] Remediation failed for sign-in ${mailbox.email}:`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+
+    const cloudAppAdminTemplateId = "158c047a-c907-4556-b7ef-446551a6b5f7";
+    for (const mailbox of cloudAppAdminFailed) {
+      try {
+        const userId = await resolveUserId(mailbox.email);
+        if (!userId) continue;
+        await graphRequest<Record<string, unknown>>(accessToken, "/roleManagement/directory/roleAssignments", {
+          method: "POST",
+          body: JSON.stringify({
+            roleDefinitionId: cloudAppAdminTemplateId,
+            principalId: userId,
+            directoryScopeId: "/"
+          })
+        });
+        mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], cloudAppAdminAssigned: true };
+        console.log(`✅ [Graph] Remediated Cloud App Admin for ${mailbox.email}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("already exists")) {
+          mailboxStatuses[mailbox.email] = { ...mailboxStatuses[mailbox.email], cloudAppAdminAssigned: true };
+        } else {
+          console.log(`⚠️ [Graph] Remediation failed for Cloud App Admin ${mailbox.email}: ${message}`);
+        }
+      }
+    }
+
+    const allSignInEnabledFinal = filteredMailboxData.every((m) => mailboxStatuses[m.email]?.signInEnabled);
+    const allCloudAppAdminFinal = filteredMailboxData.every((m) => mailboxStatuses[m.email]?.cloudAppAdminAssigned);
+
+    await prisma.tenant.update({
+      where: { id: tenantDbId },
+      data: {
+        signInEnabled: allSignInEnabledFinal,
+        cloudAppAdminAssigned: allCloudAppAdminFinal,
+        mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
+      }
+    });
+
+    const stillFailedSignIn = filteredMailboxData.filter((m) => !mailboxStatuses[m.email]?.signInEnabled);
+    const stillFailedCloudApp = filteredMailboxData.filter((m) => !mailboxStatuses[m.email]?.cloudAppAdminAssigned);
+    if (stillFailedSignIn.length > 0 || stillFailedCloudApp.length > 0) {
+      console.log(
+        `⚠️ [Microsoft] After remediation: ${stillFailedSignIn.length} sign-in still failing, ${stillFailedCloudApp.length} Cloud App Admin still failing — will retry on next run`
+      );
+    } else {
+      console.log(`✅ [Microsoft] All mailboxes remediated successfully`);
+    }
   }
 
   const csvRows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
