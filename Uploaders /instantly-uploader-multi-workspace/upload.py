@@ -348,6 +348,28 @@ def setup_driver():
         # Anti-detection scripts
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         print(f"[setup_driver] Cookie policy: all cookies allowed, third-party cookie blocking disabled")
+
+        # Inject auth cookies if provided — bypasses login form entirely
+        instantly_cookies = os.environ.get("INSTANTLY_COOKIES")
+        if instantly_cookies:
+            import json
+            try:
+                driver.get("https://app.instantly.ai/auth/login")  # Need to be on domain first
+                time.sleep(2)
+                cookies = json.loads(instantly_cookies)
+                for cookie in cookies:
+                    # Only keep fields Selenium accepts
+                    clean = {k: cookie[k] for k in ['name', 'value', 'domain', 'path', 'secure', 'httpOnly'] if k in cookie}
+                    if 'sameSite' in cookie and cookie['sameSite'] in ['Strict', 'Lax', 'None']:
+                        clean['sameSite'] = cookie['sameSite']
+                    try:
+                        driver.add_cookie(clean)
+                    except Exception as ce:
+                        print(f"[setup_driver] Skipping cookie {cookie.get('name','?')}: {ce}")
+                print(f"[setup_driver] Injected {len(cookies)} auth cookies from INSTANTLY_COOKIES")
+            except Exception as e:
+                print(f"[setup_driver] Cookie injection failed: {e}")
+
         return driver
     except Exception as e:
         print(f"Failed to setup Chrome driver: {e}")
