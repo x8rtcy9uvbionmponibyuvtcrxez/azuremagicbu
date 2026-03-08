@@ -307,16 +307,25 @@ def check_email_added(api_key, email, worker_id="", api_version="v1"):
         return check_email_added_v1(api_key, email, worker_id)
 
 def setup_driver():
-    """Setup Chrome driver with incognito mode and optimized settings"""
+    """Setup Chrome driver with optimized settings and cookie support"""
     chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument("--incognito")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-popup-blocking")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+    # Allow ALL cookies — fixes "Blocked third-party cookie" in Browserless
+    chrome_options.add_argument("--disable-features=SameSiteByDefaultCookies,CookiesWithoutSameSiteMustBeSecure,ThirdPartyCookieBlocking")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_experimental_option("prefs", {
+        "profile.cookie_controls_mode": 0,        # 0 = Allow all cookies
+        "profile.block_third_party_cookies": False,
+    })
+
+    # Anti-detection: realistic user-agent
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
     browserless_url = os.environ.get("BROWSERLESS_URL")
 
@@ -332,10 +341,13 @@ def setup_driver():
             )
         else:
             # Local dev: use local Chrome
+            chrome_options.add_argument("--incognito")
             driver = webdriver.Chrome(options=chrome_options)
             driver.maximize_window()
 
+        # Anti-detection scripts
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        print(f"[setup_driver] Cookie policy: all cookies allowed, third-party cookie blocking disabled")
         return driver
     except Exception as e:
         print(f"Failed to setup Chrome driver: {e}")
