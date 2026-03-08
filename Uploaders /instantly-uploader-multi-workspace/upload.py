@@ -318,13 +318,18 @@ def setup_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
 
-    # Container/Railway mode: headless + fixed window size
+    # Container/Railway mode: headless + fixed window size + anti-detection
     in_container = bool(os.environ.get("CHROME_BIN"))
     if in_container:
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--window-size=1920,1080")
         chrome_options.add_argument("--disable-crash-reporter")
         chrome_options.add_argument("--remote-debugging-port=9222")
+        # Normal user-agent so sites don't detect headless Chrome
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
         chrome_options.binary_location = os.environ["CHROME_BIN"]
 
     try:
@@ -340,6 +345,16 @@ def setup_driver():
             driver = webdriver.Chrome(options=chrome_options)
 
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        if in_container:
+            # Extra anti-detection for headless: fake plugins, languages, chrome runtime
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                    window.chrome = {runtime: {}};
+                """
+            })
         if not in_container:
             driver.maximize_window()
         return driver
