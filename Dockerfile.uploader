@@ -38,9 +38,14 @@ COPY ["Uploaders /smartlead-uploader/sl-complete.py",  "/app/scripts/smartlead/s
 COPY ["Uploaders /instantly-uploader-multi-workspace/upload.py", "/app/scripts/instantly/upload.py"]
 COPY ["Uploaders /instantly-uploader-multi-workspace/config.py", "/app/scripts/instantly/config.py"]
 
-# ── No sed patching needed ────────────────────────────────────
-# Both upload.py and sl-python.py auto-detect container via CHROME_BIN
-# env var and apply headless + memory-safe flags in code.
+# ── Patch Chrome options for Docker ──────────────────────────
+# sl-python.py: add container flags after --headless
+RUN sed -i 's/opts.add_argument("--headless")/opts.add_argument("--headless=new")\n                    opts.add_argument("--no-sandbox")\n                    opts.add_argument("--disable-dev-shm-usage")\n                    opts.add_argument("--disable-gpu")/' \
+    /app/scripts/smartlead/sl-python.py
+
+# upload.py: enable headless mode (currently commented out)
+RUN sed -i 's/# chrome_options.add_argument("--headless")/chrome_options.add_argument("--headless=new")/' \
+    /app/scripts/instantly/upload.py
 
 # ── Copy service code ────────────────────────────────────────
 COPY uploader-service/server.py ./server.py

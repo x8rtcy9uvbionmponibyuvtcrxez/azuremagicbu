@@ -310,6 +310,7 @@ def setup_driver():
     """Setup Chrome driver with incognito mode and optimized settings"""
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--incognito")
+    # chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -317,52 +318,12 @@ def setup_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-
-    # Container/Railway mode: headless + fixed window size + anti-detection
-    in_container = bool(os.environ.get("CHROME_BIN"))
-    if in_container:
-        print("[setup_driver] Container mode detected — applying headless + anti-detection config v3")
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--disable-crash-reporter")
-        chrome_options.add_argument("--remote-debugging-port=9222")
-        # Normal user-agent so sites don't detect headless Chrome
-        chrome_options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
-        chrome_options.binary_location = os.environ["CHROME_BIN"]
-    else:
-        print("[setup_driver] Local mode — visible browser")
-
+    
     try:
-        from selenium.webdriver.chrome.service import Service
-        # Use webdriver-manager to auto-detect chromedriver path (works in Nix & Docker)
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            from webdriver_manager.core.os_manager import ChromeType
-            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-        except Exception:
-            # Fallback: let Selenium find chromedriver on PATH
-            driver = webdriver.Chrome(options=chrome_options)
-
+        driver = webdriver.Chrome(options=chrome_options)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        if in_container:
-            # Extra anti-detection for headless: fake plugins, languages, chrome runtime
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                    window.chrome = {runtime: {}};
-                """
-            })
-            # Debug: print Chrome version + user-agent
-            ua = driver.execute_script("return navigator.userAgent")
-            print(f"[setup_driver] Chrome UA: {ua}")
-        if not in_container:
-            driver.maximize_window()
+        # Maximize window to ensure all elements are visible
+        driver.maximize_window()
         return driver
     except Exception as e:
         print(f"Failed to setup Chrome driver: {e}")
@@ -535,38 +496,54 @@ def switch_workspace(driver, target_workspace, worker_id=""):
 def login_to_instantly(driver, email, password, workspace="", worker_id=""):
     """Login to Instantly account using simplified approach from original"""
     prefix = f"Worker {worker_id}: " if worker_id else ""
+    
     try:
         print(f"{prefix}Navigating to Instantly accounts page...")
         driver.get("https://app.instantly.ai/app/accounts")
         time.sleep(2)
+        
         print(f"{prefix}Waiting for email field...")
+        # Enter email
         email_field = WebDriverWait(driver, 10).until(
             EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Email']"))
         )
         print(f"{prefix}Entering email: {email}")
         email_field.clear()
         email_field.send_keys(email)
+        
         print(f"{prefix}Waiting for password field...")
+        # Enter password
         password_field = WebDriverWait(driver, 10).until(
             EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Password']"))
         )
         print(f"{prefix}Entering password...")
         password_field.clear()
         password_field.send_keys(password)
+        
         print(f"{prefix}Clicking login button...")
+        # Click login button
         WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
         ).click()
+        
         print(f"{prefix}Waiting for login success...")
+        # Wait for login success - check URL is app/accounts
         WebDriverWait(driver, 15).until(
             lambda driver: "https://app.instantly.ai/app/accounts" in driver.current_url
         )
+        
         print(f"{Fore.GREEN}{prefix}Login successful{Style.RESET_ALL}")
+        
+        # Switch to the specified workspace if provided
         if workspace:
             if not switch_workspace(driver, workspace, worker_id):
                 print(f"{Fore.YELLOW}{prefix}WARNING: Failed to switch to workspace: {workspace}{Style.RESET_ALL}")
                 print(f"{Fore.YELLOW}{prefix}Continuing without workspace switch...{Style.RESET_ALL}")
+                # Continue anyway - don't fail the login
+                # return False
+        
         return True
+        
     except TimeoutException:
         print(f"{Fore.RED}{prefix}Login failed - timeout{Style.RESET_ALL}")
         return False
