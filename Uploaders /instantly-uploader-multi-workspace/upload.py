@@ -321,6 +321,7 @@ def setup_driver():
     # Container/Railway mode: headless + fixed window size + anti-detection
     in_container = bool(os.environ.get("CHROME_BIN"))
     if in_container:
+        print("[setup_driver] Container mode detected — applying headless + anti-detection config v3")
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--window-size=1920,1080")
         chrome_options.add_argument("--disable-crash-reporter")
@@ -331,6 +332,8 @@ def setup_driver():
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
         chrome_options.binary_location = os.environ["CHROME_BIN"]
+    else:
+        print("[setup_driver] Local mode — visible browser")
 
     try:
         from selenium.webdriver.chrome.service import Service
@@ -355,6 +358,9 @@ def setup_driver():
                     window.chrome = {runtime: {}};
                 """
             })
+            # Debug: print Chrome version + user-agent
+            ua = driver.execute_script("return navigator.userAgent")
+            print(f"[setup_driver] Chrome UA: {ua}")
         if not in_container:
             driver.maximize_window()
         return driver
