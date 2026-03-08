@@ -509,8 +509,10 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     console.log(`✓ [Worker] DKIM already configured for ${tenant.tenantName}, skipping`);
   }
 
-  const shouldConnectSmartlead = Boolean(process.env.SMARTLEAD_API_KEY);
-  const shouldConnectInstantly = Boolean(process.env.INSTANTLY_API_KEY);
+  const smartleadKey = (process.env.SMARTLEAD_API_KEY || "").trim();
+  const instantlyKey = (process.env.INSTANTLY_API_KEY || "").trim();
+  const shouldConnectSmartlead = smartleadKey.length > 0 && smartleadKey !== "none";
+  const shouldConnectInstantly = instantlyKey.length > 0 && instantlyKey !== "none";
 
   if (!tenant) {
     await updateBatchStatus(batchId);
