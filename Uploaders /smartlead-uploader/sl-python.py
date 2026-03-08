@@ -115,8 +115,19 @@ def process_emails(api_key, csv_path, custom_login_url, progress_cb=None, log_cb
                 log_message(f"Processing account {email}: attempt {attempts+1}/{max_retries}")
                 try:
                     opts = webdriver.ChromeOptions()
-                    opts.add_argument("--headless")
-                    driver = webdriver.Chrome(options=opts)
+                    opts.add_argument("--headless=new")
+                    opts.add_argument("--no-sandbox")
+                    opts.add_argument("--disable-dev-shm-usage")
+                    opts.add_argument("--disable-gpu")
+                    opts.add_argument("--window-size=1920,1080")
+                    browserless_url = os.environ.get("BROWSERLESS_URL")
+                    if browserless_url:
+                        driver = webdriver.Remote(
+                            command_executor=f"{browserless_url}/webdriver",
+                            options=opts
+                        )
+                    else:
+                        driver = webdriver.Chrome(options=opts)
 
                     log_message(f"Opening login URL for {email}")
                     driver.get(custom_login_url)

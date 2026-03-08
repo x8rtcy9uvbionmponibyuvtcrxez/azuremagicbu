@@ -310,7 +310,6 @@ def setup_driver():
     """Setup Chrome driver with incognito mode and optimized settings"""
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--incognito")
-    # chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -318,12 +317,25 @@ def setup_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    
+
+    browserless_url = os.environ.get("BROWSERLESS_URL")
+
     try:
-        driver = webdriver.Chrome(options=chrome_options)
+        if browserless_url:
+            # Railway: connect to remote Browserless Chrome
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--window-size=1920,1080")
+            print(f"[setup_driver] Connecting to Browserless at {browserless_url}")
+            driver = webdriver.Remote(
+                command_executor=f"{browserless_url}/webdriver",
+                options=chrome_options
+            )
+        else:
+            # Local dev: use local Chrome
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.maximize_window()
+
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        # Maximize window to ensure all elements are visible
-        driver.maximize_window()
         return driver
     except Exception as e:
         print(f"Failed to setup Chrome driver: {e}")
