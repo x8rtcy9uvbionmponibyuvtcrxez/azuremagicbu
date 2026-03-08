@@ -368,33 +368,38 @@ def setup_driver():
                     'httpOnly': True,
                 })
 
-                # Set navbarExp cookie (client-side login check)
-                # isLoggedIn() checks: navbarExp.expires > Date.now() && navbarExp.pkud
-                navbar_data = json.dumps({
-                    "expires": int(time.time() * 1000) + 86400000 * 30,  # 30 days from now
-                    "pkud": True
-                })
-                driver.add_cookie({
-                    'name': 'navbarExp',
-                    'value': navbar_data,
-                    'domain': '.instantly.ai',
-                    'path': '/',
-                })
+                # Set navbarExp cookie via JS (needs URL-encoding for js-cookie compat)
+                # isLoggedIn() checks: JSON.parse(navbarExp).expires > Date.now()
+                expires_ms = int(time.time() * 1000) + 86400000 * 30  # 30 days
+                driver.execute_script(f"""
+                    var data = JSON.stringify({{expires: {expires_ms}, pkud: true}});
+                    document.cookie = 'navbarExp=' + encodeURIComponent(data) + '; path=/; domain=.instantly.ai; max-age=2592000';
+                """)
 
                 print(f"[setup_driver] Injected __session + navbarExp cookies")
 
                 # Now navigate to accounts to test if session works
                 driver.get("https://app.instantly.ai/app/accounts")
-                time.sleep(4)
+                time.sleep(5)
                 current_url = driver.current_url
                 print(f"[setup_driver] After cookie injection, URL is: {current_url}")
                 if "/app/accounts" in current_url:
                     print(f"[setup_driver] Token auth worked - on accounts page")
                 else:
                     print(f"[setup_driver] Cookie auth didn't bypass login (URL: {current_url})")
-                    # Dump cookies for debugging
+                    # Dump cookies and page state for debugging
                     all_cookies = driver.get_cookies()
-                    print(f"[setup_driver] Current cookies: {[c['name'] for c in all_cookies]}")
+                    print(f"[setup_driver] Cookies: {[(c['name'], c['value'][:30]) for c in all_cookies]}")
+                    # Check what isLoggedIn sees
+                    login_check = driver.execute_script("""
+                        try {
+                            var cookies = document.cookie.split(';').map(c => c.trim().split('=')[0]);
+                            var navExp = document.cookie.match(/navbarExp=([^;]+)/);
+                            var parsed = navExp ? JSON.parse(decodeURIComponent(navExp[1])) : null;
+                            return {cookies: cookies, navbarExp: parsed, now: Date.now()};
+                        } catch(e) { return {error: e.message}; }
+                    """)
+                    print(f"[setup_driver] JS login check: {login_check}")
             except Exception as e:
                 print(f"[setup_driver] Cookie injection failed: {e}")
 
