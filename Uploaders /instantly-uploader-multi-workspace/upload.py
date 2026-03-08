@@ -342,7 +342,6 @@ def setup_driver():
         chrome_options.add_argument("--disable-sync")
         chrome_options.add_argument("--disable-translate")
         chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--single-process")
         chrome_options.add_argument("--crash-dumps-dir=/tmp")
         chrome_options.add_argument("--disable-crash-reporter")
         # Use the container's Chromium binary
@@ -571,21 +570,31 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
                 pass
             return False
 
-        # Use JavaScript to set values — ensures React state updates properly
+        # Focus and type into email field character by character
         print(f"{prefix}Entering email: {email}")
-        driver.execute_script("""
-            var el = arguments[0];
-            var val = arguments[1];
-            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(el, val);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-        """, email_field, email)
+        email_field.click()
+        time.sleep(0.3)
+        email_field.clear()
+        email_field.send_keys(email)
         time.sleep(0.5)
 
+        # Verify email was entered
+        email_val = email_field.get_attribute("value")
+        print(f"{prefix}Email field value after entry: '{email_val}'")
+        if not email_val:
+            # Fallback: use JS native setter
+            print(f"{prefix}send_keys failed, using JS setter for email...")
+            driver.execute_script("""
+                var el = arguments[0]; var val = arguments[1];
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            """, email_field, email)
+            time.sleep(0.5)
+
         print(f"{prefix}Waiting for password field...")
-        # Enter password
         password_field = None
         password_selectors = [
             (By.XPATH, "//input[@placeholder='Password']"),
@@ -605,32 +614,45 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
             print(f"{prefix}Could not find password field")
             return False
 
+        # Focus and type into password field
         print(f"{prefix}Entering password...")
-        driver.execute_script("""
-            var el = arguments[0];
-            var val = arguments[1];
-            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(el, val);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-        """, password_field, password)
+        password_field.click()
+        time.sleep(0.3)
+        password_field.clear()
+        password_field.send_keys(password)
         time.sleep(0.5)
 
-        print(f"{prefix}Clicking login button...")
-        # Click login button — try multiple selectors
+        # Verify password was entered
+        pass_val = password_field.get_attribute("value")
+        print(f"{prefix}Password field has {len(pass_val) if pass_val else 0} chars")
+        if not pass_val:
+            print(f"{prefix}send_keys failed, using JS setter for password...")
+            driver.execute_script("""
+                var el = arguments[0]; var val = arguments[1];
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            """, password_field, password)
+            time.sleep(0.5)
+
+        # Try submitting: first via button click, then JS form submit, then Enter key
+        print(f"{prefix}Attempting form submission...")
+
+        # Method 1: Click login button (match exact "Log In" text to avoid "Log In with Google")
         login_clicked = False
         login_selectors = [
             (By.XPATH, "//button[@type='submit']"),
-            (By.XPATH, "//button[contains(text(),'Log')]"),
-            (By.XPATH, "//button[contains(text(),'Sign')]"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[normalize-space(text())='Log In']"),
+            (By.XPATH, "//button[normalize-space(.)='Log In']"),
         ]
         for sel_by, sel_val in login_selectors:
             try:
-                btn = WebDriverWait(driver, 5).until(
+                btn = WebDriverWait(driver, 3).until(
                     EC.element_to_be_clickable((sel_by, sel_val))
                 )
+                print(f"{prefix}Found login button with: {sel_val}")
                 btn.click()
                 login_clicked = True
                 break
@@ -638,10 +660,27 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
                 continue
 
         if not login_clicked:
-            # Fallback: press Enter on the password field
-            print(f"{prefix}No login button found, pressing Enter on password field...")
+            # Method 2: Submit via JS
+            print(f"{prefix}Button click failed, trying JS form submit...")
+            try:
+                driver.execute_script("""
+                    var form = document.querySelector('form');
+                    if (form) { form.submit(); }
+                    else {
+                        var btns = document.querySelectorAll('button');
+                        for (var b of btns) {
+                            if (b.textContent.trim() === 'Log In') { b.click(); break; }
+                        }
+                    }
+                """)
+                login_clicked = True
+            except Exception as js_err:
+                print(f"{prefix}JS submit failed: {js_err}")
+
+        if not login_clicked:
+            # Method 3: Enter key
+            print(f"{prefix}Pressing Enter on password field...")
             password_field.send_keys(Keys.RETURN)
-            login_clicked = True
 
         print(f"{prefix}Waiting for login success...")
         time.sleep(5)  # Give login a moment to process
