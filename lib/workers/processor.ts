@@ -91,27 +91,8 @@ async function updateBatchStatus(batchId: string) {
   });
 }
 
-async function enqueueNextBatchTenant(batchId: string, completedTenantId: string) {
-  const nextTenant = await prisma.tenant.findFirst({
-    where: {
-      batchId,
-      id: { not: completedTenantId },
-      status: { in: ["queued", "domain_add", "domain_verify"] }
-    },
-    orderBy: { createdAt: "asc" },
-    select: { id: true, tenantName: true }
-  });
-
-  if (nextTenant) {
-    console.log(`🔗 [Worker] Chaining next tenant: ${nextTenant.tenantName} (${nextTenant.id})`);
-    await enqueueTenantProcessingJob(
-      { tenantId: nextTenant.id, batchId },
-      { jobId: `${batchId}:${nextTenant.id}:chained:${Date.now()}` }
-    );
-  } else {
-    console.log("✅ [Worker] No more queued tenants in batch");
-  }
-}
+// Sequential chaining removed — all tenants are enqueued at batch start.
+// Workers pick them up in parallel based on WORKER_CONCURRENCY and replica count.
 
 async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state: string }> {
   const { tenantId, batchId } = job.data;
@@ -614,8 +595,6 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       message: "Tenant completed successfully"
     });
 
-    // Chain: enqueue the next queued tenant in this batch (no delay — permissions already propagated)
-    await enqueueNextBatchTenant(batchId, tenant.id);
   }
 
   await updateBatchStatus(batchId);
@@ -702,7 +681,7 @@ export function startTenantProcessorWorker() {
       },
       {
         connection: redisConnection,
-        concurrency: 1
+        concurrency: Math.max(1, Number(process.env.WORKER_CONCURRENCY || 1))
       }
     );
 

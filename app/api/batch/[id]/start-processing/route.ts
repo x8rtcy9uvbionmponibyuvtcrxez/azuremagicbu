@@ -159,42 +159,34 @@ export async function POST(_request: Request, { params }: Params) {
       )
     );
 
-    // Only enqueue the FIRST tenant with a 6-minute permission propagation delay.
-    // When it completes, the worker will enqueue the next queued tenant in the batch.
+    // Enqueue ALL tenants at once — workers will pick them up in parallel.
+    // Each tenant gets the same propagation delay so Microsoft permissions have time to settle.
     const PERMISSION_PROPAGATION_DELAY_MS = Math.round(
       Math.max(60_000, Number(process.env.PRIVILEGE_PROPAGATION_BASE_DELAY_MS || 318_000)) *
       Math.max(1, Number(process.env.PRIVILEGE_PROPAGATION_BUFFER_MULTIPLIER || 1.2))
     );
 
-    const firstTenant = processableTenants[0];
     const seed = Date.now();
-
     const waitMinutes = Math.round(PERMISSION_PROPAGATION_DELAY_MS / 60_000);
 
-    await prisma.tenant.update({
-      where: { id: firstTenant.id },
-      data: {
-        currentStep: `Waiting ${waitMinutes}m for Microsoft permission propagation...`
-      }
-    });
+    await Promise.all(
+      processableTenants.map(async (tenant, i) => {
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            currentStep: `Waiting ${waitMinutes}m for Microsoft permission propagation...`
+          }
+        });
 
-    await enqueueTenantProcessingJob(
-      { tenantId: firstTenant.id, batchId: batch.id },
-      {
-        delayMs: PERMISSION_PROPAGATION_DELAY_MS,
-        jobId: `${batch.id}:${firstTenant.id}:start:${seed}:0`
-      }
+        await enqueueTenantProcessingJob(
+          { tenantId: tenant.id, batchId: batch.id },
+          {
+            delayMs: PERMISSION_PROPAGATION_DELAY_MS,
+            jobId: `${batch.id}:${tenant.id}:start:${seed}:${i}`
+          }
+        );
+      })
     );
-
-    // Mark remaining tenants as waiting — they'll be chained by the worker after the previous one completes
-    for (let i = 1; i < processableTenants.length; i++) {
-      await prisma.tenant.update({
-        where: { id: processableTenants[i].id },
-        data: {
-          currentStep: `Queued — will start after tenant ${i} of ${processableTenants.length} completes`
-        }
-      });
-    }
 
     await prisma.batch.update({
       where: { id: batch.id },
