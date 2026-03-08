@@ -519,44 +519,130 @@ def switch_workspace(driver, target_workspace, worker_id=""):
 def login_to_instantly(driver, email, password, workspace="", worker_id=""):
     """Login to Instantly account using simplified approach from original"""
     prefix = f"Worker {worker_id}: " if worker_id else ""
-    
+
     try:
-        print(f"{prefix}Navigating to Instantly accounts page...")
-        driver.get("https://app.instantly.ai/app/accounts")
-        time.sleep(2)
-        
+        print(f"{prefix}Navigating to Instantly login page...")
+        driver.get("https://app.instantly.ai/auth/login")
+        time.sleep(3)
+
+        print(f"{prefix}Current URL after navigation: {driver.current_url}")
+
         print(f"{prefix}Waiting for email field...")
-        # Enter email
-        email_field = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Email']"))
-        )
+        # Try multiple selectors — Instantly may change their login form
+        email_field = None
+        email_selectors = [
+            (By.XPATH, "//input[@placeholder='Email']"),
+            (By.XPATH, "//input[@type='email']"),
+            (By.XPATH, "//input[@name='email']"),
+            (By.CSS_SELECTOR, "input[placeholder*='mail']"),
+        ]
+        for sel_by, sel_val in email_selectors:
+            try:
+                email_field = WebDriverWait(driver, 5).until(
+                    EC.visibility_of_element_located((sel_by, sel_val))
+                )
+                print(f"{prefix}Found email field with selector: {sel_val}")
+                break
+            except TimeoutException:
+                continue
+
+        if not email_field:
+            print(f"{prefix}Could not find email field. Page title: {driver.title}")
+            print(f"{prefix}Current URL: {driver.current_url}")
+            # Dump visible text for debugging
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
+                print(f"{prefix}Page text: {body_text}")
+            except Exception:
+                pass
+            return False
+
         print(f"{prefix}Entering email: {email}")
         email_field.clear()
         email_field.send_keys(email)
-        
+
         print(f"{prefix}Waiting for password field...")
         # Enter password
-        password_field = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Password']"))
-        )
+        password_field = None
+        password_selectors = [
+            (By.XPATH, "//input[@placeholder='Password']"),
+            (By.XPATH, "//input[@type='password']"),
+            (By.XPATH, "//input[@name='password']"),
+        ]
+        for sel_by, sel_val in password_selectors:
+            try:
+                password_field = WebDriverWait(driver, 5).until(
+                    EC.visibility_of_element_located((sel_by, sel_val))
+                )
+                break
+            except TimeoutException:
+                continue
+
+        if not password_field:
+            print(f"{prefix}Could not find password field")
+            return False
+
         print(f"{prefix}Entering password...")
         password_field.clear()
         password_field.send_keys(password)
-        
+
         print(f"{prefix}Clicking login button...")
-        # Click login button
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
-        ).click()
-        
+        # Click login button — try multiple selectors
+        login_clicked = False
+        login_selectors = [
+            (By.XPATH, "//button[@type='submit']"),
+            (By.XPATH, "//button[contains(text(),'Log')]"),
+            (By.XPATH, "//button[contains(text(),'Sign')]"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+        ]
+        for sel_by, sel_val in login_selectors:
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((sel_by, sel_val))
+                )
+                btn.click()
+                login_clicked = True
+                break
+            except TimeoutException:
+                continue
+
+        if not login_clicked:
+            print(f"{prefix}Could not find login button")
+            return False
+
         print(f"{prefix}Waiting for login success...")
-        # Wait for login success - check URL is app/accounts
-        WebDriverWait(driver, 15).until(
-            lambda driver: "https://app.instantly.ai/app/accounts" in driver.current_url
-        )
-        
-        print(f"{Fore.GREEN}{prefix}Login successful{Style.RESET_ALL}")
-        
+        time.sleep(3)  # Give login a moment to process
+
+        # Wait for login success — accept any /app/ URL (dashboard, accounts, etc.)
+        def _logged_in(d):
+            url = d.current_url
+            return "app.instantly.ai/app/" in url or "app.instantly.ai/dashboard" in url
+
+        try:
+            WebDriverWait(driver, 30).until(_logged_in)
+        except TimeoutException:
+            # Log debugging info before failing
+            current_url = driver.current_url
+            print(f"{prefix}Login timed out. Current URL: {current_url}")
+            print(f"{prefix}Page title: {driver.title}")
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
+                print(f"{prefix}Page text: {body_text}")
+            except Exception:
+                pass
+            # Check if we're on an error page or still on login
+            if "auth" in current_url or "login" in current_url:
+                print(f"{prefix}Still on login page — credentials may be wrong or there's a CAPTCHA")
+            return False
+
+        print(f"{Fore.GREEN}{prefix}Login successful — URL: {driver.current_url}{Style.RESET_ALL}")
+
+        # Navigate to accounts page if we landed elsewhere
+        if "/app/accounts" not in driver.current_url:
+            print(f"{prefix}Navigating to accounts page...")
+            driver.get("https://app.instantly.ai/app/accounts")
+            time.sleep(3)
+
         # Switch to the specified workspace if provided
         if workspace:
             if not switch_workspace(driver, workspace, worker_id):
@@ -564,11 +650,13 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
                 print(f"{Fore.YELLOW}{prefix}Continuing without workspace switch...{Style.RESET_ALL}")
                 # Continue anyway - don't fail the login
                 # return False
-        
+
         return True
-        
+
     except TimeoutException:
         print(f"{Fore.RED}{prefix}Login failed - timeout{Style.RESET_ALL}")
+        print(f"{prefix}Current URL: {driver.current_url}")
+        print(f"{prefix}Page title: {driver.title}")
         return False
     except Exception as e:
         print(f"{Fore.RED}{prefix}Login error: {e}{Style.RESET_ALL}")
