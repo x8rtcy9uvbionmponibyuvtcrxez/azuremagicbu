@@ -11,6 +11,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from colorama import Fore, Style, init
 from config import MAX_RETRIES_PER_ACCOUNT
 
@@ -328,6 +329,11 @@ def setup_driver():
     if in_container:
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--window-size=1920,1080")
+        # Realistic user-agent to avoid bot detection
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        )
         # Memory-saving flags critical for Railway / Docker containers
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--disable-software-rasterizer")
@@ -344,7 +350,15 @@ def setup_driver():
 
     try:
         driver = webdriver.Chrome(options=chrome_options)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Hide webdriver property from bot detection
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """
+        })
         if not in_container:
             driver.maximize_window()
         return driver
@@ -557,9 +571,18 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
                 pass
             return False
 
+        # Use JavaScript to set values — ensures React state updates properly
         print(f"{prefix}Entering email: {email}")
-        email_field.clear()
-        email_field.send_keys(email)
+        driver.execute_script("""
+            var el = arguments[0];
+            var val = arguments[1];
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        """, email_field, email)
+        time.sleep(0.5)
 
         print(f"{prefix}Waiting for password field...")
         # Enter password
@@ -583,8 +606,16 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
             return False
 
         print(f"{prefix}Entering password...")
-        password_field.clear()
-        password_field.send_keys(password)
+        driver.execute_script("""
+            var el = arguments[0];
+            var val = arguments[1];
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        """, password_field, password)
+        time.sleep(0.5)
 
         print(f"{prefix}Clicking login button...")
         # Click login button — try multiple selectors
@@ -607,11 +638,13 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
                 continue
 
         if not login_clicked:
-            print(f"{prefix}Could not find login button")
-            return False
+            # Fallback: press Enter on the password field
+            print(f"{prefix}No login button found, pressing Enter on password field...")
+            password_field.send_keys(Keys.RETURN)
+            login_clicked = True
 
         print(f"{prefix}Waiting for login success...")
-        time.sleep(3)  # Give login a moment to process
+        time.sleep(5)  # Give login a moment to process
 
         # Wait for login success — accept any /app/ URL (dashboard, accounts, etc.)
         def _logged_in(d):
