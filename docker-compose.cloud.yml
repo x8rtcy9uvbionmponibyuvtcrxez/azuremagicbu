@@ -12,12 +12,22 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7
     restart: unless-stopped
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   powershell-service:
     build:
@@ -26,10 +36,13 @@ services:
     restart: unless-stopped
     environment:
       PS_SERVICE_PORT: "3099"
-      GRAPH_CLIENT_ID: ${GRAPH_CLIENT_ID}
-      GRAPH_CLIENT_SECRET: ${GRAPH_CLIENT_SECRET}
     ports:
       - "3099:3099"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3099/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   web:
     build:
@@ -37,14 +50,19 @@ services:
       dockerfile: Dockerfile.web
     restart: unless-stopped
     depends_on:
-      - postgres
-      - redis
-      - powershell-service
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      powershell-service:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/azure_inbox_ops?schema=public
       REDIS_URL: redis://redis:6379
       PS_SERVICE_URL: http://powershell-service:3099
+      CLOUD_MODE: "true"
+      NEXT_PUBLIC_CLOUD_MODE: "true"
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       GRAPH_CLIENT_ID: ${GRAPH_CLIENT_ID}
       GRAPH_CLIENT_SECRET: ${GRAPH_CLIENT_SECRET}
@@ -52,8 +70,8 @@ services:
       GRAPH_APP_ID: ${GRAPH_APP_ID}
       CLOUDFLARE_API_KEY: ${CLOUDFLARE_API_KEY}
       CLOUDFLARE_EMAIL: ${CLOUDFLARE_EMAIL}
-      SMARTLEAD_API_KEY: ${SMARTLEAD_API_KEY}
-      INSTANTLY_API_KEY: ${INSTANTLY_API_KEY}
+      SMARTLEAD_API_KEY: ${SMARTLEAD_API_KEY:-}
+      INSTANTLY_API_KEY: ${INSTANTLY_API_KEY:-}
     ports:
       - "3000:3000"
 
@@ -63,9 +81,12 @@ services:
       dockerfile: Dockerfile.worker
     restart: unless-stopped
     depends_on:
-      - postgres
-      - redis
-      - powershell-service
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      powershell-service:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/azure_inbox_ops?schema=public
@@ -78,8 +99,8 @@ services:
       GRAPH_APP_ID: ${GRAPH_APP_ID}
       CLOUDFLARE_API_KEY: ${CLOUDFLARE_API_KEY}
       CLOUDFLARE_EMAIL: ${CLOUDFLARE_EMAIL}
-      SMARTLEAD_API_KEY: ${SMARTLEAD_API_KEY}
-      INSTANTLY_API_KEY: ${INSTANTLY_API_KEY}
+      SMARTLEAD_API_KEY: ${SMARTLEAD_API_KEY:-}
+      INSTANTLY_API_KEY: ${INSTANTLY_API_KEY:-}
 
 volumes:
   postgres_data:

@@ -10,6 +10,13 @@ import { createEspRun, maskKey, type EspType } from "@/lib/esp-upload-store";
 import { spawnSmartleadRun, spawnInstantlyRun } from "@/lib/esp-upload-spawn";
 
 export async function POST(request: Request) {
+  if (process.env.CLOUD_MODE === "true") {
+    return NextResponse.json(
+      { error: "ESP Upload is not available in cloud mode. Run locally to use this feature." },
+      { status: 403 }
+    );
+  }
+
   try {
     const formData = await request.formData();
     const esp = formData.get("esp") as string;
