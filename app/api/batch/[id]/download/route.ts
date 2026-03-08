@@ -21,6 +21,7 @@ export async function GET(_request: Request, { params }: Params) {
           select: {
             id: true,
             tenantName: true,
+            clientName: true,
             domain: true,
             inboxCount: true,
             inboxNames: true,
@@ -38,7 +39,7 @@ export async function GET(_request: Request, { params }: Params) {
     const zip = new JSZip();
 
     for (const tenant of batch.tenants) {
-      const filename = tenantCsvFilename(tenant.tenantName, tenant.domain);
+      const filename = tenantCsvFilename(tenant.tenantName, tenant.clientName, tenant.domain);
       try {
         const csv = await getTenantCsvContent(tenant);
         zip.file(filename, csv);

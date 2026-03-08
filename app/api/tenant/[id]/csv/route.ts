@@ -18,6 +18,7 @@ export async function GET(_request: Request, { params }: Params) {
       select: {
         id: true,
         tenantName: true,
+        clientName: true,
         domain: true,
         inboxCount: true,
         inboxNames: true,
@@ -30,7 +31,7 @@ export async function GET(_request: Request, { params }: Params) {
     }
 
     const csv = await getTenantCsvContent(tenant);
-    const filename = tenantCsvFilename(tenant.tenantName, tenant.domain);
+    const filename = tenantCsvFilename(tenant.tenantName, tenant.clientName, tenant.domain);
 
     return new Response(csv, {
       status: 200,

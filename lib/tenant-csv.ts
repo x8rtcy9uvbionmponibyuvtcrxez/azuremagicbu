@@ -106,7 +106,8 @@ export async function getTenantCsvContent(tenant: TenantCsvInput): Promise<strin
   return generateFallbackCsv(tenant);
 }
 
-export function tenantCsvFilename(tenantName: string, domain: string): string {
-  const base = tenantName || domain || "tenant";
-  return `${base.replace(/[^a-zA-Z0-9_-]/g, "_")}.csv`;
+export function tenantCsvFilename(tenantName: string, clientName: string, domain: string): string {
+  const parts = [tenantName, clientName, domain].filter(Boolean);
+  const base = parts.length > 0 ? parts.join(" - ") : "tenant";
+  return `${base.replace(/[^a-zA-Z0-9._-\s]/g, "")}.csv`;
 }

@@ -917,6 +917,83 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
   }
 });
 
+// ──────────────────────────────────────
+// Teardown: Remove shared mailboxes
+// ──────────────────────────────────────
+app.post("/remove-shared-mailboxes", async (req, res) => {
+  const { adminUpn, adminPassword, organizationId, emails } = req.body;
+  if (!adminUpn || !adminPassword || !emails || !Array.isArray(emails) || emails.length === 0) {
+    return res.status(400).json({ error: "adminUpn, adminPassword, and emails[] required" });
+  }
+
+  const safeAdminUpn = escapePowerShellString(adminUpn);
+  const safeAdminPassword = escapePowerShellString(adminPassword);
+  const safeOrgId = organizationId ? escapePowerShellString(organizationId) : "";
+
+  const emailList = emails.map((e) => `"${escapePowerShellString(e)}"`).join(",");
+
+  const orgParam = safeOrgId
+    ? `-Organization "${safeOrgId}"`
+    : "";
+
+  const script = `
+$ErrorActionPreference = "Continue"
+$password = ConvertTo-SecureString "${safeAdminPassword}" -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("${safeAdminUpn}", $password)
+Connect-ExchangeOnline -Credential $cred ${orgParam} -ShowBanner:$false
+
+$emails = @(${emailList})
+$results = @()
+foreach ($email in $emails) {
+  try {
+    Remove-Mailbox -Identity $email -Confirm:$false -Force -ErrorAction Stop
+    $results += @{ email = $email; status = "removed" }
+    Write-Host "Removed: $email"
+  } catch {
+    $results += @{ email = $email; status = "failed"; error = $_.Exception.Message }
+    Write-Host "Failed: $email - $($_.Exception.Message)"
+  }
+}
+
+Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+$results | ConvertTo-Json -Depth 3
+`;
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const tmpFile = path.join(os.tmpdir(), `ps-remove-mbx-${Date.now()}.ps1`);
+      fs.writeFileSync(tmpFile, script);
+
+      const child = spawn("pwsh", ["-NoProfile", "-NonInteractive", "-File", tmpFile]);
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (data) => { stdout += data.toString(); });
+      child.stderr.on("data", (data) => { stderr += data.toString(); });
+
+      child.on("close", (code) => {
+        fs.unlinkSync(tmpFile);
+        if (code !== 0) {
+          reject(new Error(`PowerShell exited with code ${code}: ${stripAnsi(stderr || stdout).trim()}`));
+        } else {
+          resolve(stdout);
+        }
+      });
+    });
+
+    let parsed;
+    try {
+      parsed = parseJsonFromPowerShellOutput(result);
+    } catch {
+      parsed = { raw: stripAnsi(String(result)).trim() };
+    }
+
+    res.json({ ok: true, results: Array.isArray(parsed) ? parsed : [parsed] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Exchange PowerShell service running on port ${PORT}`);
 });

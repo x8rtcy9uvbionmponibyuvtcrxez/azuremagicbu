@@ -50,7 +50,8 @@ function isPermissionPropagationError(message: string): boolean {
   return (
     normalized.includes("insufficient privileges") ||
     normalized.includes("authorization_requestdenied") ||
-    normalized.includes("access denied")
+    normalized.includes("access denied") ||
+    normalized.includes("domain portion of the userprincipalname property is invalid")
   );
 }
 
@@ -88,6 +89,28 @@ async function updateBatchStatus(batchId: string) {
       status
     }
   });
+}
+
+async function enqueueNextBatchTenant(batchId: string, completedTenantId: string) {
+  const nextTenant = await prisma.tenant.findFirst({
+    where: {
+      batchId,
+      id: { not: completedTenantId },
+      status: { in: ["queued", "domain_add", "domain_verify"] }
+    },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, tenantName: true }
+  });
+
+  if (nextTenant) {
+    console.log(`🔗 [Worker] Chaining next tenant: ${nextTenant.tenantName} (${nextTenant.id})`);
+    await enqueueTenantProcessingJob(
+      { tenantId: nextTenant.id, batchId },
+      { jobId: `${batchId}:${nextTenant.id}:chained:${Date.now()}` }
+    );
+  } else {
+    console.log("✅ [Worker] No more queued tenants in batch");
+  }
 }
 
 async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state: string }> {
@@ -590,6 +613,9 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       eventType: "tenant_completed",
       message: "Tenant completed successfully"
     });
+
+    // Chain: enqueue the next queued tenant in this batch (no delay — permissions already propagated)
+    await enqueueNextBatchTenant(batchId, tenant.id);
   }
 
   await updateBatchStatus(batchId);
