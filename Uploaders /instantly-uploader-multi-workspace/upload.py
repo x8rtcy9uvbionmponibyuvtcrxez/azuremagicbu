@@ -640,47 +640,36 @@ def login_to_instantly(driver, email, password, workspace="", worker_id=""):
         # Try submitting: first via button click, then JS form submit, then Enter key
         print(f"{prefix}Attempting form submission...")
 
-        # Method 1: Click login button (match exact "Log In" text to avoid "Log In with Google")
+        # Click the exact "Log In" button (NOT "Log In with Google" or "Log In with Apple")
+        # Use JS to find the button with exact text match
+        print(f"{prefix}Looking for login button...")
         login_clicked = False
-        login_selectors = [
-            (By.XPATH, "//button[@type='submit']"),
-            (By.XPATH, "//button[normalize-space(text())='Log In']"),
-            (By.XPATH, "//button[normalize-space(.)='Log In']"),
-        ]
-        for sel_by, sel_val in login_selectors:
-            try:
-                btn = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((sel_by, sel_val))
-                )
-                print(f"{prefix}Found login button with: {sel_val}")
-                btn.click()
-                login_clicked = True
-                break
-            except TimeoutException:
-                continue
 
-        if not login_clicked:
-            # Method 2: Submit via JS
-            print(f"{prefix}Button click failed, trying JS form submit...")
-            try:
-                driver.execute_script("""
-                    var form = document.querySelector('form');
-                    if (form) { form.submit(); }
-                    else {
-                        var btns = document.querySelectorAll('button');
-                        for (var b of btns) {
-                            if (b.textContent.trim() === 'Log In') { b.click(); break; }
-                        }
+        # Method 1: JS click on exact "Log In" button (most reliable)
+        try:
+            clicked = driver.execute_script("""
+                var btns = document.querySelectorAll('button');
+                for (var b of btns) {
+                    var text = b.textContent.trim();
+                    if (text === 'Log In' || text === 'Login' || text === 'Sign In') {
+                        console.log('Clicking button: ' + text);
+                        b.click();
+                        return text;
                     }
-                """)
+                }
+                return null;
+            """)
+            if clicked:
+                print(f"{prefix}Clicked '{clicked}' button via JS")
                 login_clicked = True
-            except Exception as js_err:
-                print(f"{prefix}JS submit failed: {js_err}")
+        except Exception as e:
+            print(f"{prefix}JS button click failed: {e}")
 
         if not login_clicked:
-            # Method 3: Enter key
-            print(f"{prefix}Pressing Enter on password field...")
+            # Method 2: Press Enter on password field to submit form
+            print(f"{prefix}No exact button found, pressing Enter on password field...")
             password_field.send_keys(Keys.RETURN)
+            login_clicked = True
 
         print(f"{prefix}Waiting for login success...")
         time.sleep(5)  # Give login a moment to process
