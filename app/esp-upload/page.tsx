@@ -41,7 +41,7 @@ const phaseLabel: Record<string, string> = {
   done: "Done",
 };
 
-const isCloudMode = process.env.NEXT_PUBLIC_CLOUD_MODE === "true";
+// Cloud mode no longer blocks ESP upload — the web app proxies to the uploader service.
 
 export default function EspUploadPage() {
   const [selectedEsp, setSelectedEsp] = useState<EspType>(null);
@@ -153,17 +153,8 @@ export default function EspUploadPage() {
         </Button>
       </div>
 
-      {/* Cloud mode notice */}
-      {isCloudMode && (
-        <Alert className="mt-6">
-          <AlertDescription>
-            ESP Upload is not available in cloud mode. This feature requires local Python scripts and must be run from your local machine.
-          </AlertDescription>
-        </Alert>
-      )}
-
       {/* ESP Picker */}
-      {!runId && !isCloudMode && (
+      {!runId && (
         <div className="mt-6 grid gap-4 md:grid-cols-2">
           <Card
             className={`cursor-pointer transition-all ${selectedEsp === "smartlead" ? "ring-2 ring-blue-500" : "hover:border-blue-300"}`}
@@ -191,7 +182,7 @@ export default function EspUploadPage() {
       )}
 
       {/* Smartlead Form */}
-      {selectedEsp === "smartlead" && !runId && !isCloudMode && (
+      {selectedEsp === "smartlead" && !runId && (
         <form onSubmit={onSubmit} className="mt-6 grid gap-4 rounded-lg border p-4">
           <h2 className="text-lg font-medium">Smartlead Upload</h2>
 
@@ -237,7 +228,7 @@ export default function EspUploadPage() {
       )}
 
       {/* Instantly Form */}
-      {selectedEsp === "instantly" && !runId && !isCloudMode && (
+      {selectedEsp === "instantly" && !runId && (
         <form onSubmit={onSubmit} className="mt-6 grid gap-4 rounded-lg border p-4">
           <h2 className="text-lg font-medium">Instantly Upload</h2>
 

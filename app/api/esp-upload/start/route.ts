@@ -9,14 +9,55 @@ import { tmpdir } from "os";
 import { createEspRun, maskKey, type EspType } from "@/lib/esp-upload-store";
 import { spawnSmartleadRun, spawnInstantlyRun } from "@/lib/esp-upload-spawn";
 
-export async function POST(request: Request) {
-  if (process.env.CLOUD_MODE === "true") {
+const UPLOADER_URL = process.env.UPLOADER_SERVICE_URL || "";
+
+// ---------------------------------------------------------------------------
+// Cloud mode: proxy the request to the uploader micro-service
+// ---------------------------------------------------------------------------
+
+async function proxyToUploader(formData: FormData, esp: string): Promise<Response> {
+  const file = formData.get("file") as File;
+  const apiKey = (formData.get("apiKey") as string) || "";
+  const numWorkers = parseInt(formData.get("numWorkers") as string) || 4;
+
+  const body = new FormData();
+  body.append("file", file);
+  body.append("apiKey", apiKey);
+  body.append("numWorkers", String(numWorkers));
+
+  let endpoint: string;
+
+  if (esp === "smartlead") {
+    endpoint = `${UPLOADER_URL}/jobs/smartlead`;
+    body.append("loginUrl", (formData.get("loginUrl") as string) || "");
+  } else {
+    endpoint = `${UPLOADER_URL}/jobs/instantly`;
+    body.append("loginEmail", (formData.get("loginEmail") as string) || "");
+    body.append("loginPassword", (formData.get("loginPassword") as string) || "");
+    body.append("workspace", (formData.get("workspace") as string) || "");
+    body.append("apiVersion", (formData.get("apiVersion") as string) || "v1");
+    body.append("v2ApiKey", (formData.get("v2ApiKey") as string) || "");
+  }
+
+  const res = await fetch(endpoint, { method: "POST", body });
+  const data = await res.json();
+
+  if (!res.ok) {
     return NextResponse.json(
-      { error: "ESP Upload is not available in cloud mode. Run locally to use this feature." },
-      { status: 403 }
+      { error: data.detail || data.error || "Uploader service error" },
+      { status: res.status }
     );
   }
 
+  // The uploader returns { jobId }, forward as { runId } (frontend expects this key)
+  return NextResponse.json({ runId: data.jobId });
+}
+
+// ---------------------------------------------------------------------------
+// Main handler
+// ---------------------------------------------------------------------------
+
+export async function POST(request: Request) {
   try {
     const formData = await request.formData();
     const esp = formData.get("esp") as string;
@@ -43,6 +84,13 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
+
+    // ── Cloud mode: proxy to uploader micro-service ──────────
+    if (UPLOADER_URL) {
+      return proxyToUploader(formData, esp);
+    }
+
+    // ── Local mode: spawn Python subprocess directly ─────────
 
     // Create temp working directory
     const workingDir = join(tmpdir(), `esp-upload-${randomUUID()}`);
