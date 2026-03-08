@@ -354,20 +354,42 @@ def setup_driver():
         if instantly_token:
             try:
                 driver.get("https://app.instantly.ai/auth/login")  # Must be on domain first
-                time.sleep(2)
-                # Inject token into localStorage (where Instantly stores auth)
+                time.sleep(3)
+
+                # Debug: dump existing cookies and localStorage keys
+                existing_cookies = driver.get_cookies()
+                print(f"[setup_driver] Existing cookies on login page: {[c['name'] for c in existing_cookies]}")
+                ls_keys = driver.execute_script("return Object.keys(localStorage);")
+                print(f"[setup_driver] Existing localStorage keys: {ls_keys}")
+
+                # Inject into ALL possible storage locations
                 driver.execute_script(f"""
                     localStorage.setItem('token', '{instantly_token}');
                     localStorage.setItem('instantly_token', '{instantly_token}');
                     localStorage.setItem('auth_token', '{instantly_token}');
+                    localStorage.setItem('access_token', '{instantly_token}');
+                    localStorage.setItem('jwt', '{instantly_token}');
+                    localStorage.setItem('user-token', '{instantly_token}');
                 """)
-                # Also set as cookies with common names
-                for cookie_name in ['token', 'auth_token', 'instantly_token', 'session']:
+                # Also set as cookies
+                for cookie_name in ['token', 'auth_token', 'instantly_token', 'session', 'access_token', 'jwt']:
                     try:
                         driver.add_cookie({'name': cookie_name, 'value': instantly_token, 'domain': '.instantly.ai', 'path': '/'})
                     except Exception:
                         pass
                 print(f"[setup_driver] Injected auth token into localStorage + cookies")
+
+                # Now navigate to accounts to test if token works
+                driver.get("https://app.instantly.ai/app/accounts")
+                time.sleep(3)
+                current_url = driver.current_url
+                print(f"[setup_driver] After token injection, URL is: {current_url}")
+                if "/app/accounts" in current_url:
+                    print(f"[setup_driver] ✅ Token auth worked! Already on accounts page")
+                else:
+                    print(f"[setup_driver] ❌ Token didn't bypass login, page source snippet:")
+                    source = driver.page_source[:500] if driver.page_source else "empty"
+                    print(f"[setup_driver] {source}")
             except Exception as e:
                 print(f"[setup_driver] Token injection failed: {e}")
 
