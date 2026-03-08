@@ -38,9 +38,9 @@ COPY ["Uploaders /smartlead-uploader/sl-complete.py",  "/app/scripts/smartlead/s
 COPY ["Uploaders /instantly-uploader-multi-workspace/upload.py", "/app/scripts/instantly/upload.py"]
 COPY ["Uploaders /instantly-uploader-multi-workspace/config.py", "/app/scripts/instantly/config.py"]
 
-# ── No more sed patching needed ─────────────────────────────
-# Both upload.py and sl-python.py auto-detect container environments
-# via the CHROME_BIN env var and apply memory-safe flags in code.
+# ── No sed patching needed ────────────────────────────────────
+# Both upload.py and sl-python.py auto-detect container via CHROME_BIN
+# env var and apply headless + memory-safe flags in code.
 
 # ── Copy service code ────────────────────────────────────────
 COPY uploader-service/server.py ./server.py

@@ -11,7 +11,6 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from colorama import Fore, Style, init
 from config import MAX_RETRIES_PER_ACCOUNT
 
@@ -308,11 +307,7 @@ def check_email_added(api_key, email, worker_id="", api_version="v1"):
         return check_email_added_v1(api_key, email, worker_id)
 
 def setup_driver():
-    """Setup Chrome driver with incognito mode and optimized settings.
-
-    Automatically detects container environments (via CHROME_BIN env var)
-    and applies memory-safe flags to prevent tab crashes.
-    """
+    """Setup Chrome driver with incognito mode and optimized settings"""
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--incognito")
     chrome_options.add_argument("--no-sandbox")
@@ -323,41 +318,28 @@ def setup_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
 
-    # Detect container / Railway environment
+    # Container/Railway mode: headless + fixed window size
     in_container = bool(os.environ.get("CHROME_BIN"))
-
     if in_container:
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--window-size=1920,1080")
-        # Realistic user-agent to avoid bot detection
-        chrome_options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-        )
-        # Memory-saving flags critical for Railway / Docker containers
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--disable-background-networking")
-        chrome_options.add_argument("--disable-default-apps")
-        chrome_options.add_argument("--disable-sync")
-        chrome_options.add_argument("--disable-translate")
-        chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--crash-dumps-dir=/tmp")
         chrome_options.add_argument("--disable-crash-reporter")
-        # Use the container's Chromium binary
+        chrome_options.add_argument("--remote-debugging-port=9222")
         chrome_options.binary_location = os.environ["CHROME_BIN"]
 
     try:
-        driver = webdriver.Chrome(options=chrome_options)
-        # Hide webdriver property from bot detection
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                window.chrome = {runtime: {}};
-            """
-        })
+        from selenium.webdriver.chrome.service import Service
+        # Use webdriver-manager to auto-detect chromedriver path (works in Nix & Docker)
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
+            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception:
+            # Fallback: let Selenium find chromedriver on PATH
+            driver = webdriver.Chrome(options=chrome_options)
+
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         if not in_container:
             driver.maximize_window()
         return driver
@@ -532,192 +514,40 @@ def switch_workspace(driver, target_workspace, worker_id=""):
 def login_to_instantly(driver, email, password, workspace="", worker_id=""):
     """Login to Instantly account using simplified approach from original"""
     prefix = f"Worker {worker_id}: " if worker_id else ""
-
     try:
-        print(f"{prefix}Navigating to Instantly login page...")
-        driver.get("https://app.instantly.ai/auth/login")
-        time.sleep(3)
-
-        print(f"{prefix}Current URL after navigation: {driver.current_url}")
-
+        print(f"{prefix}Navigating to Instantly accounts page...")
+        driver.get("https://app.instantly.ai/app/accounts")
+        time.sleep(2)
         print(f"{prefix}Waiting for email field...")
-        # Try multiple selectors — Instantly may change their login form
-        email_field = None
-        email_selectors = [
-            (By.XPATH, "//input[@placeholder='Email']"),
-            (By.XPATH, "//input[@type='email']"),
-            (By.XPATH, "//input[@name='email']"),
-            (By.CSS_SELECTOR, "input[placeholder*='mail']"),
-        ]
-        for sel_by, sel_val in email_selectors:
-            try:
-                email_field = WebDriverWait(driver, 5).until(
-                    EC.visibility_of_element_located((sel_by, sel_val))
-                )
-                print(f"{prefix}Found email field with selector: {sel_val}")
-                break
-            except TimeoutException:
-                continue
-
-        if not email_field:
-            print(f"{prefix}Could not find email field. Page title: {driver.title}")
-            print(f"{prefix}Current URL: {driver.current_url}")
-            # Dump visible text for debugging
-            try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
-                print(f"{prefix}Page text: {body_text}")
-            except Exception:
-                pass
-            return False
-
-        # Focus and type into email field character by character
+        email_field = WebDriverWait(driver, 10).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Email']"))
+        )
         print(f"{prefix}Entering email: {email}")
-        email_field.click()
-        time.sleep(0.3)
         email_field.clear()
         email_field.send_keys(email)
-        time.sleep(0.5)
-
-        # Verify email was entered
-        email_val = email_field.get_attribute("value")
-        print(f"{prefix}Email field value after entry: '{email_val}'")
-        if not email_val:
-            # Fallback: use JS native setter
-            print(f"{prefix}send_keys failed, using JS setter for email...")
-            driver.execute_script("""
-                var el = arguments[0]; var val = arguments[1];
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            """, email_field, email)
-            time.sleep(0.5)
-
         print(f"{prefix}Waiting for password field...")
-        password_field = None
-        password_selectors = [
-            (By.XPATH, "//input[@placeholder='Password']"),
-            (By.XPATH, "//input[@type='password']"),
-            (By.XPATH, "//input[@name='password']"),
-        ]
-        for sel_by, sel_val in password_selectors:
-            try:
-                password_field = WebDriverWait(driver, 5).until(
-                    EC.visibility_of_element_located((sel_by, sel_val))
-                )
-                break
-            except TimeoutException:
-                continue
-
-        if not password_field:
-            print(f"{prefix}Could not find password field")
-            return False
-
-        # Focus and type into password field
+        password_field = WebDriverWait(driver, 10).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='Password']"))
+        )
         print(f"{prefix}Entering password...")
-        password_field.click()
-        time.sleep(0.3)
         password_field.clear()
         password_field.send_keys(password)
-        time.sleep(0.5)
-
-        # Verify password was entered
-        pass_val = password_field.get_attribute("value")
-        print(f"{prefix}Password field has {len(pass_val) if pass_val else 0} chars")
-        if not pass_val:
-            print(f"{prefix}send_keys failed, using JS setter for password...")
-            driver.execute_script("""
-                var el = arguments[0]; var val = arguments[1];
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, val);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            """, password_field, password)
-            time.sleep(0.5)
-
-        # Try submitting: first via button click, then JS form submit, then Enter key
-        print(f"{prefix}Attempting form submission...")
-
-        # Click the exact "Log In" button (NOT "Log In with Google" or "Log In with Apple")
-        # Use JS to find the button with exact text match
-        print(f"{prefix}Looking for login button...")
-        login_clicked = False
-
-        # Method 1: JS click on exact "Log In" button (most reliable)
-        try:
-            clicked = driver.execute_script("""
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) {
-                    var text = b.textContent.trim();
-                    if (text === 'Log In' || text === 'Login' || text === 'Sign In') {
-                        console.log('Clicking button: ' + text);
-                        b.click();
-                        return text;
-                    }
-                }
-                return null;
-            """)
-            if clicked:
-                print(f"{prefix}Clicked '{clicked}' button via JS")
-                login_clicked = True
-        except Exception as e:
-            print(f"{prefix}JS button click failed: {e}")
-
-        if not login_clicked:
-            # Method 2: Press Enter on password field to submit form
-            print(f"{prefix}No exact button found, pressing Enter on password field...")
-            password_field.send_keys(Keys.RETURN)
-            login_clicked = True
-
+        print(f"{prefix}Clicking login button...")
+        WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
+        ).click()
         print(f"{prefix}Waiting for login success...")
-        time.sleep(5)  # Give login a moment to process
-
-        # Wait for login success — accept any /app/ URL (dashboard, accounts, etc.)
-        def _logged_in(d):
-            url = d.current_url
-            return "app.instantly.ai/app/" in url or "app.instantly.ai/dashboard" in url
-
-        try:
-            WebDriverWait(driver, 30).until(_logged_in)
-        except TimeoutException:
-            # Log debugging info before failing
-            current_url = driver.current_url
-            print(f"{prefix}Login timed out. Current URL: {current_url}")
-            print(f"{prefix}Page title: {driver.title}")
-            try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text[:500]
-                print(f"{prefix}Page text: {body_text}")
-            except Exception:
-                pass
-            # Check if we're on an error page or still on login
-            if "auth" in current_url or "login" in current_url:
-                print(f"{prefix}Still on login page — credentials may be wrong or there's a CAPTCHA")
-            return False
-
-        print(f"{Fore.GREEN}{prefix}Login successful — URL: {driver.current_url}{Style.RESET_ALL}")
-
-        # Navigate to accounts page if we landed elsewhere
-        if "/app/accounts" not in driver.current_url:
-            print(f"{prefix}Navigating to accounts page...")
-            driver.get("https://app.instantly.ai/app/accounts")
-            time.sleep(3)
-
-        # Switch to the specified workspace if provided
+        WebDriverWait(driver, 15).until(
+            lambda driver: "https://app.instantly.ai/app/accounts" in driver.current_url
+        )
+        print(f"{Fore.GREEN}{prefix}Login successful{Style.RESET_ALL}")
         if workspace:
             if not switch_workspace(driver, workspace, worker_id):
                 print(f"{Fore.YELLOW}{prefix}WARNING: Failed to switch to workspace: {workspace}{Style.RESET_ALL}")
                 print(f"{Fore.YELLOW}{prefix}Continuing without workspace switch...{Style.RESET_ALL}")
-                # Continue anyway - don't fail the login
-                # return False
-
         return True
-
     except TimeoutException:
         print(f"{Fore.RED}{prefix}Login failed - timeout{Style.RESET_ALL}")
-        print(f"{prefix}Current URL: {driver.current_url}")
-        print(f"{prefix}Page title: {driver.title}")
         return False
     except Exception as e:
         print(f"{Fore.RED}{prefix}Login error: {e}{Style.RESET_ALL}")
