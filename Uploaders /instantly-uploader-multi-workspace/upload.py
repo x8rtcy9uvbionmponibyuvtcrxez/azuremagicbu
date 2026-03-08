@@ -307,10 +307,13 @@ def check_email_added(api_key, email, worker_id="", api_version="v1"):
         return check_email_added_v1(api_key, email, worker_id)
 
 def setup_driver():
-    """Setup Chrome driver with incognito mode and optimized settings"""
+    """Setup Chrome driver with incognito mode and optimized settings.
+
+    Automatically detects container environments (via CHROME_BIN env var)
+    and applies memory-safe flags to prevent tab crashes.
+    """
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--incognito")
-    # chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -318,12 +321,32 @@ def setup_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    
+
+    # Detect container / Railway environment
+    in_container = bool(os.environ.get("CHROME_BIN"))
+
+    if in_container:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--window-size=1920,1080")
+        # Memory-saving flags critical for Railway / Docker containers
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--disable-default-apps")
+        chrome_options.add_argument("--disable-sync")
+        chrome_options.add_argument("--disable-translate")
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--single-process")
+        chrome_options.add_argument("--crash-dumps-dir=/tmp")
+        chrome_options.add_argument("--disable-crash-reporter")
+        # Use the container's Chromium binary
+        chrome_options.binary_location = os.environ["CHROME_BIN"]
+
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        # Maximize window to ensure all elements are visible
-        driver.maximize_window()
+        if not in_container:
+            driver.maximize_window()
         return driver
     except Exception as e:
         print(f"Failed to setup Chrome driver: {e}")

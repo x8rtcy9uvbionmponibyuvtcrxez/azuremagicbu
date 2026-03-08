@@ -115,7 +115,20 @@ def process_emails(api_key, csv_path, custom_login_url, progress_cb=None, log_cb
                 log_message(f"Processing account {email}: attempt {attempts+1}/{max_retries}")
                 try:
                     opts = webdriver.ChromeOptions()
-                    opts.add_argument("--headless")
+                    opts.add_argument("--headless=new")
+                    opts.add_argument("--no-sandbox")
+                    opts.add_argument("--disable-dev-shm-usage")
+                    opts.add_argument("--disable-gpu")
+                    opts.add_argument("--window-size=1920,1080")
+                    # Container-specific memory-saving flags
+                    in_container = bool(os.environ.get("CHROME_BIN"))
+                    if in_container:
+                        opts.add_argument("--disable-extensions")
+                        opts.add_argument("--disable-software-rasterizer")
+                        opts.add_argument("--single-process")
+                        opts.add_argument("--crash-dumps-dir=/tmp")
+                        opts.add_argument("--disable-crash-reporter")
+                        opts.binary_location = os.environ["CHROME_BIN"]
                     driver = webdriver.Chrome(options=opts)
 
                     log_message(f"Opening login URL for {email}")
