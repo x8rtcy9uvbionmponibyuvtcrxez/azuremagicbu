@@ -7,7 +7,7 @@
     "dev": "next dev -p 3000",
     "dev:clean": "npm run clean:next && next dev -p 3000",
     "build": "next build",
-    "start": "npx prisma migrate deploy && node .next/standalone/server.js",
+    "start": "npx prisma migrate deploy && next start",
     "start:local": "next start",
     "worker": "npx prisma migrate deploy && tsx -r tsconfig-paths/register scripts/start-worker.ts",
     "worker:local": "DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config -r tsconfig-paths/register scripts/start-worker.ts",
