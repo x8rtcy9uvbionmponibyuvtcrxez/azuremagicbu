@@ -2,7 +2,7 @@ import { PHASE_DEVELOPMENT_SERVER } from "next/constants.js";
 
 /** @type {import('next').NextConfig} */
 const baseConfig = {
-  // output: "standalone" — disabled; Railway Railpack handles container optimization
+  output: "standalone"
 };
 
 export default function nextConfig(phase) {
