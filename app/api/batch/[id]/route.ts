@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { decryptSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
@@ -23,6 +24,8 @@ export async function GET(_request: Request, { params }: Params) {
             tenantName: true,
             clientName: true,
             domain: true,
+            adminEmail: true,
+            adminPassword: true,
             status: true,
             progress: true,
             currentStep: true,
@@ -74,12 +77,21 @@ export async function GET(_request: Request, { params }: Params) {
         completedCount,
         createdAt: finalBatch.createdAt.toISOString()
       },
-      tenants: batch.tenants.map((tenant) => ({
-        ...tenant,
-        authCodeExpiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null,
-        createdAt: tenant.createdAt.toISOString(),
-        updatedAt: tenant.updatedAt.toISOString()
-      }))
+      tenants: batch.tenants.map((tenant) => {
+        let adminPasswordPlain = "";
+        try {
+          adminPasswordPlain = tenant.adminPassword ? decryptSecret(tenant.adminPassword) : "";
+        } catch {
+          adminPasswordPlain = "";
+        }
+        return {
+          ...tenant,
+          adminPassword: adminPasswordPlain,
+          authCodeExpiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null,
+          createdAt: tenant.createdAt.toISOString(),
+          updatedAt: tenant.updatedAt.toISOString()
+        };
+      })
     });
   } catch (error) {
     return NextResponse.json(
