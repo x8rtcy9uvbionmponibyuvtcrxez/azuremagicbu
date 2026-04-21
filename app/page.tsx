@@ -19,6 +19,7 @@ import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { extractApiError, parseJsonResponse } from "@/lib/http-client";
+import { normalizeForwardingUrl } from "@/lib/validation";
 
 const nameRegex = /^[A-Za-z]+\s+[A-Za-z]+$/;
 const tenantRegex = /^[A-Za-z0-9-]+$/;
@@ -31,8 +32,11 @@ const singleTenantSchema = z.object({
   forwardingUrl: z
     .string()
     .trim()
-    .url("Enter a valid URL")
-    .refine((value) => value.startsWith("https://"), "Forwarding URL must start with https://"),
+    .min(1, "Forwarding URL is required")
+    .transform(normalizeForwardingUrl)
+    .refine((value) => {
+      try { new URL(value); return true; } catch { return false; }
+    }, "Enter a valid URL"),
   adminEmail: z
     .string()
     .trim()
@@ -169,7 +173,7 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
   const adminEmail = (row.admin_email ?? "").trim().toLowerCase();
   const adminPassword = row.admin_password ?? "";
   const domain = (row.domain ?? "").trim().toLowerCase();
-  const forwardingUrl = (row.forwarding_url ?? "").trim();
+  const forwardingUrl = normalizeForwardingUrl(row.forwarding_url ?? "");
   const inboxCountRaw = (row.inbox_count ?? "").trim();
   const inboxNames = parseInboxNames(row.inbox_names ?? "");
 
@@ -181,7 +185,6 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
     errors.push("admin_password must include uppercase, lowercase, number, and symbol");
   }
   if (!domainRegex.test(domain)) errors.push("domain is invalid");
-  if (!forwardingUrl.startsWith("https://")) errors.push("forwarding_url must start with https://");
   try {
     new URL(forwardingUrl);
   } catch {
@@ -316,7 +319,7 @@ export default function HomePage() {
           admin_password: values.adminPassword,
           domain: values.domain.trim().toLowerCase(),
           inbox_names: inboxNames.join(","),
-          forwarding_url: values.forwardingUrl.trim(),
+          forwarding_url: normalizeForwardingUrl(values.forwardingUrl),
           inbox_count: String(values.inboxCount)
         }
       ]);
@@ -540,12 +543,12 @@ export default function HomePage() {
                           <FormItem>
                             <FormLabel>Forwarding URL</FormLabel>
                             <FormControl>
-                              <Input placeholder="https://clientwebsite.com" {...field} onChange={(event) => {
+                              <Input placeholder="clientwebsite.com" {...field} onChange={(event) => {
                                 field.onChange(event);
                                 setSingleValidated(false);
                               }} />
                             </FormControl>
-                            <FormDescription>Must be HTTPS.</FormDescription>
+                            <FormDescription>Protocol is optional — we&apos;ll prepend https:// automatically.</FormDescription>
                             <FormMessage />
                           </FormItem>
                         )}

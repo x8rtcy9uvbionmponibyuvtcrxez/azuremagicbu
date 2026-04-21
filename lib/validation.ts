@@ -4,6 +4,24 @@ const tenantNameRegex = /^[A-Za-z0-9-]+$/;
 const inboxNameRegex = /^[A-Za-z]+\s+[A-Za-z]+$/;
 const domainRegex = /^(?!-)(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,}$/;
 
+export function normalizeForwardingUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed.replace(/^http:\/\//i, "https://");
+  }
+  return `https://${trimmed}`;
+}
+
+function isValidUrl(value: string): boolean {
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const passwordChecks = [
   {
     test: (value: string) => /[A-Z]/.test(value),
@@ -66,10 +84,9 @@ export const tenantCsvRowSchema = z
     forwarding_url: z
       .string()
       .trim()
-      .url("forwarding_url must be a valid URL")
-      .refine((value) => value.startsWith("https://"), {
-        message: "forwarding_url must start with https://"
-      }),
+      .min(1, "forwarding_url is required")
+      .transform(normalizeForwardingUrl)
+      .refine(isValidUrl, { message: "forwarding_url must be a valid URL" }),
     inbox_count: z
       .string()
       .trim()
