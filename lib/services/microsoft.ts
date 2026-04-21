@@ -709,6 +709,154 @@ export async function setDomainAsDefault(tenantDbId: string, domain: string, acc
   });
 }
 
+/**
+ * Ensure the primary user (firstname.lastname@customdomain) has a license.
+ *
+ * 4-step algorithm:
+ *   a. Is the primary user already licensed? → return, nothing to do.
+ *   b. Is the license on any OTHER user in the tenant? → revoke it from them.
+ *   c. Is there a free license seat in the pool? → PATCH usageLocation + assign to primary + verify.
+ *   d. Retry assignment up to 3 times with backoff. If still not attached,
+ *      throw an actionable error pointing to the admin portal.
+ *
+ * This function is idempotent and safe to call repeatedly — the initial "does
+ * primary already have a license" short-circuit means re-runs are cheap.
+ */
+async function ensurePrimaryUserLicensed(
+  accessToken: string,
+  primaryUpn: string
+): Promise<{ skuPartNumber: string }> {
+  // Step A: Does primary already have a license?
+  const primaryFilter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(primaryUpn)}'`);
+  const primaryResult = await graphRequest<{
+    value: Array<{ id: string; userPrincipalName?: string; assignedLicenses?: Array<{ skuId: string }> }>;
+  }>(accessToken, `/users?$filter=${primaryFilter}&$select=id,userPrincipalName,assignedLicenses`);
+
+  const primary = primaryResult.value?.[0];
+  if (!primary?.id) {
+    throw new Error(
+      `Primary user '${primaryUpn}' not found in tenant. Ensure the licensed user was created before attempting license allocation.`
+    );
+  }
+
+  if (Array.isArray(primary.assignedLicenses) && primary.assignedLicenses.length > 0) {
+    const skuId = primary.assignedLicenses[0].skuId || "unknown";
+    console.log(`✅ [License] ${primaryUpn} already has ${primary.assignedLicenses.length} license(s) (${skuId}) — continuing`);
+    return { skuPartNumber: skuId };
+  }
+
+  console.log(`🔄 [License] ${primaryUpn} has no license — starting allocation sequence`);
+
+  // Step B: Is a license on some OTHER user? (Including admin@<tenant>.onmicrosoft.com.)
+  const allUsers = await graphRequest<{
+    value: Array<{ id: string; userPrincipalName?: string; assignedLicenses?: Array<{ skuId: string }> }>;
+  }>(accessToken, `/users?$select=id,userPrincipalName,assignedLicenses&$top=999`);
+
+  const otherLicensed = (allUsers.value || []).filter(
+    (u) => u.id !== primary.id && Array.isArray(u.assignedLicenses) && u.assignedLicenses.length > 0
+  );
+
+  if (otherLicensed.length > 0) {
+    for (const user of otherLicensed) {
+      const skuIds = (user.assignedLicenses || []).map((l) => l.skuId).filter(Boolean);
+      console.log(
+        `🔄 [License] Revoking ${skuIds.length} license(s) from ${user.userPrincipalName || user.id} to free a seat for ${primaryUpn}`
+      );
+      try {
+        await graphRequest<Record<string, unknown>>(accessToken, `/users/${user.id}/assignLicense`, {
+          method: "POST",
+          body: JSON.stringify({ addLicenses: [], removeLicenses: skuIds })
+        });
+      } catch (error) {
+        console.log(
+          `⚠️ [License] Failed to revoke from ${user.userPrincipalName || user.id}:`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    // Let Microsoft actually free the seat before we query /subscribedSkus.
+    await sleep(5000);
+  }
+
+  // Step C: Find a free SKU in the pool.
+  const skus = await graphRequest<{
+    value: Array<{ skuId: string; skuPartNumber: string; prepaidUnits: { enabled: number }; consumedUnits: number }>;
+  }>(accessToken, "/subscribedSkus");
+
+  const availableSku = (skus.value || []).find(
+    (s) => (s.prepaidUnits?.enabled || 0) > (s.consumedUnits || 0)
+  );
+
+  if (!availableSku) {
+    throw new Error(
+      `No available license seats in this tenant. Open admin.microsoft.com → Billing → Licenses and make sure at least one seat is available, then Retry.`
+    );
+  }
+
+  // Step D: PATCH usageLocation (required by Graph), then POST assignLicense, verify. Retry up to 3 times.
+  try {
+    await graphRequest<Record<string, unknown>>(accessToken, `/users/${primary.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ usageLocation: "US" })
+    });
+  } catch (error) {
+    console.log(
+      `⚠️ [License] Could not set usageLocation on ${primaryUpn} (may already be set):`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  const backoffsMs = [0, 15_000, 45_000]; // 3 attempts, ~1 min total
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < backoffsMs.length; attempt += 1) {
+    if (backoffsMs[attempt] > 0) {
+      console.log(
+        `⏳ [License] Waiting ${backoffsMs[attempt] / 1000}s before assignment attempt ${attempt + 1}/${backoffsMs.length}...`
+      );
+      await sleep(backoffsMs[attempt]);
+    }
+
+    try {
+      await graphRequest<Record<string, unknown>>(accessToken, `/users/${primary.id}/assignLicense`, {
+        method: "POST",
+        body: JSON.stringify({ addLicenses: [{ skuId: availableSku.skuId }], removeLicenses: [] })
+      });
+    } catch (error) {
+      lastError = error;
+      console.log(
+        `⚠️ [License] assignLicense failed on attempt ${attempt + 1}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+      continue;
+    }
+
+    // Verify the license actually attached — Graph can return 2xx with nothing applied.
+    try {
+      const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
+        accessToken,
+        `/users/${primary.id}?$select=assignedLicenses`
+      );
+      const stuck =
+        Array.isArray(verify.assignedLicenses) && verify.assignedLicenses.some((l) => l?.skuId === availableSku.skuId);
+      if (stuck) {
+        console.log(`✅ [License] ${availableSku.skuPartNumber} attached and verified on ${primaryUpn}`);
+        return { skuPartNumber: availableSku.skuPartNumber };
+      }
+    } catch (error) {
+      console.log(
+        `⚠️ [License] Verify failed on attempt ${attempt + 1}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  const suffix = lastError ? ` Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}.` : "";
+  throw new Error(
+    `License ${availableSku.skuPartNumber} could not be attached to ${primaryUpn} after 3 attempts.${suffix} ` +
+      `Open admin.microsoft.com → Active users → ${primaryUpn} → Licenses and apps, assign a license manually, then Retry.`
+  );
+}
+
 export async function createLicensedUser(
   tenantDbId: string,
   domain: string,
@@ -788,118 +936,11 @@ export async function createLicensedUser(
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
-    data: { currentStep: "Assigning Exchange Online license...", progress: 85 }
+    data: { currentStep: "Allocating license to primary user...", progress: 85 }
   });
 
-  const skus = await graphRequest<{
-    value: Array<{
-      skuId: string;
-      skuPartNumber: string;
-      prepaidUnits: { enabled: number };
-      consumedUnits: number;
-    }>;
-  }>(accessToken, "/subscribedSkus");
-
-  const exchangeSkuNames = [
-    "EXCHANGESTANDARD",
-    "EXCHANGEENTERPRISE",
-    "EXCHANGE_S_STANDARD",
-    "O365_BUSINESS_ESSENTIALS",
-    "O365_BUSINESS_PREMIUM",
-    "SMB_BUSINESS_ESSENTIALS"
-  ];
-
-  let targetSku = skus.value?.find((sku) =>
-    exchangeSkuNames.some((name) => sku.skuPartNumber?.toUpperCase().includes(name))
-  );
-
-  if (!targetSku) {
-    targetSku = skus.value?.find((sku) => sku.prepaidUnits?.enabled > sku.consumedUnits);
-  }
-
-  if (!targetSku) {
-    throw new Error(
-      "No available Exchange/M365 license in this tenant. " +
-        "Open admin.microsoft.com → Billing → Licenses and make sure there's at least one unassigned seat before retrying."
-    );
-  }
-
-  // Ensure usageLocation is set before license assignment — required by Graph,
-  // and can be missing on users that were created through earlier code paths.
-  try {
-    await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ usageLocation: "US" })
-    });
-  } catch (error) {
-    console.log(
-      "⚠️ [Microsoft] Could not set usageLocation (may already be set):",
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-
-  // Assign-then-verify loop. Microsoft's /assignLicense call can return 2xx
-  // even when the license silently doesn't stick (SKU exhausted, service-plan
-  // conflict, missing usageLocation, propagation delay). Retry the assignment
-  // with backoff until we can actually read the license back off the user.
-  const backoffsMs = [0, 5_000, 10_000, 20_000, 30_000, 60_000]; // ~2 minutes total
-  let lastAssignError: unknown = null;
-  let licenseStuck = false;
-
-  for (let attempt = 0; attempt < backoffsMs.length; attempt += 1) {
-    if (backoffsMs[attempt] > 0) {
-      console.log(
-        `⏳ [Microsoft] License not visible yet on ${userPrincipalName}, waiting ${backoffsMs[attempt] / 1000}s before retrying (attempt ${attempt + 1}/${backoffsMs.length})...`
-      );
-      await sleep(backoffsMs[attempt]);
-    }
-
-    try {
-      await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}/assignLicense`, {
-        method: "POST",
-        body: JSON.stringify({
-          addLicenses: [{ skuId: targetSku.skuId }],
-          removeLicenses: []
-        })
-      });
-    } catch (error) {
-      lastAssignError = error;
-      console.log(
-        `⚠️ [Microsoft] assignLicense POST failed on attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      continue;
-    }
-
-    // Verify the license actually attached.
-    try {
-      const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId?: string }> }>(
-        accessToken,
-        `/users/${userId}?$select=assignedLicenses`
-      );
-      licenseStuck = Array.isArray(verify.assignedLicenses)
-        && verify.assignedLicenses.some((l) => l?.skuId === targetSku.skuId);
-    } catch (error) {
-      console.log(
-        `⚠️ [Microsoft] License verify GET failed on attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      continue;
-    }
-
-    if (licenseStuck) break;
-  }
-
-  if (!licenseStuck) {
-    const suffix = lastAssignError
-      ? ` Last assignment error: ${lastAssignError instanceof Error ? lastAssignError.message : String(lastAssignError)}.`
-      : "";
-    throw new Error(
-      `License ${targetSku.skuPartNumber} could not be attached to ${userPrincipalName} after ${backoffsMs.length} attempts.${suffix} ` +
-        `Open admin.microsoft.com → Billing → Licenses to confirm seats are available, ` +
-        `then admin.microsoft.com → Active users → ${userPrincipalName} → Licenses and apps to assign manually, then Retry.`
-    );
-  }
-
-  console.log(`✅ [Microsoft] License ${targetSku.skuPartNumber} assigned and verified on ${userPrincipalName}`);
+  // Centralised license allocation — see ensurePrimaryUserLicensed() for the 4-step algorithm.
+  await ensurePrimaryUserLicensed(accessToken, userPrincipalName);
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
@@ -1103,6 +1144,14 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   const resolveDelegationPrincipal = async (): Promise<string> => {
     const preferredUpn = normalizeEmail(licensedUserUpn);
     if (preferredUpn) {
+      // Pre-flight: make sure the primary user is actually licensed before we
+      // attempt any delegation. This runs the full 4-step license-allocation
+      // algorithm — revokes from other users, picks a free SKU, assigns to
+      // primary, verifies. If it fails, delegation fails fast with a clear
+      // license error instead of burning PowerShell attempts against a user
+      // who has no Exchange mailbox.
+      await ensurePrimaryUserLicensed(accessToken, preferredUpn);
+
       const preferredFilter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(preferredUpn)}'`);
       const preferredUsers = await graphRequest<{
         value: Array<{ userPrincipalName?: string; assignedLicenses?: unknown[] }>;
@@ -1533,7 +1582,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     }
 
     const delegatedAtStart = countDelegated();
-    const maxDelegationAttempts = parsePositiveInt(process.env.DELEGATION_MAX_ATTEMPTS, 4);
+    const maxDelegationAttempts = parsePositiveInt(process.env.DELEGATION_MAX_ATTEMPTS, 3);
     const delegationRetryDelayMs = parsePositiveInt(process.env.DELEGATION_RETRY_DELAY_MS, 5000);
     const forceCompletePolls = parsePositiveInt(process.env.DELEGATION_FORCE_COMPLETE_POLLS, 2);
 
@@ -1875,9 +1924,13 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         .filter((mailbox) => mailboxStatuses[mailbox.email]?.created && !mailboxStatuses[mailbox.email]?.delegated)
         .map((mailbox) => mailbox.email);
       const preview = undelegated.slice(0, 5).join(", ");
+      const allMissing = undelegated.length === filteredMailboxData.length;
+      const rootCauseHint = allMissing
+        ? ` Most likely cause: the delegation principal (${licensedUserUpn || "licensed user"}) has no Exchange mailbox — typically because the license didn't actually attach. Verify in admin.microsoft.com → Active users → Licenses and apps.`
+        : "";
       throw new Error(
-        `Delegation incomplete: ${undelegated.length}/${filteredMailboxData.length} mailboxes missing delegated permissions` +
-          (preview ? ` (examples: ${preview})` : "")
+        `Delegation incomplete: ${undelegated.length}/${filteredMailboxData.length} mailboxes missing delegated permissions.${rootCauseHint}` +
+          (preview ? ` (examples of undelegated: ${preview})` : "")
       );
     }
   }

@@ -254,7 +254,13 @@ export async function POST(_request: Request, { params }: Params) {
         ...(restartStatus !== "tenant_prep"
           ? { authCode: null, deviceCode: null, authCodeExpiry: null }
           : {}),
-        ...(existing.tenantId && restartStatus !== "tenant_prep" ? { authConfirmed: true } : {})
+        ...(existing.tenantId && restartStatus !== "tenant_prep" ? { authConfirmed: true } : {}),
+        // When retrying a license failure, wipe licensedUserId so the processor
+        // actually re-runs the licensed_user phase. Without this, the processor's
+        // phaseTwoComplete check (domainAdded && domainVerified && domainDefault &&
+        // licensedUserId) would treat the phase as done and skip license allocation,
+        // making the retry a no-op that falls straight into the same delegation failure.
+        ...(isLicenseError ? { licensedUserId: null } : {})
       }
     });
 
