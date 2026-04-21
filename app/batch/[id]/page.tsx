@@ -262,6 +262,17 @@ function formatTimestamp(value: string): string {
   }).format(date);
 }
 
+function formatEventTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date);
+}
+
 function CopyButton({ value, label, mask = false }: { value: string; label?: string; mask?: boolean }) {
   const [copied, setCopied] = useState(false);
   const display = mask ? "••••••••" : value || "—";
@@ -802,9 +813,9 @@ export default function BatchPage({ params }: PageProps) {
                   <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-600">
                     <tr>
                       <th className="px-3 py-2">Tenant</th>
+                      <th className="px-3 py-2">Code</th>
                       <th className="px-3 py-2">Admin email</th>
                       <th className="px-3 py-2">Password</th>
-                      <th className="px-3 py-2">Code</th>
                       <th className="px-3 py-2">Expires</th>
                       <th className="px-3 py-2 text-right">Action</th>
                     </tr>
@@ -939,40 +950,25 @@ export default function BatchPage({ params }: PageProps) {
               <table className="min-w-full text-xs md:text-sm">
                 <thead className="bg-muted/50 text-left">
                   <tr>
-                    <th className="px-3 py-2">Time</th>
-                    <th className="px-3 py-2">Level</th>
-                    <th className="px-3 py-2">Tags</th>
+                    <th className="w-20 px-3 py-2">Time</th>
+                    <th className="w-16 px-3 py-2">Level</th>
                     <th className="px-3 py-2">Tenant</th>
                     <th className="px-3 py-2">Event</th>
-                    <th className="px-3 py-2">Details</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredEvents.map(({ event, tags }) => {
-                    const detailText = summarizeDetails(event.details);
-                      return (
-                        <tr key={event.id} className="border-t align-top">
-                          <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">{formatTimestamp(event.createdAt)}</td>
-                          <td className="px-3 py-2">
-                            <Badge className={levelBadgeClass(event.level)}>{event.level}</Badge>
-                          </td>
-                          <td className="whitespace-nowrap px-3 py-2">
-                            <div className="flex flex-wrap gap-1">
-                              {tags.map((tag) => (
-                                <Badge key={`${event.id}-${tag}`} className={tagBadgeClass(tag)}>
-                                  {tagLabel(tag)}
-                                </Badge>
-                              ))}
-                            </div>
-                          </td>
-                          <td className="whitespace-nowrap px-3 py-2">
-                            {event.tenant ? `${event.tenant.clientName} • ${event.tenant.tenantName} (${event.tenant.domain})` : "Batch"}
-                          </td>
-                          <td className="max-w-md px-3 py-2 font-medium">{event.message}</td>
-                          <td className="max-w-lg px-3 py-2 text-muted-foreground">{detailText || "—"}</td>
-                        </tr>
-                      );
-                  })}
+                  {filteredEvents.map(({ event }) => (
+                    <tr key={event.id} className="border-t align-top">
+                      <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-muted-foreground">{formatEventTime(event.createdAt)}</td>
+                      <td className="px-3 py-2">
+                        <Badge className={levelBadgeClass(event.level)}>{event.level}</Badge>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2">
+                        {event.tenant ? `${event.tenant.tenantName} • ${event.tenant.domain}` : "Batch"}
+                      </td>
+                      <td className="px-3 py-2">{event.message}</td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
