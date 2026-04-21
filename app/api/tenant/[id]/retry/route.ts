@@ -25,6 +25,7 @@ export async function POST(_request: Request, { params }: Params) {
         zoneId: true,
         tenantId: true,
         status: true,
+        errorMessage: true,
         authCode: true,
         deviceCode: true,
         authCodeExpiry: true,
@@ -122,11 +123,30 @@ export async function POST(_request: Request, { params }: Params) {
       Boolean(existing.tenantId) &&
       (isSyntheticTestTenantId(existing.tenantId) || !isLikelyTenantIdentifier(existing.tenantId));
 
+    // Detect a previous license-assignment failure so we rewind to the
+    // licensed_user phase instead of blindly honouring the DB's
+    // "licensedUserId is set, phase done" flag. Without this, retrying a
+    // license-failed tenant jumps past license assignment, hits delegation,
+    // and fails again with the same cryptic PowerShell error.
+    const lowerErr = (existing.errorMessage || "").toLowerCase();
+    const isLicenseError =
+      Boolean(existing.licensedUserId) &&
+      (lowerErr.includes("license could not be attached") ||
+        lowerErr.includes("no license assigned") ||
+        lowerErr.includes("has no assigned licenses") ||
+        lowerErr.includes("exchange online license") ||
+        lowerErr.includes("no available") && lowerErr.includes("license"));
+
     if (tenantIdentifierInvalid) {
       restartStatus = "tenant_prep";
       progress = 55;
       currentStep = "Invalid/stale tenant ID detected. Regenerating authentication code.";
       console.log("⚠️ [Retry] Stale tenant identifier detected, forcing auth regeneration");
+    } else if (isLicenseError) {
+      restartStatus = "licensed_user";
+      progress = 80;
+      currentStep = "Re-running licensed user + license assignment after previous failure...";
+      console.log("🔄 [Retry] License-assignment failure detected, rewinding to licensed_user phase");
     } else if (!existing.zoneId && !existing.deviceCode && !existing.authConfirmed && !existing.tenantId) {
       restartStatus = "queued";
       progress = 0;

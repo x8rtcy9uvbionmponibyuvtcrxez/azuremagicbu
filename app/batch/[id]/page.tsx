@@ -1091,15 +1091,60 @@ export default function BatchPage({ params }: PageProps) {
                   </div>
                 ) : null}
 
-                {tenant.status === "failed" ? (
-                  <div className="rounded-lg border border-rose-200 bg-rose-50 p-4">
-                    <div className="mb-2 flex items-center gap-2 text-rose-900">
-                      <XCircle className="h-5 w-5" />
-                      <span className="text-sm font-medium">Tenant failed</span>
+                {tenant.status === "failed" ? (() => {
+                  const err = (tenant.errorMessage || "").toLowerCase();
+                  const isLicenseIssue =
+                    err.includes("license could not be attached") ||
+                    err.includes("no license assigned") ||
+                    err.includes("has no assigned licenses") ||
+                    err.includes("exchange online license") ||
+                    (err.includes("no available") && err.includes("license"));
+                  const adminUser = `admin@${tenant.domain.replace(/\./g, "")}.onmicrosoft.com`;
+
+                  if (isLicenseIssue) {
+                    return (
+                      <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+                        <div className="mb-2 flex items-center gap-2 text-amber-900">
+                          <CircleAlert className="h-5 w-5" />
+                          <span className="text-sm font-medium">License needs manual assignment</span>
+                        </div>
+                        <p className="text-sm text-amber-900">
+                          Microsoft didn&apos;t attach a license to the admin user for <b>{tenant.domain}</b>, likely because this tenant has no available seats.
+                        </p>
+                        <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-amber-900">
+                          <li>
+                            Open{" "}
+                            <a className="underline" href="https://admin.microsoft.com" target="_blank" rel="noreferrer">
+                              admin.microsoft.com
+                            </a>{" "}
+                            and sign in as <code className="rounded bg-amber-100 px-1 font-mono text-xs">{adminUser}</code>
+                          </li>
+                          <li>
+                            <b>Billing → Licenses</b> — confirm at least one unassigned seat of a Business Basic or Exchange Online plan
+                          </li>
+                          <li>
+                            <b>Users → Active users</b> — find the admin user for this tenant and assign a license
+                          </li>
+                          <li>Come back and click <b>Retry</b> below</li>
+                        </ol>
+                        <details className="mt-3">
+                          <summary className="cursor-pointer text-xs text-amber-800">Raw error</summary>
+                          <p className="mt-1 whitespace-pre-wrap text-xs text-amber-900">{tenant.errorMessage}</p>
+                        </details>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="rounded-lg border border-rose-200 bg-rose-50 p-4">
+                      <div className="mb-2 flex items-center gap-2 text-rose-900">
+                        <XCircle className="h-5 w-5" />
+                        <span className="text-sm font-medium">Tenant failed</span>
+                      </div>
+                      <p className="text-sm text-rose-900">{tenant.errorMessage || "No error message provided."}</p>
                     </div>
-                    <p className="text-sm text-rose-900">{tenant.errorMessage || "No error message provided."}</p>
-                  </div>
-                ) : null}
+                  );
+                })() : null}
 
                 <div className="mt-3">
                   <Button
