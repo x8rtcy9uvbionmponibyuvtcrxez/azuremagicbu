@@ -818,8 +818,42 @@ export async function createLicensedUser(
   }
 
   if (!targetSku) {
-    console.log("⚠️ [Microsoft] No available Exchange Online SKU found. License needs manual assignment.");
-  } else {
+    throw new Error(
+      "No available Exchange/M365 license in this tenant. " +
+        "Open admin.microsoft.com → Billing → Licenses and make sure there's at least one unassigned seat before retrying."
+    );
+  }
+
+  // Ensure usageLocation is set before license assignment — required by Graph,
+  // and can be missing on users that were created through earlier code paths.
+  try {
+    await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ usageLocation: "US" })
+    });
+  } catch (error) {
+    console.log(
+      "⚠️ [Microsoft] Could not set usageLocation (may already be set):",
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  // Assign-then-verify loop. Microsoft's /assignLicense call can return 2xx
+  // even when the license silently doesn't stick (SKU exhausted, service-plan
+  // conflict, missing usageLocation, propagation delay). Retry the assignment
+  // with backoff until we can actually read the license back off the user.
+  const backoffsMs = [0, 5_000, 10_000, 20_000, 30_000, 60_000]; // ~2 minutes total
+  let lastAssignError: unknown = null;
+  let licenseStuck = false;
+
+  for (let attempt = 0; attempt < backoffsMs.length; attempt += 1) {
+    if (backoffsMs[attempt] > 0) {
+      console.log(
+        `⏳ [Microsoft] License not visible yet on ${userPrincipalName}, waiting ${backoffsMs[attempt] / 1000}s before retrying (attempt ${attempt + 1}/${backoffsMs.length})...`
+      );
+      await sleep(backoffsMs[attempt]);
+    }
+
     try {
       await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}/assignLicense`, {
         method: "POST",
@@ -828,11 +862,44 @@ export async function createLicensedUser(
           removeLicenses: []
         })
       });
-      console.log(`✅ [Microsoft] License ${targetSku.skuPartNumber} assigned to user`);
     } catch (error) {
-      console.log("⚠️ [Microsoft] License assignment failed:", error instanceof Error ? error.message : String(error));
+      lastAssignError = error;
+      console.log(
+        `⚠️ [Microsoft] assignLicense POST failed on attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      continue;
     }
+
+    // Verify the license actually attached.
+    try {
+      const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId?: string }> }>(
+        accessToken,
+        `/users/${userId}?$select=assignedLicenses`
+      );
+      licenseStuck = Array.isArray(verify.assignedLicenses)
+        && verify.assignedLicenses.some((l) => l?.skuId === targetSku.skuId);
+    } catch (error) {
+      console.log(
+        `⚠️ [Microsoft] License verify GET failed on attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      continue;
+    }
+
+    if (licenseStuck) break;
   }
+
+  if (!licenseStuck) {
+    const suffix = lastAssignError
+      ? ` Last assignment error: ${lastAssignError instanceof Error ? lastAssignError.message : String(lastAssignError)}.`
+      : "";
+    throw new Error(
+      `License ${targetSku.skuPartNumber} could not be attached to ${userPrincipalName} after ${backoffsMs.length} attempts.${suffix} ` +
+        `Open admin.microsoft.com → Billing → Licenses to confirm seats are available, ` +
+        `then admin.microsoft.com → Active users → ${userPrincipalName} → Licenses and apps to assign manually, then Retry.`
+    );
+  }
+
+  console.log(`✅ [Microsoft] License ${targetSku.skuPartNumber} assigned and verified on ${userPrincipalName}`);
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
@@ -1051,15 +1118,18 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       }
 
       // Fallback: user exists but unlicensed — allow as delegation principal anyway
+      // Fallback: user exists but unlicensed — hard-fail with an actionable error.
+      // Without a license the user has no Exchange mailbox, so delegation will
+      // blow up in PowerShell with a cryptic "principal not found" error anyway.
       const unlicensedMatch = preferredUsers.value?.find((user) => {
         const upn = normalizeEmail(user.userPrincipalName);
         return upn === preferredUpn;
       });
       if (unlicensedMatch?.userPrincipalName) {
-        console.warn(
-          `[delegation] Licensed user '${preferredUpn}' exists but has no assigned licenses. Proceeding with delegation anyway.`
+        throw new Error(
+          `Licensed user '${preferredUpn}' exists but has no license assigned. ` +
+            `Open admin.microsoft.com → Active users → ${preferredUpn} → Licenses and apps, assign a license, then Retry.`
         );
-        return normalizeEmail(unlicensedMatch.userPrincipalName);
       }
 
       throw new Error(
@@ -1075,8 +1145,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       const resolvedUpn = normalizeEmail(user.userPrincipalName);
       if (resolvedUpn) {
         if (!(Array.isArray(user.assignedLicenses) && user.assignedLicenses.length > 0)) {
-          console.warn(
-            `[delegation] Licensed user '${resolvedUpn}' (by ID) exists but has no assigned licenses. Proceeding with delegation anyway.`
+          throw new Error(
+            `Licensed user '${resolvedUpn}' exists but has no license assigned. ` +
+              `Open admin.microsoft.com → Active users → ${resolvedUpn} → Licenses and apps, assign a license, then Retry.`
           );
         }
         return resolvedUpn;
