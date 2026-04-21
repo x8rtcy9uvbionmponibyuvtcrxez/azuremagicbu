@@ -189,44 +189,10 @@ export async function POST(_request: Request, { params }: Params) {
         console.log("✅ [Retry] Resuming sequencer integrations");
       }
     } else if (existing.deviceCode && !existing.authConfirmed) {
-      const isExpired = existing.authCodeExpiry ? existing.authCodeExpiry.getTime() <= Date.now() : false;
-      if (!isExpired) {
-        restartStatus = "auth_pending";
-        progress = 65;
-        currentStep = "Waiting for device code confirmation";
-        console.log("⚠️ [Retry] Device code exists, staying at auth_pending (code still valid)");
-
-        await prisma.tenant.update({
-          where: { id: existing.id },
-          data: {
-            status: restartStatus,
-            progress,
-            errorMessage: null,
-            currentStep
-          }
-        });
-
-        await logTenantEvent({
-          batchId: existing.batchId,
-          tenantId: existing.id,
-          eventType: "retry_requested",
-          level: "warn",
-          message: "Retry requested while device code is still valid",
-          details: { restartStatus, currentStep }
-        });
-
-        return NextResponse.json({
-          ok: true,
-          tenantId: existing.id,
-          restartStatus,
-          message: "Use existing device code. Click \"I've Entered the Code\" when ready."
-        });
-      }
-
       restartStatus = "tenant_prep";
       progress = 55;
-      currentStep = "Device code expired. Regenerating authentication code.";
-      console.log("🔄 [Retry] Device code expired, regenerating a fresh one");
+      currentStep = "Regenerating a fresh authentication code.";
+      console.log("🔄 [Retry] Auth pending — always regenerating a fresh device code");
     } else if (existing.tenantId && !existing.deviceCode) {
       if (!phaseTwoComplete) {
         restartStatus = "domain_add";

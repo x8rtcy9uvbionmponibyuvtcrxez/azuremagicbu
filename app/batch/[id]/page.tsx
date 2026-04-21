@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, CircleAlert, Clock3, Download, KeyRound, RefreshCcw, XCircle } from "lucide-react";
+import { CheckCircle2, CircleAlert, Clock3, Copy, Download, ExternalLink, RefreshCcw, XCircle } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -52,6 +52,8 @@ type BatchPayload = {
     tenantName: string;
     clientName: string;
     domain: string;
+    adminEmail: string;
+    adminPassword: string;
     status: TenantStatus;
     progress: number;
     currentStep: string | null;
@@ -260,6 +262,40 @@ function formatTimestamp(value: string): string {
   }).format(date);
 }
 
+function CopyButton({ value, label, mask = false }: { value: string; label?: string; mask?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const display = mask ? "••••••••" : value || "—";
+  const disabled = !value;
+
+  const onClick = async () => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // no-op; browser may block clipboard without user gesture
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="group inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 font-mono text-xs hover:bg-slate-100 disabled:opacity-50"
+      title={copied ? "Copied" : label ? `Copy ${label}` : "Copy"}
+    >
+      <span className={mask ? "tracking-widest" : "truncate max-w-[220px]"}>{display}</span>
+      {copied ? (
+        <span className="text-emerald-600">Copied</span>
+      ) : (
+        <Copy className="h-3 w-3 text-slate-400 group-hover:text-slate-700" />
+      )}
+    </button>
+  );
+}
+
 function levelBadgeClass(level: string): string {
   if (level === "error") return "bg-rose-100 text-rose-900 border-rose-200";
   if (level === "warn") return "bg-amber-100 text-amber-900 border-amber-200";
@@ -456,18 +492,18 @@ export default function BatchPage({ params }: PageProps) {
 
   const fixedEtaLabel = useMemo(() => formatEta(counts.remaining * 20 * 60), [counts.remaining]);
 
-  const showAuthGrid = useMemo(() => {
-    if (!data) return false;
-    if (data.batch.status === "processing" || data.batch.status === "completed" || data.batch.status === "failed") {
-      return false;
-    }
-    return true;
-  }, [data]);
-
   const authGridTenants = useMemo(() => {
     if (!data) return [];
     return data.tenants.filter((tenant) => tenant.status === "auth_pending" || Boolean(tenant.authCode));
   }, [data]);
+
+  const showAuthGrid = useMemo(() => {
+    if (!data) return false;
+    if (data.batch.status === "completed" || data.batch.status === "failed") return false;
+    // Keep the grid visible whenever any tenant still needs (or has) an auth code —
+    // even after batch.status flips to "processing" from per-tenant retries.
+    return authGridTenants.length > 0 || data.tenants.some((t) => !["completed", "failed"].includes(t.status) && !t.authConfirmed);
+  }, [data, authGridTenants]);
 
   const queuedPositions = useMemo(() => {
     if (!data) return new Map<string, number>();
@@ -630,7 +666,7 @@ export default function BatchPage({ params }: PageProps) {
     }
   };
 
-  const callBatchAction = async (endpoint: "generate-all-codes" | "start-processing") => {
+  const callBatchAction = async (endpoint: "generate-all-codes" | "start-processing" | "cancel") => {
     setBatchActionBusy((prev) => ({ ...prev, [endpoint]: true }));
     try {
       const response = await fetch(`/api/batch/${params.id}/${endpoint}`, {
@@ -702,6 +738,20 @@ export default function BatchPage({ params }: PageProps) {
             <RefreshCcw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
+          {data.batch.status !== "completed" && data.batch.status !== "failed" ? (
+            <Button
+              variant="outline"
+              className="border-rose-300 text-rose-700 hover:bg-rose-50"
+              disabled={Boolean(batchActionBusy["cancel"])}
+              onClick={() => {
+                if (window.confirm("Cancel this run? All pending tenants will be marked failed.")) {
+                  void callBatchAction("cancel");
+                }
+              }}
+            >
+              {batchActionBusy["cancel"] ? "Cancelling..." : "Cancel Run"}
+            </Button>
+          ) : null}
           <Button asChild variant="outline">
             <Link href="/">Back</Link>
           </Button>
@@ -718,11 +768,10 @@ export default function BatchPage({ params }: PageProps) {
       {showAuthGrid ? (
         <Card className="mb-6">
           <CardHeader>
-            <CardTitle>{isSingleTenant ? "Device Authorization" : "Batch Auth Grid"}</CardTitle>
+            <CardTitle>Device Authorization</CardTitle>
             <CardDescription>
-              {isSingleTenant
-                ? "Generate the device code, authorize it at microsoft.com/devicelogin, then start processing."
-                : "Generate device codes for all tenants, authorize each at microsoft.com/devicelogin, then start processing."}
+              For each tenant: open the device login link, sign in with the admin credentials, enter the code, then click
+              &ldquo;I&apos;ve Entered the Code&rdquo;. Each tenant processes independently.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -733,63 +782,91 @@ export default function BatchPage({ params }: PageProps) {
               >
                 {batchActionBusy["generate-all-codes"] ? "Generating..." : isSingleTenant ? "Generate Code" : "Generate All Codes"}
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => void callBatchAction("start-processing")}
-                disabled={Boolean(batchActionBusy["start-processing"]) || authGridTenants.length === 0}
+              <a
+                className="inline-flex items-center gap-1.5 text-sm font-medium text-blue-700 underline hover:text-blue-900"
+                href="https://microsoft.com/devicelogin"
+                target="_blank"
+                rel="noreferrer"
               >
-                {batchActionBusy["start-processing"]
-                  ? "Starting..."
-                  : isSingleTenant
-                    ? "I've Authorized - Start Processing"
-                    : "I've Authorized All - Start Processing"}
-              </Button>
+                Open microsoft.com/devicelogin <ExternalLink className="h-3.5 w-3.5" />
+              </a>
             </div>
 
             {authGridTenants.length === 0 ? (
               <p className="text-sm text-muted-foreground">
-                {isSingleTenant ? "No code generated yet. Click Generate Code." : "No auth codes generated yet. Click Generate All Codes."}
+                No codes yet. Click {isSingleTenant ? "Generate Code" : "Generate All Codes"} to start.
               </p>
             ) : (
-              <div className={isSingleTenant ? "max-w-md" : "grid gap-3 md:grid-cols-2 xl:grid-cols-3"}>
-                {authGridTenants.map((tenant) => (
-                  <div key={tenant.id} className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-                    <div className="mb-1 text-sm font-medium text-amber-900">
-                      {isSingleTenant ? "Authorization Code" : tenant.domain}
-                    </div>
-                    <div className="text-xs text-amber-800">
-                      {isSingleTenant ? tenant.domain : `${tenant.clientName} • ${tenant.tenantName}`}
-                    </div>
-                    <div className="mt-2 text-2xl font-mono font-bold tracking-[0.12em] text-amber-950">
-                      {tenant.authCode || "CODE_PENDING"}
-                    </div>
-                    <div className="mt-2 text-xs text-amber-900">Expires in: {formatCountdown(tenant.authCodeExpiry)}</div>
-                    <div className="mt-3 flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={async () => {
-                          if (!tenant.authCode) return;
-                          try {
-                            await navigator.clipboard.writeText(tenant.authCode);
-                          } catch {
-                            setError("Unable to copy code");
-                          }
-                        }}
-                      >
-                        Copy Code
-                      </Button>
-                      <a
-                        className="text-xs underline"
-                        href="https://microsoft.com/devicelogin"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Open device login
-                      </a>
-                    </div>
-                  </div>
-                ))}
+              <div className="overflow-x-auto rounded-md border">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-600">
+                    <tr>
+                      <th className="px-3 py-2">Tenant</th>
+                      <th className="px-3 py-2">Admin email</th>
+                      <th className="px-3 py-2">Password</th>
+                      <th className="px-3 py-2">Code</th>
+                      <th className="px-3 py-2">Expires</th>
+                      <th className="px-3 py-2 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {authGridTenants.map((tenant) => {
+                      const isBusy = Boolean(actionBusy[`${tenant.id}:confirm-auth`]);
+                      const isRetrying = Boolean(actionBusy[`${tenant.id}:retry`]);
+                      const done = tenant.status !== "auth_pending";
+                      return (
+                        <tr key={tenant.id} className="border-t align-middle">
+                          <td className="px-3 py-2">
+                            <div className="font-medium">{tenant.domain}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {tenant.clientName} • {tenant.tenantName}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <CopyButton value={tenant.adminEmail} label="admin email" />
+                          </td>
+                          <td className="px-3 py-2">
+                            <CopyButton value={tenant.adminPassword} label="password" mask />
+                          </td>
+                          <td className="px-3 py-2">
+                            {tenant.authCode ? (
+                              <CopyButton value={tenant.authCode} label="code" />
+                            ) : (
+                              <span className="text-xs text-muted-foreground">pending…</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-xs text-muted-foreground">
+                            {formatCountdown(tenant.authCodeExpiry)}
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            {done ? (
+                              <Badge className={statusClasses(tenant.status)}>{statusDisplay(tenant.status)}</Badge>
+                            ) : (
+                              <div className="flex items-center justify-end gap-2">
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => void callTenantAction(tenant.id, "retry")}
+                                  disabled={isRetrying}
+                                  title="Regenerate a fresh code"
+                                >
+                                  {isRetrying ? "…" : "New code"}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  onClick={() => void callTenantAction(tenant.id, "confirm-auth", { confirmed: true })}
+                                  disabled={isBusy || !tenant.authCode}
+                                >
+                                  {isBusy ? "Checking…" : "I've Entered the Code"}
+                                </Button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             )}
           </CardContent>
@@ -940,10 +1017,11 @@ export default function BatchPage({ params }: PageProps) {
                     return (
                       <>
                   <Progress value={tenant.progress} />
-                  <p className="text-sm text-muted-foreground">
-                    Progress: {tenant.progress}% • Step:{" "}
-                    {stepLabel}
-                  </p>
+                  <div className="flex items-baseline gap-2 text-sm">
+                    <span className="font-medium">{statusDisplay(tenant.status)}</span>
+                    <span className="text-xs text-muted-foreground">({tenant.progress}%)</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{stepLabel}</p>
                         {showAutoRetryTimer ? (
                           <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 p-2">
                             <div className="flex items-center justify-between text-xs text-amber-900">
@@ -983,26 +1061,8 @@ export default function BatchPage({ params }: PageProps) {
                 </div>
 
                 {tenant.status === "auth_pending" ? (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-                    <div className="mb-2 flex items-center gap-2 text-amber-900">
-                      <KeyRound className="h-4 w-4" />
-                      <span className="text-sm font-medium">Action Required</span>
-                    </div>
-                    <p className="text-sm text-amber-900">Go to Microsoft device login and enter this code:</p>
-                    <div className="mt-2 text-2xl font-mono font-bold tracking-[0.15em] text-amber-950">
-                      {tenant.authCode || "CODE_PENDING"}
-                    </div>
-                    <a className="mt-2 inline-block text-sm underline" href="https://microsoft.com/devicelogin" target="_blank" rel="noreferrer">
-                      Open microsoft.com/devicelogin
-                    </a>
-                    <div className="mt-3">
-                      <Button
-                        onClick={() => void callTenantAction(tenant.id, "confirm-auth", { confirmed: true })}
-                        disabled={Boolean(isBusy("confirm-auth"))}
-                      >
-                        I&apos;ve Entered the Code
-                      </Button>
-                    </div>
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
+                    Awaiting device authorization — use the table at the top of the page.
                   </div>
                 ) : null}
 
