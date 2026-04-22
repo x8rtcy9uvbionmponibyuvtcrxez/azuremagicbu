@@ -22,7 +22,10 @@ export async function GET(_request: Request, { params }: Params) {
         domain: true,
         inboxCount: true,
         inboxNames: true,
-        csvUrl: true
+        csvUrl: true,
+        licensedUserUpn: true,
+        adminPassword: true,
+        mailboxStatuses: true
       }
     });
 

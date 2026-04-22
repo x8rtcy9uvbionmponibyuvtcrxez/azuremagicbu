@@ -3,6 +3,7 @@ import { readFile } from "fs/promises";
 import path from "path";
 import type { Prisma } from "@prisma/client";
 
+import { decryptSecret } from "@/lib/crypto";
 import { parseInboxNamesValue } from "@/lib/utils";
 
 type TenantCsvInput = {
@@ -11,6 +12,13 @@ type TenantCsvInput = {
   inboxCount: number;
   inboxNames: Prisma.JsonValue | string;
   csvUrl: string | null;
+  // Fields below are optional so callers that don't need DB-backed CSV
+  // reconstruction can still pass the minimum. When all three are present,
+  // we reconstruct the CSV from actual provisioned state instead of regenerating
+  // from a naive pattern that won't match what's in Microsoft.
+  licensedUserUpn?: string | null;
+  adminPassword?: string | null;
+  mailboxStatuses?: string | null;
 };
 
 function normalizeLocalPart(value: string): string {
@@ -81,6 +89,74 @@ function generateFallbackCsv(tenant: TenantCsvInput): string {
   return rowsToCsv(rows);
 }
 
+/**
+ * Reconstruct the tenant CSV from the actual provisioning state in the database.
+ *
+ * This is the source of truth: mailboxStatuses holds the set of mailboxes the
+ * worker actually created (keyed by the real email address, e.g. "kgoyal@...",
+ * "k.goyal@...", "kunagoy@..." — the permutations produced by the email generator).
+ * All shared mailboxes share the admin password (set via Graph PATCH in the
+ * worker's mailbox phase), and the licensed user uses the same password too.
+ *
+ * Returns null if we don't have enough state to reconstruct — caller falls back
+ * to csvUrl file or the naive generator.
+ */
+function generateCsvFromDbState(tenant: TenantCsvInput): string | null {
+  if (!tenant.mailboxStatuses || !tenant.adminPassword) {
+    return null;
+  }
+
+  let parsed: Record<string, { created?: boolean }>;
+  try {
+    parsed = JSON.parse(tenant.mailboxStatuses);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  const createdEmails = Object.entries(parsed)
+    .filter(([, status]) => status?.created === true)
+    .map(([email]) => email.trim().toLowerCase())
+    .filter(Boolean);
+
+  // We need at least some provisioned mailboxes to produce a useful CSV.
+  if (createdEmails.length === 0 && !tenant.licensedUserUpn) {
+    return null;
+  }
+
+  let password: string;
+  try {
+    password = decryptSecret(tenant.adminPassword);
+  } catch {
+    return null;
+  }
+
+  const names = parseInboxNamesValue(tenant.inboxNames);
+  const displayName = names[0] || "Inbox User";
+
+  const licensedLower = (tenant.licensedUserUpn || "").trim().toLowerCase();
+  const seen = new Set<string>();
+  const rows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
+
+  // Licensed user first (she has a real mailbox backed by the single license).
+  if (licensedLower) {
+    rows.push([displayName, licensedLower, password]);
+    seen.add(licensedLower);
+  }
+
+  // Then each shared mailbox that was actually created, deduped.
+  for (const email of createdEmails) {
+    if (seen.has(email)) continue;
+    rows.push([displayName, email, password]);
+    seen.add(email);
+  }
+
+  return rowsToCsv(rows);
+}
+
 async function fromCsvUrl(csvUrl: string): Promise<string> {
   if (/^https?:\/\//i.test(csvUrl)) {
     const response = await fetch(csvUrl);
@@ -95,14 +171,25 @@ async function fromCsvUrl(csvUrl: string): Promise<string> {
 }
 
 export async function getTenantCsvContent(tenant: TenantCsvInput): Promise<string> {
+  // Preferred source: actual provisioning state stored in the database.
+  // This survives Railway redeploys (unlike csvUrl which points to ephemeral
+  // filesystem) and always matches what's actually in the Microsoft tenant.
+  const fromDb = generateCsvFromDbState(tenant);
+  if (fromDb) return fromDb;
+
+  // Secondary: a CSV file written to disk during provisioning. On Railway's
+  // ephemeral filesystem this is wiped on every deploy, but try anyway.
   if (tenant.csvUrl) {
     try {
       return await fromCsvUrl(tenant.csvUrl);
     } catch {
-      return generateFallbackCsv(tenant);
+      // fall through to fallback
     }
   }
 
+  // Last resort: regenerate from the naive pattern. Will NOT match the
+  // permutation-style emails actually created — use only when there's no
+  // provisioning state at all (e.g. tenant never reached the mailbox phase).
   return generateFallbackCsv(tenant);
 }
 
