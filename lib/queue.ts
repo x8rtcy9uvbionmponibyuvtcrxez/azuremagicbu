@@ -63,6 +63,37 @@ export async function enqueueTenantProcessingJob(
       delay: options?.delayMs || 0
     });
 
+  // Dedup by tenantId. Multiple enqueue paths (retry, reset, permission-propagation
+  // auto-retry, domain-propagation auto-retry) used to pass unique timestamp-based
+  // jobIds, which defeated BullMQ's jobId-based dedup and left stale queued jobs
+  // accumulating across retries. Before adding the new job, drain any PENDING
+  // (waiting/delayed/prioritized/paused) jobs for the same tenant+batch. Active
+  // jobs are left alone — don't interrupt work that's already running.
+  try {
+    const pending = await queue.getJobs(["waiting", "delayed", "prioritized", "paused"], 0, 5000, true);
+    let removed = 0;
+    for (const job of pending) {
+      if (job.data?.tenantId === data.tenantId && job.data?.batchId === data.batchId) {
+        try {
+          await job.remove();
+          removed += 1;
+        } catch {
+          // Best-effort: BullMQ may have transitioned the job during removal.
+        }
+      }
+    }
+    if (removed > 0) {
+      console.log(`🧹 [Queue] Cleaned ${removed} pending duplicate(s) for tenant ${data.tenantId}`);
+    }
+  } catch (error) {
+    console.log(
+      "⚠️ [Queue] Failed to dedup pending jobs:",
+      error instanceof Error ? error.message : String(error)
+    );
+    // Don't block the enqueue if dedup fails — the worst case is a duplicate
+    // (which idempotent operations handle fine), not a stuck tenant.
+  }
+
   try {
     const job = await createJob(baseJobId);
     console.log("🔄 [Queue] Adding job:", job.id);
