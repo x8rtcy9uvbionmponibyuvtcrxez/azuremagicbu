@@ -51,7 +51,8 @@ export async function POST(_request: Request, { params }: Params) {
         adminEmail: true,
         adminPassword: true,
         inboxNames: true,
-        inboxCount: true
+        inboxCount: true,
+        mailboxStatuses: true
       }
     });
 
@@ -128,11 +129,32 @@ export async function POST(_request: Request, { params }: Params) {
       console.log(`⚠️ [AutoRecover] PowerShell remove step failed: ${psRemoveError}. Proceeding with DB reset anyway.`);
     }
 
-    // 5. Wipe mailboxStatuses + all mailbox-phase booleans.
+    // 5. SURGICAL wipe: only remove the ghosts' entries from mailboxStatuses.
+    //    Leave the other 96 entries intact — they're already created, password-
+    //    set, smtp-enabled, delegated, etc. Worker's per-phase pending filters
+    //    will skip them on the next run and only process the 2 that came back
+    //    with no entry (treated as "not yet created").
+    //    We also flip the tenant-level phase booleans to false so the processor
+    //    enters the mailboxes phase; per-phase pending filters then make sure
+    //    only the missing ones get real work.
+    const currentStatuses: Record<string, unknown> = tenant.mailboxStatuses
+      ? (() => {
+          try {
+            return JSON.parse(tenant.mailboxStatuses as string) as Record<string, unknown>;
+          } catch {
+            return {};
+          }
+        })()
+      : {};
+    for (const ghost of missing) {
+      delete currentStatuses[ghost];
+    }
+    const prunedStatuses = JSON.stringify(currentStatuses);
+
     await prisma.tenant.update({
       where: { id: tenant.id },
       data: {
-        mailboxStatuses: null,
+        mailboxStatuses: prunedStatuses,
         sharedMailboxesCreated: false,
         passwordsSet: false,
         smtpAuthEnabled: false,
@@ -142,7 +164,7 @@ export async function POST(_request: Request, { params }: Params) {
         status: "mailboxes",
         progress: 60,
         errorMessage: null,
-        currentStep: `Auto-recover: removed ${missing.length} ghost mailbox(es) from Exchange, re-creating from scratch...`
+        currentStep: `Auto-recover: removed ${missing.length} ghost mailbox(es) from Exchange, re-creating only those...`
       }
     });
 
