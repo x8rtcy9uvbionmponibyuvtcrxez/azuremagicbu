@@ -72,11 +72,15 @@ export async function POST(_request: Request, { params }: Params) {
     const expected = generateEmailVariations(names, tenant.domain, tenant.inboxCount || 99);
     const expectedUpns = new Set(expected.map((e) => e.email.toLowerCase()));
 
-    // 2. Query Graph for the tenant's actual users.
+    // 2. Query Graph for the tenant's actual users — check UPN, mail, and
+    //    proxyAddresses since shared mailboxes can have a UPN that differs
+    //    from their primary SMTP (Exchange auto-suffixes when there's a
+    //    collision during creation).
     const token = await requestTenantGraphToken(tenant.tenantId);
-    const graphRes = await fetch(`${GRAPH_BASE_URL}/users?$select=userPrincipalName&$top=999`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const graphRes = await fetch(
+      `${GRAPH_BASE_URL}/users?$select=userPrincipalName,mail,proxyAddresses&$top=999`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
     if (!graphRes.ok) {
       const text = await graphRes.text();
       return NextResponse.json(
@@ -84,15 +88,22 @@ export async function POST(_request: Request, { params }: Params) {
         { status: 500 }
       );
     }
-    const graphUsers = (await graphRes.json()) as { value: Array<{ userPrincipalName?: string }> };
-    const actualUpns = new Set(
-      (graphUsers.value || [])
-        .map((u) => (u.userPrincipalName || "").toLowerCase())
-        .filter(Boolean)
-    );
+    const graphUsers = (await graphRes.json()) as {
+      value: Array<{ userPrincipalName?: string; mail?: string | null; proxyAddresses?: string[] }>;
+    };
+    const actualKnownEmails = new Set<string>();
+    for (const u of graphUsers.value || []) {
+      if (u.userPrincipalName) actualKnownEmails.add(u.userPrincipalName.toLowerCase());
+      if (u.mail) actualKnownEmails.add(u.mail.toLowerCase());
+      for (const addr of u.proxyAddresses || []) {
+        if (typeof addr !== "string") continue;
+        const lower = addr.toLowerCase();
+        actualKnownEmails.add(lower.startsWith("smtp:") ? lower.slice(5) : lower);
+      }
+    }
 
     // 3. Compute missing.
-    const missing = Array.from(expectedUpns).filter((upn) => !actualUpns.has(upn));
+    const missing = Array.from(expectedUpns).filter((upn) => !actualKnownEmails.has(upn));
 
     if (missing.length === 0) {
       return NextResponse.json(
@@ -100,7 +111,7 @@ export async function POST(_request: Request, { params }: Params) {
           ok: false,
           message: "No missing mailboxes. All expected UPNs are present in Graph. Nothing to recover.",
           expectedCount: expected.length,
-          actualInGraph: actualUpns.size
+          actualInGraph: actualKnownEmails.size
         },
         { status: 409 }
       );

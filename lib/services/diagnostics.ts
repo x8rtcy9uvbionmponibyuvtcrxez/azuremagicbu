@@ -218,8 +218,14 @@ export async function diagnoseTenant(tenantDbId: string): Promise<DiagnosticResu
         )
       : Promise.reject(new Error("No primary UPN configured")),
     graphGet<{
-      value: Array<{ id: string; userPrincipalName: string; assignedLicenses?: Array<{ skuId: string }> }>;
-    }>(token, `/users?$select=id,userPrincipalName,assignedLicenses&$top=999`)
+      value: Array<{
+        id: string;
+        userPrincipalName: string;
+        mail?: string | null;
+        proxyAddresses?: string[];
+        assignedLicenses?: Array<{ skuId: string }>;
+      }>;
+    }>(token, `/users?$select=id,userPrincipalName,mail,proxyAddresses,assignedLicenses&$top=999`)
   ]);
 
   // 1. Tenant alive
@@ -419,8 +425,20 @@ export async function diagnoseTenant(tenantDbId: string): Promise<DiagnosticResu
       const dbCreated = Object.entries(dbStatuses)
         .filter(([, s]) => s?.created === true)
         .map(([email]) => email.toLowerCase());
-      const graphUpns = new Set(allUsers.map((u) => (u.userPrincipalName || "").toLowerCase()));
-      const missingInGraph = dbCreated.filter((e) => !graphUpns.has(e));
+      // Check UPN, mail, and proxyAddresses — shared mailboxes may have a UPN
+      // that differs from their primary SMTP (Exchange auto-suffixes the UPN
+      // when the desired one collides with an existing object).
+      const graphKnownEmails = new Set<string>();
+      for (const u of allUsers) {
+        if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.toLowerCase());
+        if (u.mail) graphKnownEmails.add(u.mail.toLowerCase());
+        for (const addr of u.proxyAddresses || []) {
+          if (typeof addr !== "string") continue;
+          const lower = addr.toLowerCase();
+          graphKnownEmails.add(lower.startsWith("smtp:") ? lower.slice(5) : lower);
+        }
+      }
+      const missingInGraph = dbCreated.filter((e) => !graphKnownEmails.has(e));
       if (dbCreated.length === 0) {
         checks.push({
           name: "mailbox_drift",
