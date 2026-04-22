@@ -730,7 +730,6 @@ $results | ConvertTo-Json -Compress
       onStderr: (text) => updateProgressFromChunk(job, text, progressState)
     })
       .then((output) => {
-        job.status = "completed";
         job.completed = emails.length;
         try {
           const parsed = parseJsonFromPowerShellOutput(output);
@@ -739,14 +738,26 @@ $results | ConvertTo-Json -Compress
           if (Array.isArray(parsed) && parsed.length > 0) {
             job.results = parsed;
           }
+          job.status = "completed";
         } catch {
+          // JSON parse failed. Fall back to regex-scraping the logs — but be
+          // honest about it. If the regex fallback found nothing for a non-
+          // empty input list, we have zero visibility into what actually
+          // happened. Reporting status=completed with results=[] is a silent
+          // lie that fools the worker into thinking delegation succeeded.
           const parsedFromLogs = parseDelegationResultsFromLogs(output);
           job.results = parsedFromLogs;
-          if (parsedFromLogs.length === 0) {
-            job.errors = ["Delegation output could not be parsed into structured results"];
+          if (parsedFromLogs.length === 0 && emails.length > 0) {
+            job.status = "failed";
+            job.error =
+              "Delegation output unreadable — could not parse JSON and log regex found nothing. Actual delegation state in Exchange is unknown; retry.";
+            job.errors = [job.error];
+          } else {
+            job.status = "completed";
+            job.errors = ["Delegation output could not be parsed as JSON; results scraped from logs (partial)."];
           }
         }
-        console.log(`Delegation job ${jobId} completed: ${emails.length} mailboxes`);
+        console.log(`Delegation job ${jobId} completed: status=${job.status} results=${(job.results || []).length}/${emails.length}`);
       })
       .catch((error) => {
         job.status = "failed";
@@ -1063,14 +1074,44 @@ Connect-ExchangeOnline -Credential $cred ${orgParam} -ShowBanner:$false
 $emails = @(${emailList})
 $results = @()
 foreach ($email in $emails) {
+  $removedFromExchange = $false
+  $purgedFromRecycleBin = $false
+  $exchangeError = $null
+  $purgeError = $null
+
+  # Step 1: Remove from Exchange. Soft-delete by default.
   try {
     Remove-Mailbox -Identity $email -Confirm:$false -Force -ErrorAction Stop
-    $results += @{ email = $email; status = "removed" }
-    Write-Host "Removed: $email"
+    $removedFromExchange = $true
   } catch {
-    $results += @{ email = $email; status = "failed"; error = $_.Exception.Message }
-    Write-Host "Failed: $email - $($_.Exception.Message)"
+    $exchangeError = $_.Exception.Message
   }
+
+  # Step 2: Purge from the soft-deleted recycle bin so the UPN is truly free.
+  # Without this, Remove-Mailbox leaves the mailbox as "inactive" and the UPN
+  # reappears as a mangled "ExRemoved-<guid>@<tenant>.onmicrosoft.com" in Azure
+  # AD deletedItems, but recreation of the original UPN can still be blocked
+  # by lingering proxy-address reservations.
+  try {
+    $inactive = Get-Mailbox -Identity $email -IncludeInactiveMailbox -ErrorAction SilentlyContinue
+    if ($inactive) {
+      Remove-Mailbox -Identity $inactive.ExchangeGuid.Guid -PermanentlyDelete -Confirm:$false -Force -ErrorAction Stop
+      $purgedFromRecycleBin = $true
+    }
+  } catch {
+    $purgeError = $_.Exception.Message
+  }
+
+  $status = if ($removedFromExchange -or $purgedFromRecycleBin) { "removed" } else { "failed" }
+  $results += @{
+    email = $email
+    status = $status
+    removedFromExchange = $removedFromExchange
+    purgedFromRecycleBin = $purgedFromRecycleBin
+    exchangeError = $exchangeError
+    purgeError = $purgeError
+  }
+  Write-Host "$email -> status=$status exchange=$removedFromExchange purge=$purgedFromRecycleBin"
 }
 
 Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue

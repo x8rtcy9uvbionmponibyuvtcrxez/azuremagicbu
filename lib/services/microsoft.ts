@@ -2305,20 +2305,29 @@ export async function configureDkim(tenantDbId: string): Promise<DkimConfigurati
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     const propagationPending = isDkimPropagationPendingError(message);
-    await prisma.tenant.update({
-      where: { id: tenantDbId },
-      data: {
-        dkimConfigured: true,
-        currentStep: propagationPending
-          ? "DKIM DNS submitted. Microsoft may finish propagation in the background."
-          : "DKIM DNS submitted. Exchange enable check failed but processing will continue.",
-        progress: 98
-      }
-    });
-    console.log(
-      `⚠️ [DKIM] Enable call failed for ${domain}. Continuing without blocking completion. Reason: ${message}`
-    );
-    return { status: "configured", verificationDeferred: true, reason: message };
+
+    if (propagationPending) {
+      // DKIM CNAME records take up to 48h to propagate — keep going; real
+      // signing will start automatically once DNS is visible. Mark configured
+      // so the tenant doesn't block on this.
+      await prisma.tenant.update({
+        where: { id: tenantDbId },
+        data: {
+          dkimConfigured: true,
+          currentStep: "DKIM DNS submitted. Microsoft will finish propagation within 48h.",
+          progress: 98
+        }
+      });
+      console.log(
+        `ℹ️ [DKIM] ${domain} DNS not yet visible; deferring verification. Reason: ${message}`
+      );
+      return { status: "configured", verificationDeferred: true, reason: message };
+    }
+
+    // Any OTHER failure (bad creds, wrong domain, permission issue) is a real
+    // problem and shouldn't silently mark the tenant as DKIM-complete.
+    console.log(`❌ [DKIM] Hard failure for ${domain}. Reason: ${message}`);
+    throw new Error(`DKIM enable failed for ${domain}: ${message}`);
   }
 
   await prisma.tenant.update({
