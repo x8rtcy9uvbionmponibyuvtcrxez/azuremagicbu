@@ -1416,17 +1416,38 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         .map((mailbox) => mailbox.email);
 
       if (claimed.length > 0) {
-        const graphUsers = await graphRequest<{ value: Array<{ userPrincipalName?: string }> }>(
-          accessToken,
-          "/users?$select=userPrincipalName&$top=999"
-        );
-        const graphUpns = new Set(
-          (graphUsers.value || [])
-            .map((u) => (u.userPrincipalName || "").trim().toLowerCase())
-            .filter(Boolean)
-        );
+        // Match against UPN, mail, AND proxyAddresses. When Exchange creates a
+        // shared mailbox via New-Mailbox with a -Name that collides with any
+        // existing Azure AD object, it silently suffixes the auto-derived UPN
+        // ("kgoyal" -> UPN "kgoyal1@domain") while keeping the requested
+        // primary SMTP ("kgoyal@domain"). Checking only UPN misses these as
+        // "ghosts" when they're actually fully-functional mailboxes whose
+        // primarySMTP matches what we asked for.
+        const graphUsers = await graphRequest<{
+          value: Array<{
+            userPrincipalName?: string;
+            mail?: string | null;
+            proxyAddresses?: string[];
+          }>;
+        }>(accessToken, "/users?$select=userPrincipalName,mail,proxyAddresses&$top=999");
 
-        const ghosts = claimed.filter((email) => !graphUpns.has(email));
+        const graphKnownEmails = new Set<string>();
+        for (const u of graphUsers.value || []) {
+          if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.trim().toLowerCase());
+          if (u.mail) graphKnownEmails.add(u.mail.trim().toLowerCase());
+          for (const addr of u.proxyAddresses || []) {
+            if (typeof addr !== "string") continue;
+            // proxyAddresses come as "SMTP:primary@..." or "smtp:alias@..."
+            const lower = addr.toLowerCase();
+            if (lower.startsWith("smtp:")) {
+              graphKnownEmails.add(lower.slice(5));
+            } else {
+              graphKnownEmails.add(lower);
+            }
+          }
+        }
+
+        const ghosts = claimed.filter((email) => !graphKnownEmails.has(email));
         if (ghosts.length > 0) {
           console.log(
             `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes PowerShell claimed to create are missing in Graph. Downgrading. Examples: ${ghosts.slice(0, 5).join(", ")}`
