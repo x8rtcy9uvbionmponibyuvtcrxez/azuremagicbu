@@ -218,7 +218,7 @@ async function waitForPowerShellService(maxWaitMs = 30000): Promise<void> {
   throw new Error("PowerShell service not available after 30s. Please ensure it is running on port 3099.");
 }
 
-async function callPowerShellService(endpoint: string, body: Record<string, unknown>, timeout = 1200000): Promise<any> {
+export async function callPowerShellService(endpoint: string, body: Record<string, unknown>, timeout = 1200000): Promise<any> {
   const maxRetries = 3;
   const baseDelay = 5000;
 
