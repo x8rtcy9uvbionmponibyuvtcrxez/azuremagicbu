@@ -82,6 +82,11 @@ function buildSuggestion(checks: DiagnosticCheck[]): string | null {
   const primaryExists = by("primary_user_exists");
   const primaryMailbox = by("primary_has_mailbox");
   const domainVerified = by("domain_verified");
+  const deletedBlocking = by("deleted_users_blocking");
+
+  if (deletedBlocking?.status === "warn") {
+    return "Missing mailboxes are sitting in Azure AD's deleted-users recycle bin — Microsoft won't let us recreate them while the UPN is reserved. Hit /api/tenant/{id}/purge-deleted-users to hard-delete them from the recycle bin, then /reset-mailboxes to recreate.";
+  }
 
   if (primaryExists?.status === "fail") {
     return "Primary user was never created in Microsoft. Hit Retry — the licensed_user phase will provision them.";
@@ -433,8 +438,47 @@ export async function diagnoseTenant(tenantDbId: string): Promise<DiagnosticResu
           name: "mailbox_drift",
           status: "warn",
           detail: `${missingInGraph.length}/${dbCreated.length} mailboxes present in DB are missing from Microsoft.`,
-          data: { missingInGraph: missingInGraph.slice(0, 10), totalInDb: dbCreated.length }
+          data: { missingInGraph, totalInDb: dbCreated.length }
         });
+
+        // When drift is detected, check whether the missing UPNs are sitting
+        // in Azure AD's soft-delete recycle bin. If so, their UPNs are reserved
+        // for 30 days and recreation will fail with a "conflicting object"
+        // error. Hard-deleting from the recycle bin (/directory/deletedItems)
+        // frees the UPN for reuse.
+        try {
+          const deleted = await graphGet<{
+            value: Array<{ id: string; userPrincipalName?: string }>;
+          }>(token, `/directory/deletedItems/microsoft.graph.user?$select=id,userPrincipalName&$top=999`);
+          const deletedByUpn = new Map(
+            (deleted.value || [])
+              .filter((u) => u.userPrincipalName)
+              .map((u) => [u.userPrincipalName!.trim().toLowerCase(), u.id])
+          );
+          const blocking = missingInGraph
+            .map((email) => ({ email, deletedId: deletedByUpn.get(email) }))
+            .filter((x) => Boolean(x.deletedId));
+          if (blocking.length === 0) {
+            checks.push({
+              name: "deleted_users_blocking",
+              status: "pass",
+              detail: `None of the ${missingInGraph.length} missing mailboxes are in the deleted-users recycle bin. Drift isn't a soft-delete conflict.`
+            });
+          } else {
+            checks.push({
+              name: "deleted_users_blocking",
+              status: "warn",
+              detail: `${blocking.length}/${missingInGraph.length} missing mailboxes are soft-deleted in Azure AD. Their UPNs are reserved for 30 days — recreation will fail with "conflicting object" until they're hard-deleted from the recycle bin. Hit /api/tenant/{id}/purge-deleted-users to purge them, then /reset-mailboxes.`,
+              data: { blocking }
+            });
+          }
+        } catch (error) {
+          checks.push({
+            name: "deleted_users_blocking",
+            status: "skip",
+            detail: `Could not read /directory/deletedItems: ${error instanceof Error ? error.message : String(error)}`
+          });
+        }
       }
     } catch (error) {
       checks.push({
