@@ -306,8 +306,9 @@ $mailboxData = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 $counter = 1
 
 foreach ($mb in $mailboxData) {
+  $errMsg = $null
   try {
-    # Check if mailbox already exists
+    # Check if mailbox already exists (idempotent on retry).
     $existing = $null
     try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
     $nameParts = $mb.displayName.Trim() -split '\\s+', 2
@@ -320,22 +321,33 @@ foreach ($mb in $mailboxData) {
       try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "exists"; error = $null }
     } else {
-      $tempName = "$($mb.displayName) $counter"
-      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
+      # Use the email local-part as the AD Name (uniquely derived from the email,
+      # which is guaranteed unique). The old counter-based name ("kunal Goyal 1",
+      # "kunal Goyal 2", ...) resets every request and collides with AD Names
+      # created on previous runs — Microsoft then returns "already exists" and the
+      # catch-block heuristic silently mapped it to status=exists, leaving ghosts.
+      $tempName = $mb.email.Split("@")[0]
+      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $mb.displayName
       Start-Sleep -Seconds 2
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
       try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "created"; error = $null }
     }
   } catch {
-    $msg = $_.Exception.Message
-    if ($msg -like "*already*" -or $msg -like "*proxy address*") {
-      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    $errMsg = $_.Exception.Message
+    # Don't trust the error text to decide existence. Ask Exchange directly.
+    $verify = $null
+    try { $verify = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
+    if ($verify) {
+      # Something went wrong mid-config but the mailbox itself is there.
+      # Preserve the error message so we can diagnose.
+      $results += @{ email = $mb.email; status = "exists"; error = $errMsg }
     } else {
-      $results += @{ email = $mb.email; status = "failed"; error = $msg }
+      # Genuine failure - mailbox does not exist in Exchange.
+      $results += @{ email = $mb.email; status = "failed"; error = $errMsg }
     }
   }
-  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)")
+  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)$(if ($errMsg) { ' (' + $errMsg.Substring(0, [Math]::Min(120, $errMsg.Length)) + ')' } else { '' })")
   $counter++
 }
 
@@ -417,8 +429,9 @@ $mailboxData = Get-Content -Raw -Path "${escapedTmpFile}" | ConvertFrom-Json
 $counter = 1
 
 foreach ($mb in $mailboxData) {
+  $errMsg = $null
   try {
-    # Check if mailbox already exists
+    # Check if mailbox already exists (idempotent on retry).
     $existing = $null
     try { $existing = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
     $nameParts = $mb.displayName.Trim() -split '\\s+', 2
@@ -431,22 +444,33 @@ foreach ($mb in $mailboxData) {
       try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "exists"; error = $null }
     } else {
-      $tempName = "$($mb.displayName) $counter"
-      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $tempName
+      # Use the email local-part as the AD Name (uniquely derived from the email,
+      # which is guaranteed unique). The old counter-based name ("kunal Goyal 1",
+      # "kunal Goyal 2", ...) resets every request and collides with AD Names
+      # created on previous runs — Microsoft then returns "already exists" and the
+      # catch-block heuristic silently mapped it to status=exists, leaving ghosts.
+      $tempName = $mb.email.Split("@")[0]
+      New-Mailbox -Name $tempName -Shared -PrimarySmtpAddress $mb.email -DisplayName $mb.displayName
       Start-Sleep -Seconds 2
       try { Set-Mailbox -Identity $mb.email -DisplayName $mb.displayName } catch {}
       try { Set-User -Identity $mb.email -FirstName $firstName -LastName $lastName } catch {}
       $results += @{ email = $mb.email; status = "created"; error = $null }
     }
   } catch {
-    $msg = $_.Exception.Message
-    if ($msg -like "*already*" -or $msg -like "*proxy address*") {
-      $results += @{ email = $mb.email; status = "exists"; error = $null }
+    $errMsg = $_.Exception.Message
+    # Don't trust the error text to decide existence. Ask Exchange directly.
+    $verify = $null
+    try { $verify = Get-Mailbox -Identity $mb.email -ErrorAction SilentlyContinue } catch {}
+    if ($verify) {
+      # Something went wrong mid-config but the mailbox itself is there.
+      # Preserve the error message so we can diagnose.
+      $results += @{ email = $mb.email; status = "exists"; error = $errMsg }
     } else {
-      $results += @{ email = $mb.email; status = "failed"; error = $msg }
+      # Genuine failure - mailbox does not exist in Exchange.
+      $results += @{ email = $mb.email; status = "failed"; error = $errMsg }
     }
   }
-  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)")
+  [Console]::Error.WriteLine("[$counter/$($mailboxData.Count)] $($mb.email) -> $($results[-1].status)$(if ($errMsg) { ' (' + $errMsg.Substring(0, [Math]::Min(120, $errMsg.Length)) + ')' } else { '' })")
   $counter++
 }
 
