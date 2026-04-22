@@ -1403,6 +1403,53 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       }
     }
 
+    // Verify each mailbox we marked as "created" actually exists in Microsoft.
+    // PowerShell sometimes reports status="created" for mailboxes that silently
+    // never materialise (rate limiting on rapid user creation, Exchange flagging
+    // short/odd-looking names, transient internal errors, etc). Ghost-marked
+    // mailboxes then cause downstream delegation failures with a cryptic
+    // "X/98 missing delegated permissions" error 2 phases later. Catch them
+    // here by cross-checking Graph's user list against what PowerShell claimed.
+    try {
+      const claimed = filteredMailboxData
+        .filter((mailbox) => mailboxStatuses[mailbox.email]?.created)
+        .map((mailbox) => mailbox.email);
+
+      if (claimed.length > 0) {
+        const graphUsers = await graphRequest<{ value: Array<{ userPrincipalName?: string }> }>(
+          accessToken,
+          "/users?$select=userPrincipalName&$top=999"
+        );
+        const graphUpns = new Set(
+          (graphUsers.value || [])
+            .map((u) => (u.userPrincipalName || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
+
+        const ghosts = claimed.filter((email) => !graphUpns.has(email));
+        if (ghosts.length > 0) {
+          console.log(
+            `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes PowerShell claimed to create are missing in Graph. Downgrading. Examples: ${ghosts.slice(0, 5).join(", ")}`
+          );
+          for (const email of ghosts) {
+            if (mailboxStatuses[email]) {
+              mailboxStatuses[email] = {
+                ...mailboxStatuses[email],
+                created: false
+              };
+            }
+          }
+        } else {
+          console.log(`✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph.`);
+        }
+      }
+    } catch (error) {
+      console.log(
+        `⚠️ [Microsoft] Could not verify mailboxes in Graph (best-effort):`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
     const createdNow = countCreated();
     const allCreated = filteredMailboxData.every((mailbox) => mailboxStatuses[mailbox.email]?.created);
 
@@ -1414,6 +1461,22 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         mailboxStatuses: { set: serializeMailboxStatuses(mailboxStatuses) }
       }
     });
+
+    // If Graph verification caught ghosts, stop the run now with a clear
+    // error. Retrying will see `sharedMailboxesCreated = false` + missing
+    // `created` flags on the ghost emails, and re-attempt creation only
+    // for those specific ones (the existing 77+ will be skipped via the
+    // "status === 'exists'" branch in markCreatedFromResults).
+    if (!allCreated) {
+      const stillMissing = filteredMailboxData
+        .filter((mailbox) => !mailboxStatuses[mailbox.email]?.created)
+        .map((mailbox) => mailbox.email);
+      throw new Error(
+        `Mailbox provisioning incomplete: ${stillMissing.length}/${filteredMailboxData.length} mailboxes ` +
+          `claimed by PowerShell but not visible in Microsoft Graph. Retry will attempt creation again for the missing ones. ` +
+          `Examples: ${stillMissing.slice(0, 5).join(", ")}`
+      );
+    }
 
     console.log("⏳ [Microsoft] Cooling down 5s before next step...");
     await sleep(5000);
