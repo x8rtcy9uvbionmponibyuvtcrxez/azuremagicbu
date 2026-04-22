@@ -942,6 +942,100 @@ Disconnect-ExchangeOnline -Confirm:$false 2>$null
 });
 
 // ──────────────────────────────────────
+// Inspect a single recipient across all Exchange types
+// Reveals what Exchange sees even when Graph /users is blind:
+// MailUsers, soft-deleted mailboxes (inactive), contacts, etc.
+// ──────────────────────────────────────
+app.post("/inspect-recipient", async (req, res) => {
+  const { adminUpn, adminPassword, organizationId, upn } = req.body;
+  if (!adminUpn || !adminPassword || !upn) {
+    return res.status(400).json({ error: "adminUpn, adminPassword, upn required" });
+  }
+
+  const safeAdminUpn = escapePowerShellString(adminUpn);
+  const safeAdminPassword = escapePowerShellString(adminPassword);
+  const safeUpn = escapePowerShellString(upn);
+  const safeOrgId = organizationId ? escapePowerShellString(organizationId) : "";
+  const orgParam = safeOrgId ? `-Organization "${safeOrgId}"` : "";
+
+  const script = `
+$ErrorActionPreference = "Continue"
+$password = ConvertTo-SecureString "${safeAdminPassword}" -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential("${safeAdminUpn}", $password)
+Connect-ExchangeOnline -Credential $cred ${orgParam} -ShowBanner:$false
+
+$result = @{ upn = "${safeUpn}"; recipient = $null; mailbox = $null; inactiveMailbox = $null; user = $null; errors = @() }
+
+try {
+  $r = Get-Recipient -Identity "${safeUpn}" -ErrorAction Stop
+  if ($r) {
+    $result.recipient = @{
+      name = $r.Name
+      recipientType = $r.RecipientType
+      recipientTypeDetails = $r.RecipientTypeDetails
+      primarySmtp = $r.PrimarySmtpAddress
+      alias = $r.Alias
+      emailAddresses = @($r.EmailAddresses | ForEach-Object { $_.ToString() })
+    }
+  }
+} catch { $result.errors += "Get-Recipient: $($_.Exception.Message)" }
+
+try {
+  $m = Get-Mailbox -Identity "${safeUpn}" -ErrorAction Stop
+  if ($m) {
+    $result.mailbox = @{
+      name = $m.Name
+      recipientTypeDetails = $m.RecipientTypeDetails
+      primarySmtp = $m.PrimarySmtpAddress
+      alias = $m.Alias
+      legacyExchangeDN = $m.LegacyExchangeDN
+      exchangeGuid = "$($m.ExchangeGuid)"
+      whenCreated = "$($m.WhenCreated)"
+      isShared = $m.IsShared
+    }
+  }
+} catch { $result.errors += "Get-Mailbox: $($_.Exception.Message)" }
+
+try {
+  $im = Get-Mailbox -Identity "${safeUpn}" -IncludeInactiveMailbox -ErrorAction Stop
+  if ($im -and ($im.IsSoftDeletedByRemove -or $im.IsSoftDeletedByDisable -or $im.IsInactiveMailbox)) {
+    $result.inactiveMailbox = @{
+      recipientTypeDetails = $im.RecipientTypeDetails
+      isSoftDeletedByRemove = $im.IsSoftDeletedByRemove
+      isSoftDeletedByDisable = $im.IsSoftDeletedByDisable
+      isInactiveMailbox = $im.IsInactiveMailbox
+      whenSoftDeleted = "$($im.WhenSoftDeleted)"
+      exchangeGuid = "$($im.ExchangeGuid)"
+    }
+  }
+} catch { $result.errors += "Get-Mailbox-Inactive: $($_.Exception.Message)" }
+
+try {
+  $u = Get-User -Identity "${safeUpn}" -ErrorAction Stop
+  if ($u) {
+    $result.user = @{
+      name = $u.Name
+      userPrincipalName = $u.UserPrincipalName
+      recipientType = $u.RecipientType
+      recipientTypeDetails = $u.RecipientTypeDetails
+    }
+  }
+} catch { $result.errors += "Get-User: $($_.Exception.Message)" }
+
+Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+$result | ConvertTo-Json -Depth 5 -Compress
+`;
+
+  try {
+    const output = await runPowerShell(script, 60000);
+    const parsed = parseJsonFromPowerShellOutput(output);
+    res.json({ success: true, inspection: parsed });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ──────────────────────────────────────
 // Teardown: Remove shared mailboxes
 // ──────────────────────────────────────
 app.post("/remove-shared-mailboxes", async (req, res) => {
