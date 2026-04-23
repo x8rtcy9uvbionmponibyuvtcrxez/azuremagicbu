@@ -834,17 +834,17 @@ export default function BatchPage({ params }: PageProps) {
                             </div>
                           </td>
                           <td className="px-3 py-2">
-                            <CopyButton value={tenant.adminEmail} label="admin email" />
-                          </td>
-                          <td className="px-3 py-2">
-                            <CopyButton value={tenant.adminPassword} label="password" mask />
-                          </td>
-                          <td className="px-3 py-2">
                             {tenant.authCode ? (
                               <CopyButton value={tenant.authCode} label="code" />
                             ) : (
                               <span className="text-xs text-muted-foreground">pending…</span>
                             )}
+                          </td>
+                          <td className="px-3 py-2">
+                            <CopyButton value={tenant.adminEmail} label="admin email" />
+                          </td>
+                          <td className="px-3 py-2">
+                            <CopyButton value={tenant.adminPassword} label="password" mask />
                           </td>
                           <td className="px-3 py-2 text-xs text-muted-foreground">
                             {formatCountdown(tenant.authCodeExpiry)}
