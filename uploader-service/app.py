@@ -202,6 +202,41 @@ def init_db():
                 finished_at TEXT
             )
         """)
+        # Resumable state for in-flight jobs. Written continuously by
+        # JobState mutators (mark_success/failure/skipped/warning/finish).
+        # On uploader restart we read non-terminal rows from here, re-build
+        # JobState in memory, and re-spawn worker threads — they use the
+        # per-account account_status map to skip work already done.
+        #
+        # Design rationale: Railway Hobby containers recycle (OOM or platform
+        # maintenance) and Railway redeploys on every main push unless the
+        # service is path-scoped. Without this table, ANY restart orphans
+        # in-flight jobs and the operator sees "failed with 0/99" even
+        # though ~60 accounts actually landed. This table is what makes the
+        # uploader durable across restarts.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_jobs (
+                id TEXT PRIMARY KEY,
+                platform TEXT,
+                mode TEXT,
+                status TEXT,
+                total INTEGER DEFAULT 0,
+                processed INTEGER DEFAULT 0,
+                succeeded INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                skipped INTEGER DEFAULT 0,
+                warnings INTEGER DEFAULT 0,
+                csv_path TEXT,
+                config_json TEXT,
+                config_safe_json TEXT,
+                account_status_json TEXT,
+                failed_accounts_json TEXT,
+                logs_json TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -225,6 +260,66 @@ def save_job(job):
             json.dumps(full), job.started_at, job.finished_at,
         ))
         conn.commit()
+
+
+def persist_job(job):
+    """Upsert the full JobState snapshot to active_jobs so we can resume on
+    uploader restart. Called on every counter/status mutation — SQLite is
+    local (on the mounted Railway volume) and we cap concurrent jobs at 2, so
+    the write volume is trivial (a few hundred writes per 99-account run)."""
+    try:
+        with job._lock:
+            # Snapshot under the lock so we don't tear on concurrent mutation
+            # from another worker thread, then release before hitting SQLite.
+            payload = (
+                job.job_id,
+                job.platform,
+                job.mode,
+                job.status,
+                job.total,
+                job.processed,
+                job.succeeded,
+                job.failed,
+                job.skipped,
+                job.warnings,
+                job.csv_path,
+                json.dumps(job.config or {}),
+                json.dumps(job.config_safe or {}),
+                json.dumps(job.account_status or {}),
+                json.dumps(job.failed_accounts or []),
+                # Cap log retention — we only need recent context for the
+                # UI on resume, and huge log blobs bloat the DB. 500 lines
+                # ≈ last ~3 min of upload activity.
+                json.dumps((job.logs or [])[-500:]),
+                job.started_at,
+                job.finished_at,
+                datetime.now().isoformat(),
+            )
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO active_jobs (
+                    id, platform, mode, status, total, processed, succeeded, failed, skipped, warnings,
+                    csv_path, config_json, config_safe_json, account_status_json, failed_accounts_json,
+                    logs_json, started_at, finished_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, payload)
+            conn.commit()
+    except Exception as e:
+        # Persistence must NEVER crash the job. If SQLite has a bad day we
+        # just skip this snapshot; next state change tries again. The
+        # worst case is a slightly stale resume on restart.
+        print(f"[persist_job] non-fatal: {e}", flush=True)
+
+
+def clear_active_job(job_id):
+    """Remove an active_jobs row on terminal transition. Keeps the table
+    small and ensures a restart doesn't try to resume a completed job."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM active_jobs WHERE id = ?", (job_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"[clear_active_job] non-fatal: {e}", flush=True)
 
 
 def load_history():
@@ -286,11 +381,13 @@ class JobState:
         self.status = "paused"
         self._pause.clear()
         self.log("⏸  Job paused")
+        persist_job(self)
 
     def resume(self):
         self.status = "running"
         self._pause.set()
         self.log("▶  Job resumed")
+        persist_job(self)
 
     def request_stop(self):
         self._stop = True
@@ -304,6 +401,7 @@ class JobState:
                 d.quit()
             except Exception:
                 pass
+        persist_job(self)
 
     def wait_if_paused(self):
         self._pause.wait()
@@ -329,6 +427,7 @@ class JobState:
         with self._lock:
             self.succeeded += 1
             self.processed += 1
+        persist_job(self)
 
     def mark_failure(self, row=None):
         with self._lock:
@@ -336,11 +435,13 @@ class JobState:
             self.processed += 1
             if row is not None:
                 self.failed_accounts.append(row)
+        persist_job(self)
 
     def mark_skipped(self):
         with self._lock:
             self.skipped += 1
             self.processed += 1
+        persist_job(self)
 
     def mark_warning(self, reason):
         """Non-fatal anomaly (e.g., workspace switch needed fallback). Increments
@@ -348,6 +449,7 @@ class JobState:
         with self._lock:
             self.warnings += 1
         self.log(f"⚠ Warning: {reason}")
+        persist_job(self)
 
     def set_account_status(self, email, state, reason=None):
         """Per-account status map for the UI detail drawer. state ∈
@@ -360,12 +462,21 @@ class JobState:
                 "reason": reason,
                 "ts": datetime.now().isoformat(),
             }
+        # Persist AFTER releasing the lock — persist_job takes the lock again
+        # internally for the snapshot. Without this, we'd miss account_status
+        # updates in the resume state (and thus re-process accounts on
+        # restart because the worker loop's account_status skip check would
+        # see an empty map).
+        persist_job(self)
 
     def finish(self, status="completed"):
         self.status = status
         self.finished_at = datetime.now().isoformat()
         self.log(f"Job finished — {status}")
         save_job(self)
+        # Terminal — job is now in job_history; stop carrying it in
+        # active_jobs so restarts don't try to resume a finished job.
+        clear_active_job(self.job_id)
         # Fire a Slack webhook if configured. Notifies on any non-trivial
         # outcome: failed / cancelled / completed-with-failures / warnings.
         # Silent no-op if SLACK_WEBHOOK_URL isn't set, so local runs are
@@ -1149,6 +1260,17 @@ def run_instantly_job(job):
                     email = acct["email"]
                     pw = acct["password"]
 
+                    # Resume-safety: if this job was reloaded from active_jobs
+                    # and we already recorded a terminal state for this email,
+                    # skip it LOCALLY without incrementing any counters (we
+                    # already counted it in the prior run). Without this
+                    # check, a restart-resume would re-see the account in
+                    # existing_set (we uploaded it last time) and mark_skipped,
+                    # double-counting it into total > job.total.
+                    prior_state = (job.account_status.get(email.lower()) or {}).get("state")
+                    if prior_state in ("succeeded", "failed", "skipped"):
+                        continue
+
                     if email.lower() in existing_set:
                         job.mark_skipped()
                         job.set_account_status(email, "skipped", "already in Instantly")
@@ -1415,6 +1537,13 @@ def run_smartlead_upload(job):
             email = acct["email"]
             pw = acct["password"]
 
+            # Resume-safety (see run_instantly_job for rationale): skip
+            # accounts we already recorded a terminal state for, without
+            # double-counting on restart-resume.
+            prior_state = (job.account_status.get(email.lower()) or {}).get("state")
+            if prior_state in ("succeeded", "failed", "skipped"):
+                continue
+
             if email in existing_set:
                 job.mark_skipped()
                 job.set_account_status(email, "skipped", "already in Smartlead")
@@ -1624,6 +1753,130 @@ def _spawn_job_thread(target, job):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  RESUME — pick up where a previous process instance left off
+# ═══════════════════════════════════════════════════════════════════
+
+def load_active_jobs_and_resume():
+    """Called at module import (gunicorn worker startup). Finds any jobs
+    that were non-terminal when the previous process died and rebuilds their
+    JobState in memory + re-spawns their worker threads.
+
+    The worker functions re-fetch the existing-accounts set from the ESP API
+    at start of run, so anything uploaded before the restart is picked up in
+    that set. Combined with the account_status "prior_state" early-return in
+    the per-account loops, this means resume is idempotent: accounts already
+    recorded as succeeded/failed/skipped are skipped locally WITHOUT being
+    re-counted, and untouched accounts continue as normal.
+
+    Notes on edge cases:
+      - CSV path persistence: CSVs live in UPLOAD_DIR which is rooted at
+        DATA_DIR (the Railway volume mount). They survive container restarts.
+      - Concurrency: we re-acquire _job_slots blocking. If MAX_CONCURRENT_JOBS
+        changed between runs (e.g. env var bumped down), resumed jobs queue
+        serially as slots free up — same behavior as if they'd been
+        submitted via /api/start.
+      - Failure during resume: if the resume itself throws, log and skip
+        that row. The job stays in active_jobs (next restart tries again)
+        rather than silently disappearing.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM active_jobs").fetchall()
+    except Exception as e:
+        print(f"[resume] failed to read active_jobs: {e}", flush=True)
+        return
+
+    if not rows:
+        return
+
+    print(f"[resume] found {len(rows)} active_jobs row(s) to evaluate", flush=True)
+
+    for row in rows:
+        status = row["status"] or ""
+
+        # Terminal rows shouldn't stay here (finish() calls clear_active_job),
+        # but a crash mid-finish could leave one behind. Clean up.
+        if status in ("completed", "failed", "cancelled"):
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM active_jobs WHERE id = ?", (row["id"],))
+                    conn.commit()
+            except Exception:
+                pass
+            continue
+
+        # Verify CSV is still on disk — without it, resume is impossible.
+        csv_path = row["csv_path"]
+        if not csv_path or not os.path.exists(csv_path):
+            print(f"[resume] job {row['id']} has no CSV at {csv_path!r} — marking failed", flush=True)
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM active_jobs WHERE id = ?", (row["id"],))
+                    conn.commit()
+            except Exception:
+                pass
+            continue
+
+        try:
+            config = json.loads(row["config_json"] or "{}")
+            config_safe = json.loads(row["config_safe_json"] or "{}")
+            job = JobState(
+                row["id"], row["platform"], row["mode"], row["total"] or 0,
+                csv_path, config, config_safe,
+            )
+            job.processed = row["processed"] or 0
+            job.succeeded = row["succeeded"] or 0
+            job.failed = row["failed"] or 0
+            job.skipped = row["skipped"] or 0
+            job.warnings = row["warnings"] or 0
+            job.account_status = json.loads(row["account_status_json"] or "{}")
+            job.failed_accounts = json.loads(row["failed_accounts_json"] or "[]")
+            # Restore last 500 log lines so the UI + SSE has context on first poll.
+            job.logs = json.loads(row["logs_json"] or "[]")
+            job.started_at = row["started_at"] or job.started_at
+            # Always flip status back to running — we're about to re-spawn
+            # the threads. If the previous run was paused, a human can
+            # pause again post-resume via /api/pause.
+            job.status = "running"
+
+            jobs[row["id"]] = job
+
+            # Prominent resume log so Railway logs show what happened.
+            job.log(
+                f"♻ Resumed after uploader restart — {job.succeeded}/{job.total} succeeded, "
+                f"{job.failed} failed, {job.skipped} skipped, {job.warnings} warnings. "
+                f"Remaining work starts from where the previous worker stopped."
+            )
+            persist_job(job)
+
+            # Re-acquire the concurrency slot. Blocks if MAX_CONCURRENT_JOBS
+            # slots are already taken — which shouldn't happen at startup
+            # but is safe if a future change introduces more resume parallelism.
+            _job_slots.acquire()
+
+            if job.platform == "instantly":
+                _spawn_job_thread(run_instantly_job, job)
+            elif job.platform == "smartlead_upload":
+                _spawn_job_thread(run_smartlead_upload, job)
+            elif job.platform == "smartlead_warmup":
+                _spawn_job_thread(run_smartlead_warmup, job)
+            else:
+                job.log(f"Unknown platform {job.platform!r} — cannot resume, marking failed")
+                job.finish("failed")
+                # Release the slot we just grabbed since _spawn_job_thread
+                # didn't get called.
+                try:
+                    _job_slots.release()
+                except ValueError:
+                    pass
+        except Exception as e:
+            print(f"[resume] failed to restore job {row['id']}: {e}", flush=True)
+            # Leave the row in place so next restart retries. Better than
+            # silently dropping work.
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  FLASK ROUTES
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1706,6 +1959,10 @@ def api_start():
         job = JobState(job_id, "instantly", mode, total, csv_path, cfg, safe)
         jobs[job_id] = job
         save_job(job)
+        # Persist the initial job snapshot BEFORE the worker thread even
+        # starts, so a crash between here and the first mark_* call still
+        # leaves a resumable row in active_jobs.
+        persist_job(job)
         _spawn_job_thread(run_instantly_job, job)
 
     elif platform == "smartlead_upload":
@@ -1731,6 +1988,7 @@ def api_start():
         job = JobState(job_id, "smartlead_upload", "upload", total, csv_path, cfg, safe)
         jobs[job_id] = job
         save_job(job)
+        persist_job(job)
         _spawn_job_thread(run_smartlead_upload, job)
 
     elif platform == "smartlead_warmup":
@@ -1752,6 +2010,7 @@ def api_start():
         job = JobState(job_id, "smartlead_warmup", "warmup", 0, csv_path, cfg, safe)
         jobs[job_id] = job
         save_job(job)
+        persist_job(job)
         _spawn_job_thread(run_smartlead_warmup, job)
 
     else:
@@ -1931,6 +2190,11 @@ def _startup_banner():
 # so this logs on cold start even though __main__ branch won't run.
 init_db()
 _startup_banner()
+# Resume any jobs that were non-terminal when the previous process died.
+# Needs init_db() above (for the active_jobs table) and all JobState +
+# run_* functions defined below already — Python hoists function defs so
+# the call at module bottom sees them.
+load_active_jobs_and_resume()
 
 
 if __name__ == "__main__":
