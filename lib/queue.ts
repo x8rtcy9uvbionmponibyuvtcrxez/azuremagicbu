@@ -1,10 +1,19 @@
 import { Queue, type ConnectionOptions, type JobsOptions } from "bullmq";
 
 export const TENANT_PROCESSING_QUEUE = "tenant-processing";
+export const TENANT_UPLOAD_QUEUE = "tenant-upload";
 
 export type TenantProcessingJobData = {
   tenantId: string;
   batchId: string;
+};
+
+export type TenantUploadJobName = "start-upload" | "poll-upload";
+export type TenantUploadJobData = {
+  tenantId: string;
+  batchId: string;
+  // For poll jobs only — present once the uploader has acknowledged the run.
+  uploaderJobId?: string;
 };
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -124,4 +133,89 @@ export async function enqueueTenantProcessingJob(
     }
     throw error;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tenant upload queue — drives the email-uploader Phase 5 handoff.
+// Separate from the main tenant-processing queue so uploader backpressure
+// (429s, long-running 20-40min Selenium jobs) can't starve provisioning.
+// ─────────────────────────────────────────────────────────────────────────
+
+const uploadJobOptions: JobsOptions = {
+  // Allow generous retries for the start job specifically — 429s from the
+  // uploader's MAX_CONCURRENT_JOBS cap are expected under parallel tenant
+  // completion. Exponential backoff keeps us polite.
+  attempts: 12,
+  backoff: { type: "exponential", delay: 30_000 },
+  removeOnComplete: 500,
+  removeOnFail: 500
+};
+
+const globalUploadQueue = globalThis as unknown as {
+  tenantUploadQueue?: Queue<TenantUploadJobData, unknown, TenantUploadJobName>;
+};
+
+export function getUploadQueue(): Queue<TenantUploadJobData, unknown, TenantUploadJobName> {
+  if (!globalUploadQueue.tenantUploadQueue) {
+    globalUploadQueue.tenantUploadQueue = new Queue<TenantUploadJobData, unknown, TenantUploadJobName>(
+      TENANT_UPLOAD_QUEUE,
+      {
+        connection: redisConnection,
+        defaultJobOptions: uploadJobOptions
+      }
+    );
+    console.log("📦 [UploadQueue] Redis connected");
+  }
+  return globalUploadQueue.tenantUploadQueue;
+}
+
+export async function enqueueStartUpload(data: TenantUploadJobData): Promise<void> {
+  const queue = getUploadQueue();
+  const jobId = normalizeJobId(`start:${data.batchId}:${data.tenantId}`);
+
+  // Drain stale duplicates for the same tenant before adding — mirrors the
+  // dedup pattern in enqueueTenantProcessingJob. Safe even if nothing to remove.
+  try {
+    const pending = await queue.getJobs(["waiting", "delayed", "prioritized", "paused"], 0, 5000, true);
+    for (const job of pending) {
+      if (job.data?.tenantId === data.tenantId && job.name === "start-upload") {
+        try { await job.remove(); } catch { /* race */ }
+      }
+    }
+  } catch {
+    /* dedup is best-effort — never block enqueue */
+  }
+
+  try {
+    await queue.add("start-upload", data, { jobId });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("exists")) {
+      const existing = await queue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state === "waiting" || state === "active" || state === "delayed" || state === "prioritized") {
+          return; // already in-flight, nothing to do
+        }
+        try { await existing.remove(); } catch { /* race */ }
+        await queue.add("start-upload", data, { jobId: `${jobId}__rerun__${Date.now()}` });
+        return;
+      }
+    }
+    throw error;
+  }
+}
+
+export async function enqueuePollUpload(
+  data: TenantUploadJobData,
+  delayMs = 15_000
+): Promise<void> {
+  const queue = getUploadQueue();
+  // Polls are fire-and-forget — no dedup. Each scheduled poll runs once,
+  // then decides whether to schedule the next one.
+  await queue.add("poll-upload", data, {
+    delay: delayMs,
+    attempts: 3,
+    backoff: { type: "fixed", delay: 5_000 }
+  });
 }

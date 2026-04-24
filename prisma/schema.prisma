@@ -30,6 +30,19 @@ enum TenantStatus {
   failed
 }
 
+enum UploaderEsp {
+  instantly
+  smartlead
+}
+
+enum UploaderStatus {
+  idle
+  queued
+  running
+  completed
+  failed
+}
+
 model Batch {
   id             String      @id @default(cuid())
   status         BatchStatus @default(uploading)
@@ -37,6 +50,23 @@ model Batch {
   completedCount Int         @default(0)
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
+
+  // Per-batch uploader config (captured in the bulk upload UI).
+  // Credentials are encrypted via lib/crypto.ts before persistence.
+  // Absent/null means no auto-upload for this batch.
+  uploaderEsp              UploaderEsp?
+  uploaderAutoTrigger      Boolean      @default(false)
+  uploaderWorkers          Int          @default(2)
+  // Instantly-specific
+  instantlyEmail           String?
+  instantlyPassword        String?
+  instantlyV1Key           String?
+  instantlyV2Key           String?
+  instantlyWorkspace       String?
+  instantlyApiVersion      String?      @default("v1")
+  // Smartlead-specific
+  smartleadApiKey          String?
+  smartleadLoginUrl        String?
 
   tenants Tenant[]
   events  TenantEvent[]
@@ -91,6 +121,19 @@ model Tenant {
   instantlyFailedCount    Int      @default(0)
   csvUrl            String?
   errorMessage      String?
+  // Phase 5: email-uploader tracking
+  uploaderJobId          String?
+  uploaderStatus         UploaderStatus @default(idle)
+  uploaderQueuedAt       DateTime?
+  uploaderStartedAt      DateTime?
+  uploaderCompletedAt    DateTime?
+  uploaderTotal          Int?
+  uploaderSucceeded      Int?
+  uploaderFailed         Int?
+  uploaderSkipped        Int?
+  uploaderWarnings       Int?
+  uploaderErrorMessage   String?
+  uploaderLastLogAt      DateTime?
   createdAt         DateTime     @default(now())
   updatedAt         DateTime     @updatedAt
 
@@ -99,6 +142,7 @@ model Tenant {
 
   @@index([batchId, status])
   @@index([domain])
+  @@index([uploaderStatus])
 }
 
 model TenantEvent {

@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Email Uploader</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f13; --surface: #1a1a24; --surface2: #22222f;
+      --border: #2e2e3e; --text: #e4e4ef; --text2: #8888a4;
+      --accent: #6c5ce7; --accent2: #a29bfe;
+      --green: #00b894; --red: #e74c3c; --orange: #f39c12; --blue: #3498db;
+      --radius: 12px; --radius-sm: 8px;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      line-height: 1.5; min-height: 100vh;
+    }
+
+    /* ── Layout ───────────────────────────────────────── */
+    .app { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
+    .app-header {
+      display: flex; align-items: center; gap: 16px;
+      padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 24px;
+    }
+    .app-header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .app-header .pill {
+      font-size: 11px; padding: 3px 10px; border-radius: 20px;
+      background: var(--accent); color: #fff; font-weight: 600;
+    }
+
+    /* ── Tabs ─────────────────────────────────────────── */
+    .tabs { display: flex; gap: 4px; margin-bottom: 24px; }
+    .tab-btn {
+      padding: 10px 22px; border: none; border-radius: var(--radius-sm);
+      background: var(--surface); color: var(--text2); cursor: pointer;
+      font-size: 14px; font-weight: 600; transition: all 0.2s;
+    }
+    .tab-btn:hover { background: var(--surface2); color: var(--text); }
+    .tab-btn.active { background: var(--accent); color: #fff; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* ── Cards ────────────────────────────────────────── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 24px; margin-bottom: 20px;
+    }
+    .card-title {
+      font-size: 15px; font-weight: 700; margin-bottom: 16px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .card-title .icon { font-size: 18px; }
+
+    /* ── Mode Selector ───────────────────────────────── */
+    .mode-selector {
+      display: flex; gap: 0; margin-bottom: 18px; border-radius: var(--radius-sm);
+      overflow: hidden; border: 1px solid var(--border);
+    }
+    .mode-btn {
+      flex: 1; padding: 10px 16px; border: none; cursor: pointer;
+      font-size: 13px; font-weight: 600; transition: all 0.2s;
+      background: var(--surface2); color: var(--text2); text-align: center;
+    }
+    .mode-btn:hover { color: var(--text); }
+    .mode-btn.active { background: var(--accent); color: #fff; }
+
+    /* ── Forms ────────────────────────────────────────── */
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .form-group { display: flex; flex-direction: column; gap: 5px; }
+    .form-group.full { grid-column: 1 / -1; }
+    .form-group label { font-size: 12px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+    input[type="text"], input[type="password"], input[type="email"], select {
+      padding: 10px 14px; border-radius: var(--radius-sm);
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--text); font-size: 14px; outline: none; transition: border 0.2s;
+      width: 100%;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    input::placeholder { color: var(--text2); }
+
+    /* ── File upload ──────────────────────────────────── */
+    .file-drop {
+      border: 2px dashed var(--border); border-radius: var(--radius);
+      padding: 32px; text-align: center; cursor: pointer;
+      transition: all 0.2s; position: relative;
+    }
+    .file-drop:hover, .file-drop.dragover { border-color: var(--accent); background: rgba(108,92,231,0.05); }
+    .file-drop input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    .file-drop .icon { font-size: 32px; margin-bottom: 8px; }
+    .file-drop p { color: var(--text2); font-size: 14px; }
+    .file-drop .filename { color: var(--green); font-weight: 600; margin-top: 6px; font-size: 13px; }
+
+    /* ── Buttons ──────────────────────────────────────── */
+    .btn {
+      padding: 10px 24px; border: none; border-radius: var(--radius-sm);
+      font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s;
+      display: inline-flex; align-items: center; gap: 8px;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #5a4bd6; }
+    .btn-success { background: var(--green); color: #fff; }
+    .btn-success:hover:not(:disabled) { background: #00a884; }
+    .btn-warning { background: var(--orange); color: #fff; }
+    .btn-warning:hover:not(:disabled) { background: #e08b0a; }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #c0392b; }
+    .btn-ghost { background: transparent; color: var(--text2); border: 1px solid var(--border); }
+    .btn-ghost:hover:not(:disabled) { background: var(--surface2); color: var(--text); }
+    .btn-sm { padding: 6px 14px; font-size: 12px; }
+    .btn-row { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+    /* ── Checkbox row ─────────────────────────────────── */
+    .check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .check-row input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+    .check-row label { font-size: 13px; color: var(--text2); cursor: pointer; }
+
+    /* ── Progress ─────────────────────────────────────── */
+    .progress-section { display: none; }
+    .progress-section.active { display: block; }
+    .progress-bar-outer { height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+    .progress-bar-inner { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s; width: 0%; }
+    .progress-bar-inner.success { background: var(--green); }
+    .progress-bar-inner.error { background: var(--red); }
+    .progress-stats { display: flex; gap: 20px; font-size: 13px; color: var(--text2); margin-top: 8px; flex-wrap: wrap; }
+    .progress-stats .stat { display: flex; align-items: center; gap: 5px; }
+    .progress-stats .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .progress-stats .dot.green { background: var(--green); }
+    .progress-stats .dot.red { background: var(--red); }
+    .progress-stats .dot.gray { background: var(--text2); }
+    .progress-stats .dot.blue { background: var(--blue); }
+    .progress-stats .dot.orange { background: var(--orange); }
+
+    .status-badge { padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    .status-running { background: rgba(52,152,219,0.15); color: var(--blue); }
+    .status-paused { background: rgba(243,156,18,0.15); color: var(--orange); }
+    .status-completed { background: rgba(0,184,148,0.15); color: var(--green); }
+    .status-failed, .status-cancelled { background: rgba(231,76,60,0.15); color: var(--red); }
+    .status-stopping { background: rgba(231,76,60,0.15); color: var(--orange); }
+
+    /* ── Log Console ──────────────────────────────────── */
+    .log-console {
+      background: #0c0c10; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 16px; max-height: 320px; overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.7;
+    }
+    .log-line { padding: 1px 0; word-break: break-word; }
+    .log-line.success { color: var(--green); }
+    .log-line.error { color: var(--red); }
+    .log-line.warn { color: var(--orange); }
+    .log-line.info { color: var(--text2); }
+
+    /* ── History ──────────────────────────────────────── */
+    .history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .history-table th {
+      text-align: left; padding: 10px 14px; color: var(--text2); font-weight: 600;
+      border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .history-table td { padding: 12px 14px; border-bottom: 1px solid rgba(46,46,62,0.5); }
+    .history-table tr:hover td { background: rgba(108,92,231,0.04); }
+    .empty-state { text-align: center; padding: 48px 20px; color: var(--text2); }
+    .empty-state .icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+
+    /* ── Two Column Smartlead ─────────────────────────── */
+    .sl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media (max-width: 720px) { .sl-grid { grid-template-columns: 1fr; } }
+
+    /* ── Responsive ───────────────────────────────────── */
+    @media (max-width: 640px) {
+      .form-grid { grid-template-columns: 1fr; }
+      .tabs { flex-wrap: wrap; }
+      .progress-stats { flex-direction: column; gap: 6px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <div class="app-header">
+    <h1>Email Uploader</h1>
+    <span class="pill">v5.0</span>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('instantly', this)">Instantly</button>
+    <button class="tab-btn" onclick="switchTab('smartlead', this)">Smartlead</button>
+    <button class="tab-btn" onclick="switchTab('history', this)">History</button>
+  </div>
+
+  <!-- ══════════════ INSTANTLY TAB ══════════════ -->
+  <div class="tab-content active" id="tab-instantly">
+
+    <!-- Mode Selector -->
+    <div class="card">
+      <div class="card-title"><span class="icon">&#9889;</span> Upload Mode</div>
+      <div class="mode-selector">
+        <button class="mode-btn active" onclick="setInstMode('single', this)">Single Workspace</button>
+        <button class="mode-btn" onclick="setInstMode('multi', this)">Multi-Workspace</button>
+      </div>
+      <p class="hint" id="inst-mode-hint">Sequential upload to the default workspace.</p>
+    </div>
+
+    <!-- Credentials -->
+    <div class="card">
+      <div class="card-title"><span class="icon">&#128273;</span> Credentials</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>API Version</label>
+          <select id="inst-api-version">
+            <option value="v1">V1</option>
+            <option value="v2">V2</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>V1 API Key</label>
+          <input type="text" id="inst-v1-key" placeholder="V1 API key" />
+        </div>
+        <div class="form-group">
+          <label>V2 API Key</label>
+          <input type="text" id="inst-v2-key" placeholder="V2 API key (optional for V1)" />
+        </div>
+        <div class="form-group">
+          <label>Instantly Email</label>
+          <input type="email" id="inst-email" placeholder="login@example.com" />
+        </div>
+        <div class="form-group">
+          <label>Instantly Password</label>
+          <input type="password" id="inst-password" placeholder="Your password" />
+        </div>
+        <div class="form-group" id="inst-workspace-group" style="display:none;">
+          <label>Workspace Name</label>
+          <input type="text" id="inst-workspace" placeholder="Target workspace" />
+        </div>
+        <div class="form-group" id="inst-workers-group">
+          <label>Workers (parallel)</label>
+          <select id="inst-workers">
+            <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- CSV + Start -->
+    <div class="card">
+      <div class="card-title"><span class="icon">&#128196;</span> CSV File</div>
+      <div class="file-drop" id="inst-drop">
+        <input type="file" accept=".csv" id="inst-csv-input" onchange="pickFile(this, 'inst')" />
+        <div class="icon">&#128206;</div>
+        <p>Drop CSV here or click to browse</p>
+        <p style="font-size:11px; color:var(--text2); margin-top:4px;">Must have EmailAddress and Password columns</p>
+        <div class="filename" id="inst-filename"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="inst-start-btn" onclick="startInstantly()" disabled>
+          &#9654; Start Upload
+        </button>
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-section" id="inst-progress">
+      <div class="card" id="inst-progress-card"></div>
+    </div>
+  </div>
+
+  <!-- ══════════════ SMARTLEAD TAB ══════════════ -->
+  <div class="tab-content" id="tab-smartlead">
+
+    <!-- Credentials -->
+    <div class="card">
+      <div class="card-title"><span class="icon">&#128232;</span> Smartlead Credentials</div>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>API Key</label>
+          <input type="text" id="sl-api-key" placeholder="Your Smartlead API key" />
+        </div>
+      </div>
+    </div>
+
+    <div class="sl-grid">
+
+      <!-- Upload Accounts -->
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128228;</span> Upload Accounts</div>
+        <div class="form-group" style="margin-bottom:14px;">
+          <label>OAuth Login URL</label>
+          <input type="text" id="sl-login-url" placeholder="https://..." />
+        </div>
+        <div class="file-drop" id="sl-drop" style="padding:20px;">
+          <input type="file" accept=".csv" id="sl-csv-input" onchange="pickFile(this, 'sl')" />
+          <div class="icon" style="font-size:24px;">&#128206;</div>
+          <p style="font-size:13px;">Drop CSV or click to browse</p>
+          <div class="filename" id="sl-filename"></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="sl-start-btn" onclick="startSLUpload()" disabled>
+            &#9654; Start Upload
+          </button>
+        </div>
+      </div>
+
+      <!-- Warmup Config -->
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128293;</span> Warmup Config</div>
+        <p style="font-size:12px; color:var(--text2); margin-bottom:12px;">
+          Sets warmup (5/day, 30% reply) &amp; sending limits (5/day, 61min wait) for all accounts on matching domains.
+        </p>
+        <div class="form-group" style="margin-bottom:14px;">
+          <label>Domain (optional)</label>
+          <input type="text" id="slw-domain" placeholder="example.com" />
+          <span style="font-size:11px; color:var(--text2);">Or upload a CSV to auto-detect domains</span>
+        </div>
+        <div class="file-drop" id="slw-drop" style="padding:16px;">
+          <input type="file" accept=".csv" id="slw-csv-input" onchange="pickFile(this, 'slw')" />
+          <p style="font-size:13px;">&#128206; Optional CSV for domain detection</p>
+          <div class="filename" id="slw-filename"></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-success" id="slw-start-btn" onclick="startSLWarmup()">
+            &#128293; Configure Warmup
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-section" id="sl-progress">
+      <div class="card" id="sl-progress-card"></div>
+    </div>
+  </div>
+
+  <!-- ══════════════ HISTORY TAB ══════════════ -->
+  <div class="tab-content" id="tab-history">
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between;">
+        <span><span class="icon">&#128218;</span> Upload History</span>
+        <button class="btn btn-ghost btn-sm" onclick="clearHistory()">Clear All</button>
+      </div>
+      <div id="history-body">
+        <div class="empty-state">
+          <div class="icon">&#128203;</div>
+          <p>No upload history yet</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════
+   STATE
+   ═══════════════════════════════════════════════════════ */
+var activeJobId = null;
+var activePrefix = null;
+var pollTimer = null;
+var instMode = 'single';
+var csvFiles = {};  // prefix -> File
+var reuseCsvPath = {};  // prefix -> server-side path to reuse from a prior run
+
+/* ═══════════════════════════════════════════════════════
+   TABS
+   ═══════════════════════════════════════════════════════ */
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+  document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+  btn.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'history') loadHistory();
+}
+
+/* ═══════════════════════════════════════════════════════
+   INSTANTLY MODE
+   ═══════════════════════════════════════════════════════ */
+function setInstMode(mode, btn) {
+  instMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  document.getElementById('inst-workspace-group').style.display = mode === 'multi' ? '' : 'none';
+  document.getElementById('inst-mode-hint').textContent =
+    mode === 'multi' ? 'Upload with workspace switching.' : 'Sequential upload to the default workspace.';
+}
+
+/* ═══════════════════════════════════════════════════════
+   FILE PICKER
+   ═══════════════════════════════════════════════════════ */
+function pickFile(input, prefix) {
+  var file = input.files[0];
+  if (!file) return;
+  csvFiles[prefix] = file;
+  document.getElementById(prefix + '-filename').textContent = file.name;
+  var startBtn = document.getElementById(prefix + '-start-btn');
+  if (startBtn) startBtn.disabled = false;
+}
+
+/* ═══════════════════════════════════════════════════════
+   START INSTANTLY
+   ═══════════════════════════════════════════════════════ */
+function startInstantly() {
+  var apiVer = document.getElementById('inst-api-version').value;
+  var v1Key = document.getElementById('inst-v1-key').value.trim();
+  var v2Key = document.getElementById('inst-v2-key').value.trim();
+  var email = document.getElementById('inst-email').value.trim();
+  var pw = document.getElementById('inst-password').value.trim();
+  var ws = document.getElementById('inst-workspace').value.trim();
+  var csvFile = csvFiles['inst'];
+  var reusePath = reuseCsvPath['inst'];
+
+  if (!csvFile && !reusePath) return alert('Please select a CSV file.');
+  if (!email || !pw) return alert('Instantly email and password are required.');
+  if (apiVer === 'v1' && !v1Key) return alert('V1 API key is required.');
+  if (apiVer === 'v2' && !v2Key) return alert('V2 API key is required.');
+  if (instMode === 'multi' && !ws) return alert('Workspace name is required for multi-workspace mode.');
+
+  var fd = new FormData();
+  fd.append('platform', 'instantly');
+  fd.append('mode', instMode);
+  fd.append('api_version', apiVer);
+  fd.append('api_key', v1Key);
+  fd.append('v2_api_key', v2Key);
+  fd.append('instantly_email', email);
+  fd.append('instantly_password', pw);
+  fd.append('workspace', ws);
+  fd.append('workers', document.getElementById('inst-workers').value);
+  if (csvFile) fd.append('csv_file', csvFile);
+  else if (reusePath) fd.append('reuse_csv_path', reusePath);
+
+  // Clear reuse flag so next manual upload doesn't accidentally reuse
+  reuseCsvPath['inst'] = null;
+  submitJob(fd, 'inst');
+}
+
+/* ═══════════════════════════════════════════════════════
+   START SMARTLEAD UPLOAD
+   ═══════════════════════════════════════════════════════ */
+function startSLUpload() {
+  var apiKey = document.getElementById('sl-api-key').value.trim();
+  var loginUrl = document.getElementById('sl-login-url').value.trim();
+  var csvFile = csvFiles['sl'];
+  var reusePath = reuseCsvPath['sl'];
+
+  if (!csvFile && !reusePath) return alert('Please select a CSV file.');
+  if (!apiKey) return alert('Smartlead API key is required.');
+  if (!loginUrl) return alert('OAuth login URL is required.');
+
+  var fd = new FormData();
+  fd.append('platform', 'smartlead_upload');
+  fd.append('api_key', apiKey);
+  fd.append('login_url', loginUrl);
+  if (csvFile) fd.append('csv_file', csvFile);
+  else if (reusePath) fd.append('reuse_csv_path', reusePath);
+
+  reuseCsvPath['sl'] = null;
+  submitJob(fd, 'sl');
+}
+
+/* ═══════════════════════════════════════════════════════
+   START SMARTLEAD WARMUP
+   ═══════════════════════════════════════════════════════ */
+function startSLWarmup() {
+  var apiKey = document.getElementById('sl-api-key').value.trim();
+  var domain = document.getElementById('slw-domain').value.trim();
+  var csvFile = csvFiles['slw'];
+  var reusePath = reuseCsvPath['slw'];
+
+  if (!apiKey) return alert('Smartlead API key is required.');
+  if (!domain && !csvFile && !reusePath) return alert('Provide a domain or CSV file to detect domains.');
+
+  var fd = new FormData();
+  fd.append('platform', 'smartlead_warmup');
+  fd.append('api_key', apiKey);
+  fd.append('domain', domain);
+  if (csvFile) fd.append('csv_file', csvFile);
+  else if (reusePath) fd.append('reuse_csv_path', reusePath);
+
+  reuseCsvPath['slw'] = null;
+  submitJob(fd, 'sl');
+}
+
+/* ═══════════════════════════════════════════════════════
+   SUBMIT JOB (shared)
+   ═══════════════════════════════════════════════════════ */
+function submitJob(fd, prefix) {
+  var startBtn = document.getElementById(prefix + '-start-btn');
+  if (startBtn) startBtn.disabled = true;
+
+  // Show progress section
+  var progSection = document.getElementById(prefix + '-progress');
+  progSection.classList.add('active');
+  var progCard = document.getElementById(prefix + '-progress-card');
+  progCard.innerHTML = buildProgressHTML(prefix);
+
+  fetch('/api/start', { method: 'POST', body: fd })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) {
+        alert('Error: ' + data.error);
+        if (startBtn) startBtn.disabled = false;
+        return;
+      }
+      activeJobId = data.job_id;
+      activePrefix = prefix;
+      startPolling();
+    })
+    .catch(function(err) {
+      alert('Failed to start: ' + err.message);
+      if (startBtn) startBtn.disabled = false;
+    });
+}
+
+/* ═══════════════════════════════════════════════════════
+   PROGRESS HTML TEMPLATE
+   ═══════════════════════════════════════════════════════ */
+function buildProgressHTML(prefix) {
+  return '<div class="card-title">' +
+    '<span class="icon">&#128640;</span> Progress ' +
+    '<span class="status-badge status-running" id="' + prefix + '-badge">Running</span>' +
+    '</div>' +
+    '<div class="progress-bar-outer"><div class="progress-bar-inner" id="' + prefix + '-bar"></div></div>' +
+    '<div class="progress-stats">' +
+      '<span class="stat" id="' + prefix + '-pct">0%</span>' +
+      '<span class="stat"><span class="dot green"></span> <span id="' + prefix + '-ok">0</span> success</span>' +
+      '<span class="stat"><span class="dot red"></span> <span id="' + prefix + '-fail">0</span> failed</span>' +
+      '<span class="stat"><span class="dot gray"></span> <span id="' + prefix + '-skip">0</span> skipped</span>' +
+      '<span class="stat"><span class="dot orange"></span> <span id="' + prefix + '-warn">0</span> warnings</span>' +
+      '<span class="stat"><span class="dot blue"></span> <span id="' + prefix + '-tot">0</span> total</span>' +
+    '</div>' +
+    '<div class="btn-row">' +
+      '<button class="btn btn-warning btn-sm" id="' + prefix + '-pause-btn" onclick="pauseJob()">&#10074;&#10074; Pause</button>' +
+      '<button class="btn btn-success btn-sm" id="' + prefix + '-resume-btn" onclick="resumeJob()" style="display:none;">&#9654; Resume</button>' +
+      '<button class="btn btn-danger btn-sm" id="' + prefix + '-stop-btn" onclick="stopJob()">&#9724; Stop</button>' +
+    '</div>' +
+    '<div style="margin-top:16px;">' +
+      '<div class="card-title"><span class="icon">&#128220;</span> Live Log</div>' +
+      '<div class="log-console" id="' + prefix + '-log"></div>' +
+    '</div>';
+}
+
+/* ═══════════════════════════════════════════════════════
+   POLLING
+   ═══════════════════════════════════════════════════════ */
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollStatus, 1200);
+  pollStatus();
+}
+
+function pollStatus() {
+  if (!activeJobId) return;
+  fetch('/api/status/' + activeJobId)
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) return;
+      renderProgress(d);
+      if (d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        var startBtn = document.getElementById(activePrefix + '-start-btn');
+        if (startBtn) startBtn.disabled = false;
+      }
+    })
+    .catch(function() {});
+}
+
+function renderProgress(d) {
+  var p = activePrefix;
+  if (!p) return;
+
+  var pct = d.total > 0 ? Math.round((d.processed / d.total) * 100) : 0;
+
+  // Bar
+  var bar = document.getElementById(p + '-bar');
+  if (bar) {
+    bar.style.width = pct + '%';
+    bar.classList.remove('success', 'error');
+    if (d.status === 'completed') bar.classList.add('success');
+    else if (d.status === 'failed' || d.status === 'cancelled') bar.classList.add('error');
+  }
+
+  // Stats
+  setText(p + '-pct', pct + '%');
+  setText(p + '-ok', d.succeeded);
+  setText(p + '-fail', d.failed);
+  setText(p + '-skip', d.skipped);
+  setText(p + '-warn', d.warnings || 0);
+  setText(p + '-tot', d.total);
+
+  // Badge
+  var badge = document.getElementById(p + '-badge');
+  if (badge) {
+    badge.textContent = d.status.charAt(0).toUpperCase() + d.status.slice(1);
+    badge.className = 'status-badge status-' + d.status;
+  }
+
+  // Buttons
+  var pauseBtn = document.getElementById(p + '-pause-btn');
+  var resumeBtn = document.getElementById(p + '-resume-btn');
+  var stopBtn = document.getElementById(p + '-stop-btn');
+  if (d.status === 'paused') {
+    if (pauseBtn) pauseBtn.style.display = 'none';
+    if (resumeBtn) resumeBtn.style.display = '';
+  } else if (d.status === 'running') {
+    if (pauseBtn) pauseBtn.style.display = '';
+    if (resumeBtn) resumeBtn.style.display = 'none';
+  }
+  if (d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled') {
+    if (pauseBtn) pauseBtn.style.display = 'none';
+    if (resumeBtn) resumeBtn.style.display = 'none';
+    if (stopBtn) stopBtn.style.display = 'none';
+  }
+
+  // Logs
+  var logEl = document.getElementById(p + '-log');
+  if (logEl && d.logs) {
+    logEl.innerHTML = '';
+    d.logs.forEach(function(line) {
+      var div = document.createElement('div');
+      var cls = 'log-line info';
+      var lower = line.toLowerCase();
+      if (lower.indexOf('success') !== -1 || lower.indexOf('\u2713') !== -1) cls = 'log-line success';
+      else if (lower.indexOf('error') !== -1 || lower.indexOf('failed') !== -1 || lower.indexOf('\u2717') !== -1) cls = 'log-line error';
+      else if (lower.indexOf('skip') !== -1 || lower.indexOf('retry') !== -1 || lower.indexOf('warn') !== -1) cls = 'log-line warn';
+      div.className = cls;
+      div.textContent = line;
+      logEl.appendChild(div);
+    });
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
+function setText(id, val) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+/* ═══════════════════════════════════════════════════════
+   CONTROLS
+   ═══════════════════════════════════════════════════════ */
+function pauseJob() {
+  if (activeJobId) fetch('/api/pause/' + activeJobId, { method: 'POST' });
+}
+function resumeJob() {
+  if (activeJobId) fetch('/api/resume/' + activeJobId, { method: 'POST' });
+}
+function stopJob() {
+  if (activeJobId && confirm('Stop this upload? Progress will be saved.')) {
+    fetch('/api/stop/' + activeJobId, { method: 'POST' });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   HISTORY
+   ═══════════════════════════════════════════════════════ */
+function loadHistory() {
+  fetch('/api/history')
+    .then(function(r) { return r.json(); })
+    .then(function(rows) {
+      var body = document.getElementById('history-body');
+      if (!rows.length) {
+        body.innerHTML = '<div class="empty-state"><div class="icon">&#128203;</div><p>No upload history yet</p></div>';
+        return;
+      }
+      var html = '<table class="history-table"><thead><tr>' +
+        '<th>Platform</th><th>Mode</th><th>Date</th><th>Total</th><th>OK</th><th>Fail</th><th>Skip</th><th>Status</th><th></th>' +
+        '</tr></thead><tbody>';
+      rows.forEach(function(r) {
+        var date = r.started_at ? new Date(r.started_at).toLocaleString() : '\u2014';
+        html += '<tr>' +
+          '<td style="text-transform:capitalize; font-weight:600;">' + esc(r.platform) + '</td>' +
+          '<td>' + esc(r.mode || '') + '</td>' +
+          '<td>' + date + '</td>' +
+          '<td>' + r.total + '</td>' +
+          '<td style="color:var(--green);">' + r.succeeded + '</td>' +
+          '<td style="color:var(--red);">' + r.failed + '</td>' +
+          '<td style="color:var(--text2);">' + r.skipped + '</td>' +
+          '<td><span class="status-badge status-' + r.status + '">' + r.status + '</span></td>' +
+          '<td style="white-space:nowrap;">' +
+            '<button class="btn btn-ghost btn-sm" title="View live progress + logs" onclick="viewJob(\'' + r.id + '\', \'' + esc(r.platform) + '\')">&#128065;</button>' +
+            ' <button class="btn btn-ghost btn-sm" title="Rerun with these settings" onclick="rerunJob(\'' + r.id + '\')">&#8635;</button>' +
+            ' <button class="btn btn-ghost btn-sm" onclick="deleteHistory(\'' + r.id + '\')">&#128465;</button>' +
+          '</td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      body.innerHTML = html;
+    });
+}
+
+function deleteHistory(id) {
+  fetch('/api/history/' + id, { method: 'DELETE' }).then(function() { loadHistory(); });
+}
+
+/* Re-attach the live progress/log view to an existing (possibly still running) job.
+   Useful after a browser refresh or just for peeking at a job from the History tab. */
+function viewJob(id, platform) {
+  var prefix = (platform && platform.toLowerCase().indexOf('smartlead') !== -1) ? 'sl' : 'inst';
+  activePrefix = prefix;
+  activeJobId = id;
+  // Switch to that platform's tab so the progress panel is visible
+  var targetTab = (prefix === 'sl') ? 'smartlead' : 'instantly';
+  var tabBtn = document.querySelector('.tab-btn[onclick*="switchTab(\'' + targetTab + '\'"]');
+  if (tabBtn) tabBtn.click();
+  // Kick off polling; existing renderProgress logic will fill in the UI
+  startPolling();
+}
+
+/* Rerun a past job with all settings restored. */
+function rerunJob(id) {
+  fetch('/api/history/' + id + '/rerun-config')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) return alert('Could not load rerun config: ' + data.error);
+      var platform = (data.platform || '').toLowerCase();
+      var cfg = data.config || {};
+
+      // Helper: set an input value if it exists
+      function set(id, value) {
+        var el = document.getElementById(id);
+        if (el && value !== undefined && value !== null) el.value = value;
+      }
+      // Helper: click a button that matches a text — used for mode buttons
+      function clickMode(mode) {
+        var btns = document.querySelectorAll('.mode-btn');
+        btns.forEach(function(b) {
+          var t = (b.textContent || '').toLowerCase();
+          if ((mode === 'single' && t.indexOf('single') >= 0) || (mode === 'multi' && t.indexOf('multi') >= 0)) {
+            b.click();
+          }
+        });
+      }
+
+      // Switch to the right tab by clicking its tab button (so state stays consistent)
+      var tabTarget = platform === 'instantly' ? 'instantly' : 'smartlead';
+      document.querySelectorAll('.tab-btn').forEach(function(b) {
+        if ((b.textContent || '').toLowerCase().indexOf(tabTarget) >= 0) b.click();
+      });
+
+      if (platform === 'instantly') {
+        set('inst-api-version', cfg.api_version || 'v1');
+        set('inst-v1-key', cfg.api_key || '');
+        set('inst-v2-key', cfg.v2_api_key || '');
+        set('inst-email', cfg.instantly_email || '');
+        set('inst-password', cfg.instantly_password || '');
+        set('inst-workspace', cfg.workspace || '');
+        clickMode(data.mode || 'single');
+      } else if (platform === 'smartlead') {
+        set('sl-api-key', cfg.api_key || '');
+        set('sl-login-url', cfg.login_url || '');
+        set('slw-domain', (cfg.domains && cfg.domains[0]) || '');
+      }
+
+      // Restore the CSV file
+      var prefix = platform === 'instantly' ? 'inst' : (data.mode === 'warmup' ? 'slw' : 'sl');
+      var fnameEl = document.getElementById(prefix + '-filename');
+      var startBtn = document.getElementById(prefix + '-start-btn');
+      if (data.csv_exists && data.csv_path) {
+        reuseCsvPath[prefix] = data.csv_path;
+        csvFiles[prefix] = null;  // clear any previously picked fresh file
+        if (fnameEl) fnameEl.textContent = '↻ Reusing: ' + (data.csv_name || 'previous CSV');
+        if (startBtn) startBtn.disabled = false;
+      } else {
+        reuseCsvPath[prefix] = null;
+        if (fnameEl) fnameEl.textContent = (data.csv_name ? '⚠ Previous CSV (' + data.csv_name + ') no longer on disk — pick again' : '');
+      }
+
+      alert('Settings restored. ' +
+        (data.csv_exists ? 'CSV pre-selected — click Start when ready.' : 'Please pick a CSV and click Start.'));
+    })
+    .catch(function(e) { alert('Rerun failed: ' + e); });
+}
+function clearHistory() {
+  if (!confirm('Delete all history?')) return;
+  fetch('/api/history/clear', { method: 'POST' }).then(function() { loadHistory(); });
+}
+
+/* ═══════════════════════════════════════════════════════
+   UTILS
+   ═══════════════════════════════════════════════════════ */
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+// Drag-over styling
+document.querySelectorAll('.file-drop').forEach(function(el) {
+  el.addEventListener('dragover', function(e) { e.preventDefault(); el.classList.add('dragover'); });
+  el.addEventListener('dragleave', function() { el.classList.remove('dragover'); });
+  el.addEventListener('drop', function() { el.classList.remove('dragover'); });
+});
+</script>
+</body>
+</html>

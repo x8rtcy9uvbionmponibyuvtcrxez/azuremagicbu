@@ -1,35 +1,58 @@
 # ──────────────────────────────────────────────────────────────
-# Dockerfile.uploader — Python + Selenium (Browserless remote Chrome)
+# Dockerfile.uploader — email-uploader (Flask + Selenium + Chromium)
 #
-# Runs the FastAPI uploader service. Chrome is NOT installed here —
-# it connects to a separate Browserless service via RemoteWebDriver.
-# Set BROWSERLESS_URL env var to point to the Browserless service.
+# The bulletproofed uploader that runs Microsoft OAuth flows through
+# headless Chromium to push mailboxes into Instantly or Smartlead.
+# Activates residential proxy when PROXY_URL/PROXY_USER/PROXY_PASS are
+# set (via IPRoyal) — same code runs locally on a Mac without them.
+#
+# Migrated from the standalone ~/email-uploader repo into the azure
+# monorepo so provisioning + upload ship as one project.
 # ──────────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
+        chromium chromium-driver \
+        fonts-liberation libnss3 libxcomposite1 libxdamage1 libxfixes3 \
+        libxkbcommon0 libxrandr2 libgbm1 libasound2 libatk-bridge2.0-0 \
+        libatk1.0-0 libcups2 libdbus-1-3 libdrm2 libgtk-3-0 libnspr4 \
+        libxshmfence1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_BIN=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver \
+    HEADLESS=1 \
+    PORT=5050 \
+    DATA_DIR=/app/data \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# ── Python deps ───────────────────────────────────────────────
+# Pre-create DATA_DIR so a Railway volume mount lands on a writable path.
+RUN mkdir -p /app/data /app/data/uploads
+
+# Python deps first — cached layer, invalidates only when requirements change.
 COPY uploader-service/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy upload scripts ──────────────────────────────────────
-# Note: "Uploaders " directory has a trailing space in its name
-COPY ["Uploaders /smartlead-uploader/sl-python.py",   "/app/scripts/smartlead/sl-python.py"]
-COPY ["Uploaders /smartlead-uploader/sl-complete.py",  "/app/scripts/smartlead/sl-complete.py"]
-COPY ["Uploaders /instantly-uploader-multi-workspace/upload.py", "/app/scripts/instantly/upload.py"]
-COPY ["Uploaders /instantly-uploader-multi-workspace/config.py", "/app/scripts/instantly/config.py"]
+# App code.
+COPY uploader-service/app.py ./app.py
+COPY uploader-service/templates ./templates
+COPY uploader-service/static ./static
 
-# ── Copy service code ────────────────────────────────────────
-COPY uploader-service/server.py ./server.py
+# Railway injects PORT dynamically; gunicorn respects $PORT below.
+EXPOSE 5050
 
-ENV SCRIPTS_DIR=/app/scripts
-ENV PYTHONUNBUFFERED=1
-
-EXPOSE 3098
-
-CMD ["python3", "server.py"]
+# Production: gunicorn with 1 worker + 4 gthread threads.
+# CRITICAL: workers=1 because the in-memory `jobs` dict + background
+# Selenium threads must live inside ONE process. Threads handle HTTP
+# concurrency for the UI + status polling. Timeout 300s so a large CSV
+# upload on POST /api/start doesn't get killed mid-request.
+CMD gunicorn app:app \
+    --bind 0.0.0.0:${PORT:-5050} \
+    --workers 1 \
+    --threads 4 \
+    --worker-class gthread \
+    --timeout 300 \
+    --access-logfile - \
+    --error-logfile -

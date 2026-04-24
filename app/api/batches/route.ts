@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { parse } from "csv-parse/sync";
 import { z } from "zod";
+import type { UploaderEsp } from "@prisma/client";
 
 import { encryptSecret, ensureEncryptionKey } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
@@ -13,6 +14,82 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const fileFieldName = "file";
+
+type UploaderConfig = {
+  esp: UploaderEsp | null;
+  autoTrigger: boolean;
+  workers: number;
+  instantlyEmail: string | null;
+  instantlyPassword: string | null;
+  instantlyV1Key: string | null;
+  instantlyV2Key: string | null;
+  instantlyWorkspace: string | null;
+  instantlyApiVersion: "v1" | "v2";
+  smartleadApiKey: string | null;
+  smartleadLoginUrl: string | null;
+};
+
+function parseUploaderConfig(formData: FormData): { cfg: UploaderConfig; error?: string } {
+  const enabled = formData.get("uploader_enabled") === "1";
+  const cfg: UploaderConfig = {
+    esp: null,
+    autoTrigger: false,
+    workers: 2,
+    instantlyEmail: null,
+    instantlyPassword: null,
+    instantlyV1Key: null,
+    instantlyV2Key: null,
+    instantlyWorkspace: null,
+    instantlyApiVersion: "v1",
+    smartleadApiKey: null,
+    smartleadLoginUrl: null
+  };
+
+  if (!enabled) {
+    return { cfg };
+  }
+
+  const espRaw = (formData.get("uploader_esp") as string | null)?.trim() || "";
+  if (espRaw !== "instantly" && espRaw !== "smartlead") {
+    return { cfg, error: "uploader_esp must be 'instantly' or 'smartlead' when uploader_enabled=1" };
+  }
+  cfg.esp = espRaw;
+  cfg.autoTrigger = true;
+
+  const workersRaw = Number(formData.get("uploader_workers") || "2");
+  cfg.workers = Math.max(1, Math.min(5, Number.isFinite(workersRaw) ? Math.round(workersRaw) : 2));
+
+  if (cfg.esp === "instantly") {
+    cfg.instantlyEmail = (formData.get("instantly_email") as string | null)?.trim() || null;
+    cfg.instantlyPassword = (formData.get("instantly_password") as string | null)?.trim() || null;
+    cfg.instantlyV1Key = (formData.get("instantly_v1_key") as string | null)?.trim() || null;
+    cfg.instantlyV2Key = (formData.get("instantly_v2_key") as string | null)?.trim() || null;
+    cfg.instantlyWorkspace = (formData.get("instantly_workspace") as string | null)?.trim() || null;
+    const apiVersion = (formData.get("instantly_api_version") as string | null)?.trim() || "v1";
+    cfg.instantlyApiVersion = apiVersion === "v2" ? "v2" : "v1";
+
+    if (!cfg.instantlyEmail || !cfg.instantlyPassword) {
+      return { cfg, error: "Instantly email + password are required when uploader_esp=instantly" };
+    }
+    if (!cfg.instantlyV1Key && !cfg.instantlyV2Key) {
+      return { cfg, error: "At least one Instantly API key (v1 or v2) is required" };
+    }
+    if (cfg.instantlyApiVersion === "v2" && !cfg.instantlyV2Key) {
+      return { cfg, error: "instantly_api_version=v2 requires instantly_v2_key" };
+    }
+  } else {
+    cfg.smartleadApiKey = (formData.get("smartlead_api_key") as string | null)?.trim() || null;
+    cfg.smartleadLoginUrl = (formData.get("smartlead_login_url") as string | null)?.trim() || null;
+    if (!cfg.smartleadApiKey) {
+      return { cfg, error: "Smartlead API key is required when uploader_esp=smartlead" };
+    }
+    if (!cfg.smartleadLoginUrl) {
+      return { cfg, error: "Smartlead Microsoft OAuth login URL is required when uploader_esp=smartlead" };
+    }
+  }
+
+  return { cfg };
+}
 
 export async function POST(request: Request) {
   let formData: FormData;
@@ -128,12 +205,39 @@ export async function POST(request: Request) {
     );
   }
 
+  const { cfg: uploaderCfg, error: uploaderError } = parseUploaderConfig(formData);
+  if (uploaderError) {
+    return NextResponse.json(
+      { error: "Uploader config invalid.", details: uploaderError },
+      { status: 422 }
+    );
+  }
+
   try {
     const batch = await prisma.batch.create({
       data: {
         status: "uploading",
         totalCount: parsedTenants.length,
         completedCount: 0,
+        uploaderEsp: uploaderCfg.esp,
+        uploaderAutoTrigger: uploaderCfg.autoTrigger,
+        uploaderWorkers: uploaderCfg.workers,
+        instantlyEmail: uploaderCfg.instantlyEmail,
+        instantlyPassword: uploaderCfg.instantlyPassword
+          ? encryptSecret(uploaderCfg.instantlyPassword)
+          : null,
+        instantlyV1Key: uploaderCfg.instantlyV1Key
+          ? encryptSecret(uploaderCfg.instantlyV1Key)
+          : null,
+        instantlyV2Key: uploaderCfg.instantlyV2Key
+          ? encryptSecret(uploaderCfg.instantlyV2Key)
+          : null,
+        instantlyWorkspace: uploaderCfg.instantlyWorkspace,
+        instantlyApiVersion: uploaderCfg.instantlyApiVersion,
+        smartleadApiKey: uploaderCfg.smartleadApiKey
+          ? encryptSecret(uploaderCfg.smartleadApiKey)
+          : null,
+        smartleadLoginUrl: uploaderCfg.smartleadLoginUrl,
         tenants: {
           create: parsedTenants.map((tenant) => ({
             tenantName: tenant.tenantName,
@@ -176,6 +280,41 @@ export async function POST(request: Request) {
         })
       )
     );
+
+    // Batch-level event: record whether auto-upload is wired for this batch.
+    await logTenantEvent({
+      batchId: batch.id,
+      eventType: "batch_submitted",
+      message: uploaderCfg.autoTrigger
+        ? `Batch of ${parsedTenants.length} tenant(s) submitted — auto-upload to ${uploaderCfg.esp} enabled`
+        : `Batch of ${parsedTenants.length} tenant(s) submitted — no auto-upload configured`,
+      details: {
+        tenantCount: parsedTenants.length,
+        uploaderEsp: uploaderCfg.esp,
+        uploaderAutoTrigger: uploaderCfg.autoTrigger,
+        uploaderWorkers: uploaderCfg.workers
+      }
+    });
+
+    // Slack — fire-and-forget. Never block the response on Slack.
+    void (async () => {
+      try {
+        const { slackNotify } = await import("@/lib/services/slack");
+        if (uploaderCfg.autoTrigger) {
+          await slackNotify(
+            `Batch submitted: ${parsedTenants.length} tenants, auto-upload to ${uploaderCfg.esp} (${uploaderCfg.workers} workers)`,
+            "info"
+          );
+        } else {
+          await slackNotify(
+            `Batch submitted: ${parsedTenants.length} tenants (no auto-upload)`,
+            "info"
+          );
+        }
+      } catch (error) {
+        console.error("[batches] slack notify failed:", error);
+      }
+    })();
 
     return NextResponse.json(
       {

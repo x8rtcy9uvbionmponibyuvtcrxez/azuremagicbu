@@ -4,10 +4,12 @@ import type { BatchStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
   TENANT_PROCESSING_QUEUE,
+  enqueueStartUpload,
   enqueueTenantProcessingJob,
   redisConnection,
   type TenantProcessingJobData
 } from "@/lib/queue";
+import { slackNotify } from "@/lib/services/slack";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { setupCloudflare } from "@/lib/services/cloudflare";
 import {
@@ -117,6 +119,7 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       select: {
         id: true,
         tenantName: true,
+        domain: true,
         status: true,
         zoneId: true,
         tenantId: true,
@@ -597,6 +600,40 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       message: "Tenant completed successfully"
     });
 
+    // Slack: tenant provisioned. Separate from uploader start so the user
+    // sees provisioning-vs-upload as distinct lifecycle moments.
+    void slackNotify(
+      `Tenant provisioned: ${tenant.tenantName} (${tenant.domain})`,
+      "info"
+    );
+
+    // Phase 5: if the batch opted in to auto-upload, hand off to the
+    // tenant-upload queue. The upload worker owns all retry/backoff/polling —
+    // we just enqueue and move on.
+    const batchCfg = await prisma.batch.findUnique({
+      where: { id: batchId },
+      select: { uploaderAutoTrigger: true, uploaderEsp: true }
+    });
+    if (batchCfg?.uploaderAutoTrigger && batchCfg.uploaderEsp) {
+      try {
+        await enqueueStartUpload({ tenantId: tenant.id, batchId });
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "uploader_enqueued",
+          message: `Upload enqueued (${batchCfg.uploaderEsp})`
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "uploader_enqueue_failed",
+          level: "error",
+          message: `Failed to enqueue upload: ${msg}`
+        });
+      }
+    }
   }
 
   await updateBatchStatus(batchId);

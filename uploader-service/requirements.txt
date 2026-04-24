@@ -1,7 +1,9 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
-selenium==4.27.1
-requests==2.32.3
-colorama==0.4.6
-webdriver-manager==4.0.2
+flask>=3.0
+selenium>=4.15
+requests>=2.31
+# Cloud-only: used when PROXY_URL env var is set. Optional for local runs.
+selenium-wire>=5.1
+# Pin blinker — newer versions break selenium-wire's Flask hook.
+blinker==1.7.0
+# Production WSGI server used by Dockerfile.uploader.
+gunicorn>=21.2

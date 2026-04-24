@@ -216,10 +216,51 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
   };
 }
 
-async function uploadCsvAndCreateBatch(csvContent: string): Promise<BatchResponse> {
+type UploaderConfigInput =
+  | { enabled: false }
+  | {
+      enabled: true;
+      esp: "instantly";
+      workers: number;
+      instantlyEmail: string;
+      instantlyPassword: string;
+      instantlyV1Key: string;
+      instantlyV2Key: string;
+      instantlyWorkspace: string;
+      instantlyApiVersion: "v1" | "v2";
+    }
+  | {
+      enabled: true;
+      esp: "smartlead";
+      workers: number;
+      smartleadApiKey: string;
+      smartleadLoginUrl: string;
+    };
+
+async function uploadCsvAndCreateBatch(
+  csvContent: string,
+  uploader: UploaderConfigInput = { enabled: false }
+): Promise<BatchResponse> {
   const file = new File([csvContent], `tenants-${Date.now()}.csv`, { type: "text/csv" });
   const formData = new FormData();
   formData.append("file", file);
+
+  if (uploader.enabled) {
+    formData.append("uploader_enabled", "1");
+    formData.append("uploader_esp", uploader.esp);
+    formData.append("uploader_workers", String(uploader.workers));
+    if (uploader.esp === "instantly") {
+      formData.append("instantly_email", uploader.instantlyEmail);
+      formData.append("instantly_password", uploader.instantlyPassword);
+      formData.append("instantly_v1_key", uploader.instantlyV1Key);
+      formData.append("instantly_v2_key", uploader.instantlyV2Key);
+      formData.append("instantly_workspace", uploader.instantlyWorkspace);
+      formData.append("instantly_api_version", uploader.instantlyApiVersion);
+    } else {
+      formData.append("smartlead_api_key", uploader.smartleadApiKey);
+      formData.append("smartlead_login_url", uploader.smartleadLoginUrl);
+    }
+  }
 
   const response = await fetch("/api/batches", {
     method: "POST",
@@ -246,6 +287,23 @@ export default function HomePage() {
   const [bulkRows, setBulkRows] = useState<BulkRow[]>([]);
   const [bulkFileName, setBulkFileName] = useState<string | null>(null);
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
+
+  // Uploader config — shown at the bottom of the bulk upload tab so the
+  // user configures Azure provisioning + ESP upload in a single form.
+  const [uploaderEnabled, setUploaderEnabled] = useState(false);
+  const [uploaderEsp, setUploaderEsp] = useState<"instantly" | "smartlead">("instantly");
+  const [uploaderWorkers, setUploaderWorkers] = useState(2);
+  const [showUploaderSecrets, setShowUploaderSecrets] = useState(false);
+  // Instantly-specific
+  const [instEmail, setInstEmail] = useState("");
+  const [instPassword, setInstPassword] = useState("");
+  const [instV1Key, setInstV1Key] = useState("");
+  const [instV2Key, setInstV2Key] = useState("");
+  const [instWorkspace, setInstWorkspace] = useState("");
+  const [instApiVersion, setInstApiVersion] = useState<"v1" | "v2">("v1");
+  // Smartlead-specific
+  const [slApiKey, setSlApiKey] = useState("");
+  const [slLoginUrl, setSlLoginUrl] = useState("");
 
   const form = useForm<SingleTenantFormValues>({
     resolver: zodResolver(singleTenantSchema),
@@ -376,9 +434,52 @@ export default function HomePage() {
     multiple: false
   });
 
+  const buildUploaderConfig = (): UploaderConfigInput | { error: string } => {
+    if (!uploaderEnabled) return { enabled: false };
+
+    if (uploaderEsp === "instantly") {
+      if (!instEmail.trim() || !instPassword) {
+        return { error: "Instantly login email and password are required" };
+      }
+      if (!instV1Key.trim() && !instV2Key.trim()) {
+        return { error: "At least one Instantly API key (v1 or v2) is required" };
+      }
+      if (instApiVersion === "v2" && !instV2Key.trim()) {
+        return { error: "Selected API version is v2 — enter the v2 API key" };
+      }
+      return {
+        enabled: true,
+        esp: "instantly",
+        workers: uploaderWorkers,
+        instantlyEmail: instEmail.trim(),
+        instantlyPassword: instPassword,
+        instantlyV1Key: instV1Key.trim(),
+        instantlyV2Key: instV2Key.trim(),
+        instantlyWorkspace: instWorkspace.trim(),
+        instantlyApiVersion: instApiVersion
+      };
+    }
+
+    if (!slApiKey.trim()) return { error: "Smartlead API key is required" };
+    if (!slLoginUrl.trim()) return { error: "Smartlead Microsoft OAuth login URL is required" };
+    return {
+      enabled: true,
+      esp: "smartlead",
+      workers: uploaderWorkers,
+      smartleadApiKey: slApiKey.trim(),
+      smartleadLoginUrl: slLoginUrl.trim()
+    };
+  };
+
   const processValidTenants = async () => {
     if (validBulkRows.length === 0) {
       setBulkStatus({ variant: "destructive", title: "No valid rows", detail: "Upload a CSV with at least one valid tenant." });
+      return;
+    }
+
+    const uploaderResult = buildUploaderConfig();
+    if ("error" in uploaderResult) {
+      setBulkStatus({ variant: "destructive", title: "Uploader config incomplete", detail: uploaderResult.error });
       return;
     }
 
@@ -399,7 +500,7 @@ export default function HomePage() {
         }))
       );
 
-      const result = await uploadCsvAndCreateBatch(csvContent);
+      const result = await uploadCsvAndCreateBatch(csvContent, uploaderResult);
       router.push(`/batch/${result.batch.id}`);
     } catch (error) {
       setBulkStatus({ variant: "destructive", title: "Processing failed", detail: error instanceof Error ? error.message : "Unexpected error" });
@@ -756,6 +857,148 @@ export default function HomePage() {
                   )}
 
                   <p className="text-sm text-muted-foreground">Summary: {validBulkRows.length} valid, {invalidBulkRows.length} error</p>
+                </div>
+
+                {/* Step 3: Optional uploader config. The "Process Valid Tenants"
+                    button below runs both Azure provisioning + this ESP upload
+                    step — tenants are uploaded one-by-one as provisioning
+                    finishes, so the user never needs a second run. */}
+                <div className="space-y-3 rounded-lg border p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <h3 className="text-sm font-medium">Step 3: ESP Auto-Upload (optional)</h3>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        As each tenant finishes provisioning, its mailboxes are auto-uploaded into your ESP via Microsoft OAuth. Leave off to just provision.
+                      </p>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={uploaderEnabled}
+                        onChange={(e) => setUploaderEnabled(e.target.checked)}
+                      />
+                      <span>{uploaderEnabled ? "Enabled" : "Disabled"}</span>
+                    </label>
+                  </div>
+
+                  {uploaderEnabled && (
+                    <div className="space-y-4">
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <label className="grid gap-1 text-sm">
+                          <span className="font-medium">ESP</span>
+                          <select
+                            className="rounded border bg-background px-3 py-2 text-sm"
+                            value={uploaderEsp}
+                            onChange={(e) => setUploaderEsp(e.target.value === "smartlead" ? "smartlead" : "instantly")}
+                          >
+                            <option value="instantly">Instantly</option>
+                            <option value="smartlead">Smartlead</option>
+                          </select>
+                        </label>
+                        <label className="grid gap-1 text-sm">
+                          <span className="font-medium">Parallel Workers (1–5)</span>
+                          <select
+                            className="rounded border bg-background px-3 py-2 text-sm"
+                            value={uploaderWorkers}
+                            onChange={(e) => setUploaderWorkers(Number(e.target.value))}
+                          >
+                            {[1, 2, 3, 4, 5].map((n) => (
+                              <option key={n} value={n}>
+                                {n} worker{n > 1 ? "s" : ""}{n === 2 ? " (default)" : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+
+                      {uploaderEsp === "instantly" ? (
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <label className="grid gap-1 text-sm md:col-span-2">
+                            <span className="font-medium">Instantly Login Email</span>
+                            <Input
+                              type="email"
+                              value={instEmail}
+                              onChange={(e) => setInstEmail(e.target.value)}
+                              placeholder="team@example.com"
+                            />
+                          </label>
+                          <label className="grid gap-1 text-sm md:col-span-2">
+                            <span className="font-medium">Instantly Login Password</span>
+                            <div className="flex gap-2">
+                              <Input
+                                type={showUploaderSecrets ? "text" : "password"}
+                                value={instPassword}
+                                onChange={(e) => setInstPassword(e.target.value)}
+                              />
+                              <Button type="button" variant="outline" onClick={() => setShowUploaderSecrets((v) => !v)}>
+                                {showUploaderSecrets ? "Hide" : "Show"}
+                              </Button>
+                            </div>
+                          </label>
+                          <label className="grid gap-1 text-sm">
+                            <span className="font-medium">API Version</span>
+                            <select
+                              className="rounded border bg-background px-3 py-2 text-sm"
+                              value={instApiVersion}
+                              onChange={(e) => setInstApiVersion(e.target.value === "v2" ? "v2" : "v1")}
+                            >
+                              <option value="v1">v1</option>
+                              <option value="v2">v2</option>
+                            </select>
+                          </label>
+                          <label className="grid gap-1 text-sm">
+                            <span className="font-medium">Workspace (leave blank for single)</span>
+                            <Input
+                              value={instWorkspace}
+                              onChange={(e) => setInstWorkspace(e.target.value)}
+                              placeholder="Inbox Nav"
+                            />
+                          </label>
+                          <label className="grid gap-1 text-sm">
+                            <span className="font-medium">API Key (v1)</span>
+                            <Input
+                              type={showUploaderSecrets ? "text" : "password"}
+                              value={instV1Key}
+                              onChange={(e) => setInstV1Key(e.target.value)}
+                            />
+                          </label>
+                          <label className="grid gap-1 text-sm">
+                            <span className="font-medium">API Key (v2)</span>
+                            <Input
+                              type={showUploaderSecrets ? "text" : "password"}
+                              value={instV2Key}
+                              onChange={(e) => setInstV2Key(e.target.value)}
+                              placeholder={instApiVersion === "v2" ? "required" : "optional"}
+                            />
+                          </label>
+                        </div>
+                      ) : (
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <label className="grid gap-1 text-sm md:col-span-2">
+                            <span className="font-medium">Smartlead API Key</span>
+                            <Input
+                              type={showUploaderSecrets ? "text" : "password"}
+                              value={slApiKey}
+                              onChange={(e) => setSlApiKey(e.target.value)}
+                            />
+                          </label>
+                          <label className="grid gap-1 text-sm md:col-span-2">
+                            <span className="font-medium">Microsoft OAuth Login URL</span>
+                            <Input
+                              type="url"
+                              value={slLoginUrl}
+                              onChange={(e) => setSlLoginUrl(e.target.value)}
+                              placeholder="https://login.microsoftonline.com/..."
+                            />
+                          </label>
+                        </div>
+                      )}
+
+                      <p className="text-xs text-muted-foreground">
+                        Credentials are encrypted at rest and only used for this batch. Upload progress for each tenant will appear on the batch progress page.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3">
