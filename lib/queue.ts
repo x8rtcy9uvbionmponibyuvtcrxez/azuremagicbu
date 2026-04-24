@@ -139,6 +139,22 @@ export async function enqueueTenantProcessingJob(
 // Tenant upload queue — drives the email-uploader Phase 5 handoff.
 // Separate from the main tenant-processing queue so uploader backpressure
 // (429s, long-running 20-40min Selenium jobs) can't starve provisioning.
+//
+// ⚠️  GOTCHA for one-off scripts / ad-hoc enqueueing:
+// BullMQ's defaultJobOptions are applied per-Queue-instance, NOT per-queue-
+// name. A fresh `new Queue("tenant-upload", { connection })` without passing
+// `defaultJobOptions` will hand back jobs with `attempts: 1` — meaning the
+// very first 429 (expected under MAX_CONCURRENT_JOBS backpressure) marks the
+// job permanently failed instead of backing off and retrying.
+//
+// This bit us on 2026-04-24 during the TN-003..006 manual kickoff: 2 of 4
+// jobs landed on the uploader while the other 2 got 429'd, then died with
+// attempts=1/1 because the one-off script instantiated a bare Queue.
+//
+// Always enqueue through `enqueueStartUpload` / `enqueuePollUpload` below,
+// OR — if you MUST construct a Queue manually — pass `uploadJobOptions`
+// explicitly as `defaultJobOptions`. Never trust the queue name alone to
+// apply retry semantics.
 // ─────────────────────────────────────────────────────────────────────────
 
 const uploadJobOptions: JobsOptions = {
