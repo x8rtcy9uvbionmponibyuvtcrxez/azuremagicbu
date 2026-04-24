@@ -89,6 +89,16 @@ model Tenant {
   smartleadFailedCount    Int      @default(0)
   instantlyConnectedCount Int      @default(0)
   instantlyFailedCount    Int      @default(0)
+  // Phase 5 (optional): email-uploader auto-trigger. Populated only when
+  // EMAIL_UPLOADER_URL env var is set on the worker. The uploader runs
+  // asynchronously — we store its job_id so the azure UI can link to its
+  // live log view and (eventually) a polling loop can update upload status.
+  uploaderJobId              String?
+  uploaderStatus             String?   // queued | running | completed | failed
+  uploaderTriggeredAt        DateTime?
+  uploaderCompletedAt        DateTime?
+  uploaderSucceededCount     Int      @default(0)
+  uploaderFailedCount        Int      @default(0)
   csvUrl            String?
   errorMessage      String?
   createdAt         DateTime     @default(now())

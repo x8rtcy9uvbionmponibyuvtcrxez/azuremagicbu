@@ -19,6 +19,7 @@ import {
   setupTenantPrep
 } from "@/lib/services/microsoft";
 import { connectMailboxesToSequencer } from "@/lib/services/sequencer";
+import { triggerInstantlyUpload } from "@/lib/services/emailUploader";
 import { logTenantEvent } from "@/lib/tenant-events";
 
 const TERMINAL_BATCH_STATUSES: BatchStatus[] = ["completed", "failed"];
@@ -597,6 +598,27 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       message: "Tenant completed successfully"
     });
 
+    // Phase 5 (optional): fire off the email-uploader if EMAIL_UPLOADER_URL
+    // is configured. Runs async — we don't block tenant_completed on the
+    // OAuth uploads landing. Safe to ignore failure: tenant is otherwise
+    // fully provisioned, this just adds mailboxes to Instantly for sending.
+    if (process.env.EMAIL_UPLOADER_URL) {
+      try {
+        const result = await triggerInstantlyUpload(tenant.id);
+        if (result.ok && !result.skipped) {
+          console.log(`✅ [Worker] email-uploader job ${result.jobId} triggered for ${tenant.tenantName}`);
+        } else if (result.skipped) {
+          console.log(`ℹ️ [Worker] email-uploader skipped: ${result.error || "already triggered"}`);
+        } else {
+          console.log(`⚠️ [Worker] email-uploader trigger failed: ${result.error}`);
+        }
+      } catch (err) {
+        // Swallow — this phase is additive, failure here doesn't un-complete the tenant.
+        console.log(
+          `⚠️ [Worker] triggerInstantlyUpload threw: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
   }
 
   await updateBatchStatus(batchId);
