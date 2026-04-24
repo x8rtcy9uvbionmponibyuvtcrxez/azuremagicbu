@@ -28,15 +28,78 @@ export interface TriggerUploadResult {
   error?: string;
 }
 
-function getUploaderConfig() {
-  const url = (process.env.EMAIL_UPLOADER_URL || "").trim();
-  const email = (process.env.INSTANTLY_EMAIL || "").trim();
-  const password = (process.env.INSTANTLY_PASSWORD || "").trim();
-  const v1Key = (process.env.INSTANTLY_V1_KEY || "").trim();
-  const v2Key = (process.env.INSTANTLY_V2_KEY || "").trim();
-  const workspace = (process.env.INSTANTLY_WORKSPACE || "").trim();
-  const workers = Number(process.env.EMAIL_UPLOADER_WORKERS || "2");
-  return { url, email, password, v1Key, v2Key, workspace, workers };
+interface ResolvedUploaderCreds {
+  url: string;
+  email: string;
+  password: string;
+  v1Key: string;
+  v2Key: string;
+  workspace: string;
+  workers: number;
+  source: "batch" | "env" | "mixed";
+}
+
+/**
+ * Try to decrypt a ciphertext; if decryption fails (e.g. the field was stored
+ * plaintext during dev), fall back to the raw value. This mirrors the same
+ * pattern used for Tenant.adminPassword elsewhere in the codebase.
+ */
+function safeDecrypt(value: string | null | undefined): string {
+  if (!value) return "";
+  try {
+    return decryptSecret(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Resolve Instantly creds for a batch. Priority:
+ *   1. batch.instantly* fields (per-batch override, multi-tenant)
+ *   2. INSTANTLY_* env vars (convenience default for single-customer deploys)
+ *   3. Null / empty → caller should skip
+ *
+ * EMAIL_UPLOADER_URL is always env-only (it's infrastructure, not credential).
+ * Never hardcode customer creds as service-wide env vars in production —
+ * use the batch fields. Env vars are just a dev/staging convenience.
+ */
+function resolveUploaderCreds(batch: {
+  instantlyEmail: string | null;
+  instantlyPassword: string | null;
+  instantlyV1Key: string | null;
+  instantlyV2Key: string | null;
+  instantlyWorkspace: string | null;
+  instantlyWorkers: number | null;
+}): ResolvedUploaderCreds {
+  const envEmail = (process.env.INSTANTLY_EMAIL || "").trim();
+  const envPass = (process.env.INSTANTLY_PASSWORD || "").trim();
+  const envV1 = (process.env.INSTANTLY_V1_KEY || "").trim();
+  const envV2 = (process.env.INSTANTLY_V2_KEY || "").trim();
+  const envWs = (process.env.INSTANTLY_WORKSPACE || "").trim();
+  const envWorkers = Number(process.env.EMAIL_UPLOADER_WORKERS || "2");
+
+  const batchEmail = (batch.instantlyEmail || "").trim();
+  const batchPass = safeDecrypt(batch.instantlyPassword);
+  const batchV1 = safeDecrypt(batch.instantlyV1Key);
+  const batchV2 = safeDecrypt(batch.instantlyV2Key);
+  const batchWs = (batch.instantlyWorkspace || "").trim();
+
+  const hasBatchCreds = Boolean(batchEmail && batchPass && (batchV1 || batchV2));
+  const hasEnvCreds = Boolean(envEmail && envPass && (envV1 || envV2));
+
+  const source: ResolvedUploaderCreds["source"] =
+    hasBatchCreds && hasEnvCreds ? "mixed" : hasBatchCreds ? "batch" : "env";
+
+  return {
+    url: (process.env.EMAIL_UPLOADER_URL || "").trim(),
+    email: batchEmail || envEmail,
+    password: batchPass || envPass,
+    v1Key: batchV1 || envV1,
+    v2Key: batchV2 || envV2,
+    workspace: batchWs || envWs,
+    workers: batch.instantlyWorkers ?? envWorkers,
+    source,
+  };
 }
 
 /**
@@ -72,17 +135,6 @@ function buildMailboxCsv(tenant: {
 }
 
 export async function triggerInstantlyUpload(tenantDbId: string): Promise<TriggerUploadResult> {
-  const cfg = getUploaderConfig();
-  if (!cfg.url) {
-    return { ok: true, skipped: true, error: "EMAIL_UPLOADER_URL not set" };
-  }
-  if (!cfg.email || !cfg.password || (!cfg.v1Key && !cfg.v2Key)) {
-    return {
-      ok: false,
-      error: "email-uploader env incomplete — need INSTANTLY_EMAIL, INSTANTLY_PASSWORD, INSTANTLY_V1_KEY or INSTANTLY_V2_KEY"
-    };
-  }
-
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantDbId },
     select: {
@@ -95,10 +147,41 @@ export async function triggerInstantlyUpload(tenantDbId: string): Promise<Trigge
       adminPassword: true,
       encryptionVersion: true,
       uploaderJobId: true,
-      uploaderStatus: true
-    }
+      uploaderStatus: true,
+      batch: {
+        select: {
+          instantlyEmail: true,
+          instantlyPassword: true,
+          instantlyV1Key: true,
+          instantlyV2Key: true,
+          instantlyWorkspace: true,
+          instantlyWorkers: true,
+          instantlyAutoUploadOptIn: true,
+        },
+      },
+    },
   });
   if (!tenant) return { ok: false, error: "Tenant not found" };
+
+  // Opt-in gate: per-batch choice. Default is OFF so existing batches are
+  // unaffected by the rollout. Operator sets this to true when they want
+  // azure to auto-trigger the uploader after provisioning.
+  if (!tenant.batch.instantlyAutoUploadOptIn) {
+    return { ok: true, skipped: true, error: "batch.instantlyAutoUploadOptIn is false" };
+  }
+
+  const cfg = resolveUploaderCreds(tenant.batch);
+  if (!cfg.url) {
+    return { ok: true, skipped: true, error: "EMAIL_UPLOADER_URL not set" };
+  }
+  if (!cfg.email || !cfg.password || (!cfg.v1Key && !cfg.v2Key)) {
+    return {
+      ok: false,
+      error: `email-uploader credentials missing (source=${cfg.source}). ` +
+        `Either set batch.instantly{Email,Password,V1Key,V2Key} per batch, or set ` +
+        `INSTANTLY_EMAIL / INSTANTLY_PASSWORD / INSTANTLY_V1_KEY or INSTANTLY_V2_KEY env vars as defaults.`,
+    };
+  }
 
   // Idempotency: skip if already queued/running/completed
   if (tenant.uploaderJobId && tenant.uploaderStatus && tenant.uploaderStatus !== "failed") {
@@ -176,7 +259,7 @@ export async function triggerInstantlyUpload(tenantDbId: string): Promise<Trigge
       batchId: tenant.batchId,
       tenantId: tenant.id,
       eventType: "uploader_triggered",
-      message: `email-uploader job ${data.job_id} started (${workers} workers)`
+      message: `email-uploader job ${data.job_id} started (${workers} workers, creds source=${cfg.source})`
     });
     return { ok: true, jobId: data.job_id };
   } catch (error) {

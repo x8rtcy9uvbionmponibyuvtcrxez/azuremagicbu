@@ -38,6 +38,20 @@ model Batch {
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
+  // Optional per-batch Instantly credentials for Phase 5 auto-upload.
+  // When populated, override any INSTANTLY_* env vars on the worker.
+  // Supports multi-tenant: different batches / different clients can each
+  // use their own Instantly account without redeploying the worker.
+  // Password + API keys are encrypted with the same scheme as
+  // Tenant.adminPassword (decryptSecret on read).
+  instantlyEmail           String?
+  instantlyPassword        String?    // encrypted
+  instantlyV1Key           String?    // encrypted
+  instantlyV2Key           String?    // encrypted
+  instantlyWorkspace       String?
+  instantlyWorkers         Int?       // 1-5, default 2 from env var
+  instantlyAutoUploadOptIn Boolean @default(false)  // opt-in to Phase 5 per batch
+
   tenants Tenant[]
   events  TenantEvent[]
 }
