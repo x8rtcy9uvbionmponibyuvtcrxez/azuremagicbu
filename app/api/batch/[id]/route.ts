@@ -36,7 +36,20 @@ export async function GET(_request: Request, { params }: Params) {
             errorMessage: true,
             setupConfirmed: true,
             createdAt: true,
-            updatedAt: true
+            updatedAt: true,
+            // Uploader tracking
+            uploaderJobId: true,
+            uploaderStatus: true,
+            uploaderQueuedAt: true,
+            uploaderStartedAt: true,
+            uploaderCompletedAt: true,
+            uploaderTotal: true,
+            uploaderSucceeded: true,
+            uploaderFailed: true,
+            uploaderSkipped: true,
+            uploaderWarnings: true,
+            uploaderErrorMessage: true,
+            uploaderLastLogAt: true
           }
         }
       }
@@ -75,7 +88,10 @@ export async function GET(_request: Request, { params }: Params) {
         status: finalBatch.status,
         totalCount: finalBatch.totalCount,
         completedCount,
-        createdAt: finalBatch.createdAt.toISOString()
+        createdAt: finalBatch.createdAt.toISOString(),
+        uploaderEsp: finalBatch.uploaderEsp,
+        uploaderAutoTrigger: finalBatch.uploaderAutoTrigger,
+        uploaderWorkers: finalBatch.uploaderWorkers
       },
       tenants: batch.tenants.map((tenant) => {
         let adminPasswordPlain = "";
@@ -89,7 +105,11 @@ export async function GET(_request: Request, { params }: Params) {
           adminPassword: adminPasswordPlain,
           authCodeExpiry: tenant.authCodeExpiry ? tenant.authCodeExpiry.toISOString() : null,
           createdAt: tenant.createdAt.toISOString(),
-          updatedAt: tenant.updatedAt.toISOString()
+          updatedAt: tenant.updatedAt.toISOString(),
+          uploaderQueuedAt: tenant.uploaderQueuedAt ? tenant.uploaderQueuedAt.toISOString() : null,
+          uploaderStartedAt: tenant.uploaderStartedAt ? tenant.uploaderStartedAt.toISOString() : null,
+          uploaderCompletedAt: tenant.uploaderCompletedAt ? tenant.uploaderCompletedAt.toISOString() : null,
+          uploaderLastLogAt: tenant.uploaderLastLogAt ? tenant.uploaderLastLogAt.toISOString() : null
         };
       })
     });

@@ -39,6 +39,9 @@ const processingStatuses = new Set<TenantStatus>([
   "sequencer_connect"
 ]);
 
+type UploaderEsp = "instantly" | "smartlead" | null;
+type UploaderStatus = "idle" | "queued" | "running" | "completed" | "failed";
+
 type BatchPayload = {
   batch: {
     id: string;
@@ -46,6 +49,9 @@ type BatchPayload = {
     totalCount: number;
     completedCount: number;
     createdAt: string;
+    uploaderEsp: UploaderEsp;
+    uploaderAutoTrigger: boolean;
+    uploaderWorkers: number;
   };
   tenants: Array<{
     id: string;
@@ -65,8 +71,42 @@ type BatchPayload = {
     setupConfirmed: boolean;
     createdAt: string;
     updatedAt: string;
+    uploaderJobId: string | null;
+    uploaderStatus: UploaderStatus;
+    uploaderQueuedAt: string | null;
+    uploaderStartedAt: string | null;
+    uploaderCompletedAt: string | null;
+    uploaderTotal: number | null;
+    uploaderSucceeded: number | null;
+    uploaderFailed: number | null;
+    uploaderSkipped: number | null;
+    uploaderWarnings: number | null;
+    uploaderErrorMessage: string | null;
+    uploaderLastLogAt: string | null;
   }>;
 };
+
+function uploaderStatusLabel(status: UploaderStatus): string {
+  switch (status) {
+    case "idle": return "Not started";
+    case "queued": return "Queued";
+    case "running": return "Uploading";
+    case "completed": return "Upload complete";
+    case "failed": return "Upload failed";
+    default: return status;
+  }
+}
+
+function uploaderStatusClasses(status: UploaderStatus): string {
+  switch (status) {
+    case "idle": return "bg-slate-100 text-slate-700 border-slate-200";
+    case "queued": return "bg-sky-100 text-sky-900 border-sky-200";
+    case "running": return "bg-blue-100 text-blue-900 border-blue-200";
+    case "completed": return "bg-emerald-100 text-emerald-900 border-emerald-200";
+    case "failed": return "bg-rose-100 text-rose-900 border-rose-200";
+    default: return "bg-slate-100 text-slate-700 border-slate-200";
+  }
+}
 
 type PageProps = {
   params: {
@@ -1055,6 +1095,62 @@ export default function BatchPage({ params }: PageProps) {
                     <Badge className="bg-blue-100 text-blue-900 border-blue-200">Currently processing</Badge>
                   ) : null}
                 </div>
+
+                {data.batch.uploaderAutoTrigger ? (
+                  <div className="rounded-lg border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium">ESP Upload</span>
+                        <span className="text-xs text-muted-foreground">
+                          ({data.batch.uploaderEsp || "—"})
+                        </span>
+                      </div>
+                      <Badge className={uploaderStatusClasses(tenant.uploaderStatus)}>
+                        {uploaderStatusLabel(tenant.uploaderStatus)}
+                      </Badge>
+                    </div>
+
+                    {tenant.uploaderStatus !== "idle" && tenant.uploaderTotal !== null ? (
+                      <div className="mt-2 space-y-1">
+                        <Progress
+                          value={
+                            tenant.uploaderTotal && tenant.uploaderTotal > 0
+                              ? Math.round(
+                                  (((tenant.uploaderSucceeded || 0) +
+                                    (tenant.uploaderFailed || 0) +
+                                    (tenant.uploaderSkipped || 0)) /
+                                    tenant.uploaderTotal) *
+                                    100
+                                )
+                              : 0
+                          }
+                          className="h-1.5"
+                        />
+                        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                          <span>✓ {tenant.uploaderSucceeded ?? 0}</span>
+                          <span>✗ {tenant.uploaderFailed ?? 0}</span>
+                          <span>↷ {tenant.uploaderSkipped ?? 0} skipped</span>
+                          {tenant.uploaderWarnings ? (
+                            <span>⚠ {tenant.uploaderWarnings} warn</span>
+                          ) : null}
+                          <span className="ml-auto">
+                            total {tenant.uploaderTotal ?? 0}
+                          </span>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {tenant.uploaderStatus === "failed" && tenant.uploaderErrorMessage ? (
+                      <p className="mt-2 text-xs text-rose-700">{tenant.uploaderErrorMessage}</p>
+                    ) : null}
+
+                    {tenant.uploaderJobId ? (
+                      <p className="mt-2 font-mono text-[11px] text-muted-foreground">
+                        job {tenant.uploaderJobId}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {tenant.status === "auth_pending" ? (
                   <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">

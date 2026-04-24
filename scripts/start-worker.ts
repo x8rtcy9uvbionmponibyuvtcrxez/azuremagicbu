@@ -8,8 +8,10 @@ config({ path: resolve(process.cwd(), ".env.local"), override: true });
 
 import { prisma } from "@/lib/prisma";
 import { startTenantProcessorWorker } from "@/lib/workers/processor";
+import { startTenantUploadWorker } from "@/lib/workers/uploadWorker";
 
 const worker = startTenantProcessorWorker();
+const uploadWorker = startTenantUploadWorker();
 
 let shuttingDown = false;
 
@@ -23,7 +25,13 @@ async function shutdown(signal: string) {
   try {
     await worker.close();
   } catch (error) {
-    console.error("[Worker] Error while closing worker:", error instanceof Error ? error.message : String(error));
+    console.error("[Worker] Error while closing tenant processor:", error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    await uploadWorker.close();
+  } catch (error) {
+    console.error("[Worker] Error while closing upload worker:", error instanceof Error ? error.message : String(error));
   }
 
   try {
@@ -51,4 +59,5 @@ process.on("uncaughtException", (error) => {
   console.error("[Worker] Uncaught exception:", error);
 });
 
-console.log("[Worker] Tenant processor worker started");
+console.log("[Worker] Tenant processor + upload workers started");
+void uploadWorker; // retained reference — prevents tree-shaking

@@ -17,3 +17,15 @@ yarn.lock
 .DS_Store
 
 .claude/
+
+# uploader-service runtime state — never commit history, uploads, venv
+uploader-service/.venv/
+uploader-service/__pycache__/
+uploader-service/.uploader.log
+uploader-service/.uploader.pid
+uploader-service/uploads/*
+!uploader-service/uploads/.gitkeep
+uploader-service/dist/
+**/__pycache__/
+*.pyc
+*.pyo

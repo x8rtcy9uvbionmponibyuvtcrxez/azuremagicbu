@@ -13,3 +13,16 @@ dev 3.db
 dev 4.db
 dev 5.db
 tsconfig.tsbuildinfo
+
+# uploader-service runtime artifacts — never bake into the image
+uploader-service/.venv
+uploader-service/__pycache__
+uploader-service/history.db
+uploader-service/.uploader.log
+uploader-service/.uploader.pid
+uploader-service/uploads/*
+!uploader-service/uploads/.gitkeep
+uploader-service/dist
+**/__pycache__
+*.pyc
+*.pyo

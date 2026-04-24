@@ -1,4 +1,5 @@
 import { startTenantProcessorWorker } from "@/lib/workers/processor";
+import { startTenantUploadWorker } from "@/lib/workers/uploadWorker";
 
 function isApiBootstrapEnabled(): boolean {
   // Keep cloud behavior explicit: bootstrap in dev by default, or when explicitly enabled.
@@ -14,5 +15,6 @@ export function maybeBootstrapWorkerFromApi(): { attempted: boolean; started: bo
   }
 
   startTenantProcessorWorker();
+  startTenantUploadWorker();
   return { attempted: true, started: true };
 }
