@@ -21,6 +21,15 @@ import type { UploaderEsp } from "@prisma/client";
 
 const UPLOADER_URL = (process.env.EMAIL_UPLOADER_URL || "").trim().replace(/\/$/, "");
 
+// Worker count per upload job. Clamped 1..5 at the uploader (more than ~2
+// Chromiums in a 1GB Hobby container OOMs). Bumping to a higher value when
+// upgrading Railway plan is a single env-var change — no code redeploy.
+const DEFAULT_WORKERS = (() => {
+  const raw = Number(process.env.EMAIL_UPLOADER_DEFAULT_WORKERS || "2");
+  if (!Number.isFinite(raw)) return 2;
+  return Math.max(1, Math.min(5, Math.round(raw)));
+})();
+
 export type TriggerResult =
   | { ok: true; jobId: string }
   | { ok: true; skipped: true; reason: string }
@@ -71,7 +80,6 @@ async function startInstantlyUpload(opts: {
     instantlyV2Key: string;
     instantlyWorkspace: string;
     instantlyApiVersion: string;
-    uploaderWorkers: number;
   };
 }): Promise<TriggerResult> {
   const { cfg } = opts;
@@ -85,7 +93,7 @@ async function startInstantlyUpload(opts: {
   const apiVersion = cfg.instantlyApiVersion === "v2" && cfg.instantlyV2Key ? "v2" : "v1";
   const apiKey = cfg.instantlyV1Key || cfg.instantlyV2Key;
   const mode = cfg.instantlyWorkspace ? "multi" : "single";
-  const workers = Math.max(1, Math.min(5, cfg.uploaderWorkers || 2));
+  const workers = DEFAULT_WORKERS;
 
   const form = new FormData();
   form.append("platform", "instantly");
@@ -198,7 +206,6 @@ export async function triggerUploadForTenant(tenantDbId: string): Promise<Trigge
         select: {
           uploaderEsp: true,
           uploaderAutoTrigger: true,
-          uploaderWorkers: true,
           instantlyEmail: true,
           instantlyPassword: true,
           instantlyV1Key: true,
@@ -248,8 +255,7 @@ export async function triggerUploadForTenant(tenantDbId: string): Promise<Trigge
         instantlyV1Key: safeDecrypt(tenant.batch.instantlyV1Key),
         instantlyV2Key: safeDecrypt(tenant.batch.instantlyV2Key),
         instantlyWorkspace: (tenant.batch.instantlyWorkspace || "").trim(),
-        instantlyApiVersion: tenant.batch.instantlyApiVersion || "v1",
-        uploaderWorkers: tenant.batch.uploaderWorkers
+        instantlyApiVersion: tenant.batch.instantlyApiVersion || "v1"
       }
     });
   } else {

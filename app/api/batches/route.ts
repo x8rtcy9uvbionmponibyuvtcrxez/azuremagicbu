@@ -18,7 +18,6 @@ const fileFieldName = "file";
 type UploaderConfig = {
   esp: UploaderEsp | null;
   autoTrigger: boolean;
-  workers: number;
   instantlyEmail: string | null;
   instantlyPassword: string | null;
   instantlyV1Key: string | null;
@@ -29,12 +28,17 @@ type UploaderConfig = {
   smartleadLoginUrl: string | null;
 };
 
+// Worker count is no longer a batch-level knob. lib/services/emailUploader.ts
+// reads EMAIL_UPLOADER_DEFAULT_WORKERS (fallback 2) at send time. The Batch
+// model still carries a uploaderWorkers column for back-compat with older rows
+// and to leave a per-batch override open for the future, but new batches land
+// with that column at its DB default and the runtime ignores it.
+
 function parseUploaderConfig(formData: FormData): { cfg: UploaderConfig; error?: string } {
   const enabled = formData.get("uploader_enabled") === "1";
   const cfg: UploaderConfig = {
     esp: null,
     autoTrigger: false,
-    workers: 2,
     instantlyEmail: null,
     instantlyPassword: null,
     instantlyV1Key: null,
@@ -55,9 +59,6 @@ function parseUploaderConfig(formData: FormData): { cfg: UploaderConfig; error?:
   }
   cfg.esp = espRaw;
   cfg.autoTrigger = true;
-
-  const workersRaw = Number(formData.get("uploader_workers") || "2");
-  cfg.workers = Math.max(1, Math.min(5, Number.isFinite(workersRaw) ? Math.round(workersRaw) : 2));
 
   if (cfg.esp === "instantly") {
     cfg.instantlyEmail = (formData.get("instantly_email") as string | null)?.trim() || null;
@@ -221,7 +222,9 @@ export async function POST(request: Request) {
         completedCount: 0,
         uploaderEsp: uploaderCfg.esp,
         uploaderAutoTrigger: uploaderCfg.autoTrigger,
-        uploaderWorkers: uploaderCfg.workers,
+        // uploaderWorkers intentionally omitted — backend default from
+        // EMAIL_UPLOADER_DEFAULT_WORKERS applies. Column stays at its DB
+        // default (currently 2) for legacy/back-compat reads.
         instantlyEmail: uploaderCfg.instantlyEmail,
         instantlyPassword: uploaderCfg.instantlyPassword
           ? encryptSecret(uploaderCfg.instantlyPassword)
@@ -291,8 +294,7 @@ export async function POST(request: Request) {
       details: {
         tenantCount: parsedTenants.length,
         uploaderEsp: uploaderCfg.esp,
-        uploaderAutoTrigger: uploaderCfg.autoTrigger,
-        uploaderWorkers: uploaderCfg.workers
+        uploaderAutoTrigger: uploaderCfg.autoTrigger
       }
     });
 
@@ -302,7 +304,7 @@ export async function POST(request: Request) {
         const { slackNotify } = await import("@/lib/services/slack");
         if (uploaderCfg.autoTrigger) {
           await slackNotify(
-            `Batch submitted: ${parsedTenants.length} tenants, auto-upload to ${uploaderCfg.esp} (${uploaderCfg.workers} workers)`,
+            `Batch submitted: ${parsedTenants.length} tenants, auto-upload to ${uploaderCfg.esp}`,
             "info"
           );
         } else {
