@@ -51,7 +51,6 @@ type BatchPayload = {
     createdAt: string;
     uploaderEsp: UploaderEsp;
     uploaderAutoTrigger: boolean;
-    uploaderWorkers: number;
   };
   tenants: Array<{
     id: string;

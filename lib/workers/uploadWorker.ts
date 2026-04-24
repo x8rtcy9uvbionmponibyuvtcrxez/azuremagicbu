@@ -102,12 +102,12 @@ async function handleStartUpload(job: Job<TenantUploadJobData, unknown, TenantUp
       tenantName: true,
       domain: true,
       inboxCount: true,
-      batch: { select: { uploaderEsp: true, uploaderWorkers: true } }
+      batch: { select: { uploaderEsp: true } }
     }
   });
 
   await slackNotify(
-    `Upload started: ${tenant?.tenantName} (${tenant?.domain}) → ${tenant?.batch.uploaderEsp}, ${tenant?.inboxCount} accounts, ${tenant?.batch.uploaderWorkers} workers`,
+    `Upload started: ${tenant?.tenantName} (${tenant?.domain}) → ${tenant?.batch.uploaderEsp}, ${tenant?.inboxCount} accounts`,
     "info"
   );
 

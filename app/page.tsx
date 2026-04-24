@@ -216,12 +216,15 @@ function validateBulkRow(row: Record<string, string>, rowNumber: number): BulkRo
   };
 }
 
+// The workers-per-job knob is intentionally NOT part of the UI anymore —
+// it's a backend concern. `lib/services/emailUploader.ts` resolves from the
+// EMAIL_UPLOADER_DEFAULT_WORKERS env var (default 2, right-sized for the
+// Railway Hobby 1GB RAM ceiling). Bumping to 5 is a single env-var change.
 type UploaderConfigInput =
   | { enabled: false }
   | {
       enabled: true;
       esp: "instantly";
-      workers: number;
       instantlyEmail: string;
       instantlyPassword: string;
       instantlyV1Key: string;
@@ -232,7 +235,6 @@ type UploaderConfigInput =
   | {
       enabled: true;
       esp: "smartlead";
-      workers: number;
       smartleadApiKey: string;
       smartleadLoginUrl: string;
     };
@@ -248,7 +250,6 @@ async function uploadCsvAndCreateBatch(
   if (uploader.enabled) {
     formData.append("uploader_enabled", "1");
     formData.append("uploader_esp", uploader.esp);
-    formData.append("uploader_workers", String(uploader.workers));
     if (uploader.esp === "instantly") {
       formData.append("instantly_email", uploader.instantlyEmail);
       formData.append("instantly_password", uploader.instantlyPassword);
@@ -289,10 +290,11 @@ export default function HomePage() {
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
 
   // Uploader config — shown at the bottom of the bulk upload tab so the
-  // user configures Azure provisioning + ESP upload in a single form.
-  const [uploaderEnabled, setUploaderEnabled] = useState(false);
-  const [uploaderEsp, setUploaderEsp] = useState<"instantly" | "smartlead">("instantly");
-  const [uploaderWorkers, setUploaderWorkers] = useState(2);
+  // user configures Azure provisioning + ESP upload in a single form. The
+  // ESP picker itself is the enable switch: "none" means skip ESP, anything
+  // else means upload to that ESP. No separate checkbox; fields are visible
+  // from page load so the user can fill them WHILE dropping the CSV.
+  const [uploaderEsp, setUploaderEsp] = useState<"none" | "instantly" | "smartlead">("instantly");
   const [showUploaderSecrets, setShowUploaderSecrets] = useState(false);
   // Instantly-specific
   const [instEmail, setInstEmail] = useState("");
@@ -435,7 +437,10 @@ export default function HomePage() {
   });
 
   const buildUploaderConfig = (): UploaderConfigInput | { error: string } => {
-    if (!uploaderEnabled) return { enabled: false };
+    // "none" = provision only, skip ESP upload. This is how users opt out of
+    // auto-upload now (the separate enabled checkbox got removed so there's
+    // only ever one toggle to reason about).
+    if (uploaderEsp === "none") return { enabled: false };
 
     if (uploaderEsp === "instantly") {
       if (!instEmail.trim() || !instPassword) {
@@ -450,7 +455,6 @@ export default function HomePage() {
       return {
         enabled: true,
         esp: "instantly",
-        workers: uploaderWorkers,
         instantlyEmail: instEmail.trim(),
         instantlyPassword: instPassword,
         instantlyV1Key: instV1Key.trim(),
@@ -465,7 +469,6 @@ export default function HomePage() {
     return {
       enabled: true,
       esp: "smartlead",
-      workers: uploaderWorkers,
       smartleadApiKey: slApiKey.trim(),
       smartleadLoginUrl: slLoginUrl.trim()
     };
@@ -859,58 +862,42 @@ export default function HomePage() {
                   <p className="text-sm text-muted-foreground">Summary: {validBulkRows.length} valid, {invalidBulkRows.length} error</p>
                 </div>
 
-                {/* Step 3: Optional uploader config. The "Process Valid Tenants"
-                    button below runs both Azure provisioning + this ESP upload
-                    step — tenants are uploaded one-by-one as provisioning
-                    finishes, so the user never needs a second run. */}
+                {/* Step 3: ESP Auto-Upload. The picker itself drives whether ESP
+                    is on — select "None" to provision only, or pick an ESP to
+                    reveal its credential fields. Fields render immediately so
+                    the user can fill creds WHILE dropping the CSV (one motion,
+                    not a two-step flow).
+
+                    Worker count is deliberately NOT in the UI. It's a backend
+                    concern (EMAIL_UPLOADER_DEFAULT_WORKERS env var, default 2 —
+                    right-sized for Railway Hobby's 1GB RAM ceiling, since each
+                    worker = one Chromium ≈ 400MB). */}
                 <div className="space-y-3 rounded-lg border p-4">
-                  <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <h3 className="text-sm font-medium">Step 3: ESP Auto-Upload (optional)</h3>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        As each tenant finishes provisioning, its mailboxes are auto-uploaded into your ESP via Microsoft OAuth. Leave off to just provision.
-                      </p>
-                    </div>
-                    <label className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={uploaderEnabled}
-                        onChange={(e) => setUploaderEnabled(e.target.checked)}
-                      />
-                      <span>{uploaderEnabled ? "Enabled" : "Disabled"}</span>
-                    </label>
+                  <div>
+                    <h3 className="text-sm font-medium">Step 3: ESP Auto-Upload</h3>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      As each tenant finishes provisioning, its mailboxes are auto-uploaded into the selected ESP via Microsoft OAuth. Pick &quot;None&quot; to just provision.
+                    </p>
                   </div>
 
-                  {uploaderEnabled && (
-                    <div className="space-y-4">
-                      <div className="grid gap-4 md:grid-cols-2">
-                        <label className="grid gap-1 text-sm">
-                          <span className="font-medium">ESP</span>
-                          <select
-                            className="rounded border bg-background px-3 py-2 text-sm"
-                            value={uploaderEsp}
-                            onChange={(e) => setUploaderEsp(e.target.value === "smartlead" ? "smartlead" : "instantly")}
-                          >
-                            <option value="instantly">Instantly</option>
-                            <option value="smartlead">Smartlead</option>
-                          </select>
-                        </label>
-                        <label className="grid gap-1 text-sm">
-                          <span className="font-medium">Parallel Workers (1–5)</span>
-                          <select
-                            className="rounded border bg-background px-3 py-2 text-sm"
-                            value={uploaderWorkers}
-                            onChange={(e) => setUploaderWorkers(Number(e.target.value))}
-                          >
-                            {[1, 2, 3, 4, 5].map((n) => (
-                              <option key={n} value={n}>
-                                {n} worker{n > 1 ? "s" : ""}{n === 2 ? " (default)" : ""}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      </div>
+                  <label className="grid gap-1 text-sm md:max-w-xs">
+                    <span className="font-medium">ESP</span>
+                    <select
+                      className="rounded border bg-background px-3 py-2 text-sm"
+                      value={uploaderEsp}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setUploaderEsp(v === "none" ? "none" : v === "smartlead" ? "smartlead" : "instantly");
+                      }}
+                    >
+                      <option value="none">None (provision only)</option>
+                      <option value="instantly">Instantly</option>
+                      <option value="smartlead">Smartlead</option>
+                    </select>
+                  </label>
 
+                  {uploaderEsp !== "none" && (
+                    <div className="space-y-4">
                       {uploaderEsp === "instantly" ? (
                         <div className="grid gap-4 md:grid-cols-2">
                           <label className="grid gap-1 text-sm md:col-span-2">

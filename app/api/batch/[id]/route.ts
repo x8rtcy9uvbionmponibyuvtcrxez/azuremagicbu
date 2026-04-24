@@ -90,8 +90,7 @@ export async function GET(_request: Request, { params }: Params) {
         completedCount,
         createdAt: finalBatch.createdAt.toISOString(),
         uploaderEsp: finalBatch.uploaderEsp,
-        uploaderAutoTrigger: finalBatch.uploaderAutoTrigger,
-        uploaderWorkers: finalBatch.uploaderWorkers
+        uploaderAutoTrigger: finalBatch.uploaderAutoTrigger
       },
       tenants: batch.tenants.map((tenant) => {
         let adminPasswordPlain = "";
