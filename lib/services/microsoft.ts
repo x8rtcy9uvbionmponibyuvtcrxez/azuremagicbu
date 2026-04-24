@@ -275,6 +275,89 @@ export async function callPowerShellService(endpoint: string, body: Record<strin
   throw new Error("callPowerShellService: unexpected exit from retry loop");
 }
 
+const GRAPH_BASE_URL_INTERNAL = "https://graph.microsoft.com/v1.0";
+
+/**
+ * Idempotently ensure the Global Administrator directoryRole is activated in
+ * the target tenant and return its id. If the role hasn't been activated yet
+ * (Microsoft lazy-activates roles on first use), we POST to /directoryRoles
+ * with the template id. Safe to call repeatedly.
+ */
+async function ensureGlobalAdminRoleActivated(accessToken: string): Promise<string | null> {
+  const roles = await graphRequest<{ value: Array<{ id: string; displayName: string }> }>(
+    accessToken,
+    "/directoryRoles"
+  );
+  const existing = roles.value?.find((role) => role.displayName === "Global Administrator");
+  if (existing) return existing.id;
+
+  const templates = await graphRequest<{ value: Array<{ id: string; displayName: string }> }>(
+    accessToken,
+    "/directoryRoleTemplates"
+  );
+  const template = templates.value?.find((t) => t.displayName === "Global Administrator");
+  if (!template) return null;
+
+  try {
+    const activated = await graphRequest<{ id: string }>(accessToken, "/directoryRoles", {
+      method: "POST",
+      body: JSON.stringify({ roleTemplateId: template.id })
+    });
+    console.log("✅ [Microsoft] Global Admin role activated:", activated.id);
+    return activated.id;
+  } catch (error) {
+    console.log(
+      "⚠️ [Microsoft] Could not activate Global Admin role:",
+      error instanceof Error ? error.message : String(error)
+    );
+    return null;
+  }
+}
+
+/**
+ * Grant Global Administrator to a user or service principal. Idempotent:
+ * Microsoft returns "already exists" when the principal already has the role,
+ * which we treat as success. Returns `{ ok: true }` on success/already-assigned,
+ * `{ ok: false, error }` when the role couldn't be found/activated or the grant
+ * failed for some other reason.
+ *
+ * This is best-effort by default — callers decide whether to abort or just warn.
+ * The SP grant during tenant prep is the critical one (needed for app-only
+ * Graph calls); the primary-user grant is for Instantly/Smartlead admin-consent
+ * UX and a missing grant can be retrofilled via /api/tenant/{id}/grant-primary-global-admin.
+ */
+export async function grantGlobalAdmin(
+  accessToken: string,
+  principal: { kind: "user" | "servicePrincipal"; id: string }
+): Promise<{ ok: boolean; alreadyAssigned?: boolean; error?: string; roleId?: string }> {
+  const roleId = await ensureGlobalAdminRoleActivated(accessToken);
+  if (!roleId) {
+    return { ok: false, error: "Global Administrator role could not be activated in this tenant" };
+  }
+
+  const refPath = principal.kind === "user" ? "users" : "servicePrincipals";
+  try {
+    await graphRequest<Record<string, unknown>>(accessToken, `/directoryRoles/${roleId}/members/$ref`, {
+      method: "POST",
+      body: JSON.stringify({
+        "@odata.id": `${GRAPH_BASE_URL_INTERNAL}/${refPath}/${principal.id}`
+      })
+    });
+    return { ok: true, alreadyAssigned: false, roleId };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    if (
+      normalized.includes("already exist") ||
+      normalized.includes("added already") ||
+      normalized.includes("one or more added object references already exist")
+    ) {
+      return { ok: true, alreadyAssigned: true, roleId };
+    }
+    return { ok: false, error: message, roleId };
+  }
+}
+
 export async function setupTenantPrep(tenantId: string): Promise<void> {
   try {
     const tenant = await prisma.tenant.findUnique({
@@ -408,57 +491,18 @@ export async function completeTenantPrep(tenantId: string, accessToken: string):
         }
       });
 
-      let globalAdminRoleId: string | null = null;
-
-      const roles = await graphRequest<{ value: Array<{ id: string; displayName: string }> }>(accessToken, "/directoryRoles");
-      const gaRole = roles.value?.find((role) => role.displayName === "Global Administrator");
-
-      if (gaRole) {
-        globalAdminRoleId = gaRole.id;
+      const assignResult = await grantGlobalAdmin(accessToken, {
+        kind: "servicePrincipal",
+        id: servicePrincipalId
+      });
+      if (assignResult.ok) {
+        console.log("✅ [Microsoft] Global Admin role assigned to service principal");
+        await prisma.tenant.update({
+          where: { id: tenantId },
+          data: { globalAdminAssigned: true }
+        });
       } else {
-        console.log("ℹ️ [Microsoft] Global Admin role not activated, activating from template...");
-        const templates = await graphRequest<{ value: Array<{ id: string; displayName: string }> }>(
-          accessToken,
-          "/directoryRoleTemplates"
-        );
-        const gaTemplate = templates.value?.find((template) => template.displayName === "Global Administrator");
-
-        if (gaTemplate) {
-          const activated = await graphRequest<{ id: string }>(accessToken, "/directoryRoles", {
-            method: "POST",
-            body: JSON.stringify({ roleTemplateId: gaTemplate.id })
-          });
-          globalAdminRoleId = activated.id;
-          console.log("✅ [Microsoft] Global Admin role activated:", globalAdminRoleId);
-        }
-      }
-
-      if (globalAdminRoleId) {
-        try {
-          await graphRequest<Record<string, unknown>>(accessToken, `/directoryRoles/${globalAdminRoleId}/members/$ref`, {
-            method: "POST",
-            body: JSON.stringify({
-              "@odata.id": `https://graph.microsoft.com/v1.0/servicePrincipals/${servicePrincipalId}`
-            })
-          });
-          console.log("✅ [Microsoft] Global Admin role assigned to service principal");
-
-          await prisma.tenant.update({
-            where: { id: tenantId },
-            data: { globalAdminAssigned: true }
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (message.includes("already exist") || message.includes("added already")) {
-            console.log("ℹ️ [Microsoft] SP already has Global Admin role");
-            await prisma.tenant.update({
-              where: { id: tenantId },
-              data: { globalAdminAssigned: true }
-            });
-          } else {
-            console.log("⚠️ [Microsoft] Could not assign Global Admin:", message);
-          }
-        }
+        console.log("⚠️ [Microsoft] Could not assign Global Admin to SP:", assignResult.error);
       }
     }
 
@@ -941,6 +985,30 @@ export async function createLicensedUser(
 
   // Centralised license allocation — see ensurePrimaryUserLicensed() for the 4-step algorithm.
   await ensurePrimaryUserLicensed(accessToken, userPrincipalName);
+
+  // Grant Global Administrator to the primary user. This is what lets the user
+  // self-consent during Instantly/Smartlead OAuth (their tenant-wide consent
+  // prompt only shows the "on behalf of organization" option if the signing-in
+  // user holds an admin role). Best-effort — failure here doesn't block
+  // provisioning; we can retroactively grant via /api/tenant/{id}/grant-primary-global-admin.
+  try {
+    const grantResult = await grantGlobalAdmin(accessToken, { kind: "user", id: userId });
+    if (grantResult.ok) {
+      console.log(
+        grantResult.alreadyAssigned
+          ? `ℹ️ [Microsoft] Primary user ${userPrincipalName} already had Global Admin`
+          : `✅ [Microsoft] Granted Global Admin to primary user ${userPrincipalName}`
+      );
+    } else {
+      console.log(
+        `⚠️ [Microsoft] Could not grant Global Admin to primary user ${userPrincipalName}: ${grantResult.error}`
+      );
+    }
+  } catch (error) {
+    console.log(
+      `⚠️ [Microsoft] Global Admin grant to primary user threw: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 
   await prisma.tenant.update({
     where: { id: tenantDbId },
