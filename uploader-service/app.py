@@ -515,29 +515,86 @@ def inst_fetch_existing_v2(api_key, log):
 
 
 def inst_check_v1(api_key, email, log):
+    """Verify a specific account is visible to the v1 API key.
+
+    Paginates through /api/v1/account/list (100 per page, up to 5000 accounts
+    = 50 pages). Early-exits the moment we find the target email.
+
+    HISTORICAL NOTE: earlier version hardcoded limit=10 which silently missed
+    newly-added accounts in workspaces with >10 existing accounts. Caused
+    every post-OAuth check to return False in large workspaces, which made
+    inst_add_account retry up to 3 times per account — burning ~2 min per
+    account (Instantly dedupes by email so duplicates do not land, but it
+    wastes enormous time + looks like everything is failing).
+    """
     try:
-        r = http_req.get(
-            "https://api.instantly.ai/api/v1/account/list",
-            params={"api_key": api_key, "limit": 10, "skip": 0}, timeout=30,
-        )
-        if r.status_code == 200:
+        skip = 0
+        while True:
+            r = http_req.get(
+                "https://api.instantly.ai/api/v1/account/list",
+                params={"api_key": api_key, "limit": 100, "skip": skip},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                log(f"V1 check HTTP {r.status_code}")
+                return False
             data = r.json()
             accts = data.get("accounts", data) if isinstance(data, dict) else data
-            return any(a.get("email", "").lower() == email.lower() for a in accts)
+            if not accts:
+                return False
+            if any(a.get("email", "").lower() == email.lower() for a in accts):
+                return True
+            if len(accts) < 100:
+                return False
+            skip += 100
+            # Safety cap. Shouldn't matter for normal customers, but keeps a
+            # runaway pagination loop from DoS'ing the Instantly API.
+            if skip >= 5000:
+                log(f"V1 check: hit 5000-account pagination cap while searching for {email}")
+                return False
     except Exception as e:
         log(f"V1 check error: {e}")
     return False
 
 
 def inst_check_v2(api_key, email, log):
+    """Verify a specific account via Instantly's direct-lookup endpoint.
+
+    Primary path: GET /api/v2/accounts/{email} — O(1), no pagination needed.
+    Falls back to a paginated /api/v2/accounts scan if the direct lookup
+    returns a non-2xx, non-404 status (so a transient 5xx doesn't silently
+    claim the account is missing).
+    """
     hdrs = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        r = http_req.get(
+            f"https://api.instantly.ai/api/v2/accounts/{email}",
+            headers=hdrs,
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return True
+        if r.status_code == 404:
+            return False
+        # 5xx / 429 / 401 — fall through to paginated list rather than
+        # silently declaring a not-found.
+        log(f"V2 direct-lookup HTTP {r.status_code}, falling back to list")
+    except Exception as e:
+        log(f"V2 direct-lookup error (fallback to list): {e}")
+
     cursor = None
     try:
-        for _ in range(5):
+        # Safety cap: 50 pages × 100 = 5000 accounts (matches v1 fix).
+        for _ in range(50):
             p = {"limit": 100}
             if cursor:
                 p["starting_after"] = cursor
-            r = http_req.get("https://api.instantly.ai/api/v2/accounts", headers=hdrs, params=p, timeout=30)
+            r = http_req.get(
+                "https://api.instantly.ai/api/v2/accounts",
+                headers=hdrs,
+                params=p,
+                timeout=30,
+            )
             if r.status_code != 200:
                 break
             data = r.json()
@@ -549,7 +606,7 @@ def inst_check_v2(api_key, email, log):
                 break
             cursor = nsa
     except Exception as e:
-        log(f"V2 check error: {e}")
+        log(f"V2 list fallback error: {e}")
     return False
 
 
@@ -1193,7 +1250,22 @@ def run_instantly_job(job):
             except Exception as e:
                 job.log(f"Reconcile non-fatal: {e}")
 
-        job.finish("cancelled" if job.should_stop else "completed")
+        # Finish disposition logic — the historical default of always calling
+        # finish("completed") unless .should_stop masked catastrophic outcomes
+        # like "every worker aborted on workspace-switch failure so we did
+        # zero work but technically reached the end of the function". That
+        # looked like a green run to the azure poller. Flag it as failed if
+        # the job had accounts to process but processed none.
+        if job.should_stop:
+            job.finish("cancelled")
+        elif job.total > 0 and job.processed == 0:
+            job.log(
+                "⚠ Job ran end-to-end without processing any accounts "
+                "(workers likely aborted during setup) — marking FAILED"
+            )
+            job.finish("failed")
+        else:
+            job.finish("completed")
 
     except Exception as e:
         job.log(f"Fatal error: {e}")
