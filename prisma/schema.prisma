@@ -119,6 +119,14 @@ model Tenant {
   smartleadFailedCount    Int      @default(0)
   instantlyConnectedCount Int      @default(0)
   instantlyFailedCount    Int      @default(0)
+  // Phase 4.5: Profile photos (applied via Graph PUT /users/{id}/photo/$value)
+  // Operator uploads one photo per persona name (parsed from inboxNames),
+  // worker matches Mailbox.displayName → personaName and PUTs the binary.
+  // Auto-fires between mailbox creation and ESP upload when all personas
+  // have photos; manual trigger always available.
+  profilePhotosApplied    Boolean  @default(false)
+  profilePhotosCompleted  Int?
+  profilePhotosFailed     Int?
   csvUrl            String?
   errorMessage      String?
   // Phase 5: email-uploader tracking
@@ -139,10 +147,34 @@ model Tenant {
 
   batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
   events TenantEvent[]
+  personas TenantPersona[]
 
   @@index([batchId, status])
   @@index([domain])
   @@index([uploaderStatus])
+}
+
+model TenantPersona {
+  // One row per unique inboxName for a tenant. Holds the persona's profile
+  // photo as raw bytes (Postgres BYTEA) plus apply state. The applyPhotos
+  // worker matches Mailbox.displayName == personaName and PUTs photoData
+  // to /users/{userId}/photo/$value via Microsoft Graph.
+  id            String    @id @default(cuid())
+  tenantId      String
+  personaName   String
+  photoData     Bytes?
+  photoMime     String?
+  photoSize     Int?
+  photoApplied  Boolean   @default(false)
+  applyError    String?
+  appliedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  tenant        Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, personaName])
+  @@index([tenantId])
 }
 
 model TenantEvent {

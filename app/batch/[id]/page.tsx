@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { TenantProfilePhotos } from "@/components/TenantProfilePhotos";
 import { extractApiError, parseJsonResponse } from "@/lib/http-client";
 
 type BatchStatus = "uploading" | "processing" | "completed" | "failed";
@@ -1094,6 +1095,8 @@ export default function BatchPage({ params }: PageProps) {
                     <Badge className="bg-blue-100 text-blue-900 border-blue-200">Currently processing</Badge>
                   ) : null}
                 </div>
+
+                <TenantProfilePhotos tenantId={tenant.id} />
 
                 {data.batch.uploaderAutoTrigger ? (
                   <div className="rounded-lg border p-3">

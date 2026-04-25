@@ -20,6 +20,7 @@ import {
   setupSharedMailboxes,
   setupTenantPrep
 } from "@/lib/services/microsoft";
+import { applyPhotosToTenant, extractPersonas } from "@/lib/services/profilePhotos";
 import { connectMailboxesToSequencer } from "@/lib/services/sequencer";
 import { logTenantEvent } from "@/lib/tenant-events";
 
@@ -606,6 +607,53 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
       `Tenant provisioned: ${tenant.tenantName} (${tenant.domain})`,
       "info"
     );
+
+    // Phase 4.5: profile photos. Idempotent re-extraction of personas (catches
+    // any inboxNames edits since batch submission), then auto-apply if EVERY
+    // persona has a photo uploaded. Partial sets fall through to manual apply
+    // via POST /api/tenant/{id}/apply-photos. Failures are logged but never
+    // block the ESP-upload handoff — photos are best-effort polish, not a
+    // gate on getting accounts into Instantly/Smartlead.
+    try {
+      const personas = await extractPersonas(tenant.id);
+      if (personas.length > 0 && personas.every((p) => p.hasPhoto)) {
+        const result = await applyPhotosToTenant(tenant.id);
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "profile_photos_applied",
+          message: `Profile photos applied: ${result.applied}/${result.applied + result.failed + result.skipped} mailboxes (failed=${result.failed}, skipped=${result.skipped})`,
+          details: {
+            applied: result.applied,
+            failed: result.failed,
+            skipped: result.skipped
+          }
+        });
+        if (result.applied > 0) {
+          void slackNotify(
+            `Profile photos applied: ${tenant.tenantName} — ${result.applied} mailboxes`,
+            result.failed > 0 ? "warn" : "info"
+          );
+        }
+      } else if (personas.length > 0) {
+        const missing = personas.filter((p) => !p.hasPhoto).map((p) => p.personaName);
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "profile_photos_skipped",
+          message: `Auto-apply skipped — ${missing.length}/${personas.length} persona(s) have no photo: ${missing.join(", ")}. Operator can upload + click "Apply Photos" later.`
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await logTenantEvent({
+        batchId,
+        tenantId: tenant.id,
+        eventType: "profile_photos_failed",
+        level: "error",
+        message: `Profile photo apply failed: ${message}`
+      });
+    }
 
     // Phase 5: if the batch opted in to auto-upload, hand off to the
     // tenant-upload queue. The upload worker owns all retry/backoff/polling —

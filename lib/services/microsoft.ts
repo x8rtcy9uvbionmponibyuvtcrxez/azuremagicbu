@@ -88,7 +88,7 @@ export async function requestTenantGraphToken(organizationId: string): Promise<s
   return data.access_token;
 }
 
-async function graphRequest<T>(token: string, endpoint: string, init: RequestInit = {}): Promise<T> {
+export async function graphRequest<T>(token: string, endpoint: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${GRAPH_BASE_URL}${endpoint}`, {
     ...init,
     headers: {
