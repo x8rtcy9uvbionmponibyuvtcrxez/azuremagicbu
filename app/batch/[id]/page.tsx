@@ -1143,6 +1143,32 @@ export default function BatchPage({ params }: PageProps) {
                       <p className="mt-2 text-xs text-rose-700">{tenant.uploaderErrorMessage}</p>
                     ) : null}
 
+                    {/* Retry button: shown when the upload is in a terminal
+                        state AND either failed outright or completed with
+                        one or more accounts missing. Clicking re-enqueues
+                        start-upload for this tenant — the uploader's
+                        existing_set check at job start will fast-skip the
+                        accounts that are already in the ESP, so retry costs
+                        ~1 sec per already-landed account + ~30s per missing
+                        one. Safe to click multiple times; the in-flight
+                        check blocks double-triggers. */}
+                    {(tenant.uploaderStatus === "failed" ||
+                      (tenant.uploaderStatus === "completed" && (tenant.uploaderFailed || 0) > 0)) ? (
+                      <div className="mt-3">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={actionBusy[`${tenant.id}:retry-upload`]}
+                          onClick={() => void callTenantAction(tenant.id, "retry-upload")}
+                        >
+                          <RefreshCcw className="mr-1.5 h-3.5 w-3.5" />
+                          {actionBusy[`${tenant.id}:retry-upload`]
+                            ? "Retrying..."
+                            : `Retry upload${tenant.uploaderFailed ? ` (${tenant.uploaderFailed} missing)` : ""}`}
+                        </Button>
+                      </div>
+                    ) : null}
+
                     {tenant.uploaderJobId ? (
                       <p className="mt-2 font-mono text-[11px] text-muted-foreground">
                         job {tenant.uploaderJobId}

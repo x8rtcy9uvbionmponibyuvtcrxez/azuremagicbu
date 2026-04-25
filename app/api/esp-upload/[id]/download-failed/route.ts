@@ -1,11 +1,41 @@
+/**
+ * Standalone ESP upload — failed-accounts CSV download.
+ *
+ * Our uploader doesn't have a /failed-csv endpoint per job, but it does
+ * return the per-account state map via /api/status/{id}?detail=1. We
+ * filter for state="failed", correlate with the original CSV upload's
+ * email + password rows (preserved in account_status's "row" if present
+ * — though typically only email is exposed via account_status), and
+ * synthesize a CSV that mirrors what the original /jobs/{id}/failed-csv
+ * would have returned.
+ *
+ * Trade-off: account_status only exposes the email + state + reason.
+ * Without password, the CSV we return is "list of email addresses that
+ * failed" — useful for diagnostic / re-upload from a separate source,
+ * but not directly resubmittable without joining back to a stored
+ * password. For batch-flow uploads, the Retry Failed button on
+ * /batch/[id] is the better path because it has the original CSV via
+ * the persisted job state.
+ */
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { readFile } from "fs/promises";
-import { getEspRun } from "@/lib/esp-upload-store";
 
-const UPLOADER_URL = process.env.UPLOADER_SERVICE_URL || "";
+const UPLOADER_URL = (process.env.EMAIL_UPLOADER_URL || "").trim().replace(/\/$/, "");
+
+type AccountStatusEntry = {
+  state: string;
+  reason?: string;
+  ts: string;
+};
+
+type UploaderStatusResponse = {
+  job_id: string;
+  status: string;
+  account_status?: Record<string, AccountStatusEntry>;
+};
 
 export async function GET(
   _request: Request,
@@ -13,62 +43,57 @@ export async function GET(
 ) {
   const { id } = await params;
 
-  // ── Cloud mode: proxy to uploader micro-service ──────────
-  if (UPLOADER_URL) {
-    try {
-      const res = await fetch(`${UPLOADER_URL}/jobs/${id}/failed-csv`, {
-        cache: "no-store",
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        return NextResponse.json(
-          { error: data.detail || data.error || "No failed CSV available" },
-          { status: res.status }
-        );
-      }
-
-      const content = await res.text();
-      return new Response(content, {
-        headers: {
-          "Content-Type": "text/csv",
-          "Content-Disposition": `attachment; filename="failed_accounts.csv"`,
-        },
-      });
-    } catch (err) {
-      return NextResponse.json(
-        { error: err instanceof Error ? err.message : "Uploader service unreachable" },
-        { status: 502 }
-      );
-    }
+  if (!UPLOADER_URL) {
+    return NextResponse.json(
+      { error: "EMAIL_UPLOADER_URL is not configured" },
+      { status: 503 }
+    );
   }
 
-  // ── Local mode: read from in-memory store ────────────────
-  const run = getEspRun(id);
+  let res: Response;
+  try {
+    res = await fetch(`${UPLOADER_URL}/api/status/${id}?detail=1`, {
+      cache: "no-store"
+    });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Uploader unreachable" },
+      { status: 502 }
+    );
+  }
 
-  if (!run) {
+  if (res.status === 404) {
     return NextResponse.json({ error: "Run not found" }, { status: 404 });
   }
-
-  if (!run.failedCsvPath) {
+  if (!res.ok) {
     return NextResponse.json(
-      { error: "No failed accounts CSV available" },
+      { error: `Uploader HTTP ${res.status}` },
+      { status: res.status }
+    );
+  }
+
+  const data: UploaderStatusResponse = await res.json();
+  const accountStatus = data.account_status || {};
+
+  const failedRows: string[] = ["EmailAddress,Reason"];
+  for (const [email, entry] of Object.entries(accountStatus)) {
+    if (entry.state !== "failed") continue;
+    // CSV-escape the reason (commas, quotes).
+    const reason = (entry.reason || "").replace(/"/g, '""');
+    failedRows.push(`${email},"${reason}"`);
+  }
+
+  if (failedRows.length === 1) {
+    return NextResponse.json(
+      { error: "No failed accounts in this run" },
       { status: 404 }
     );
   }
 
-  try {
-    const content = await readFile(run.failedCsvPath, "utf-8");
-    return new Response(content, {
-      headers: {
-        "Content-Type": "text/csv",
-        "Content-Disposition": `attachment; filename="failed_accounts.csv"`,
-      },
-    });
-  } catch {
-    return NextResponse.json(
-      { error: "Failed CSV file not found on disk" },
-      { status: 404 }
-    );
-  }
+  return new Response(failedRows.join("\n") + "\n", {
+    headers: {
+      "Content-Type": "text/csv",
+      "Content-Disposition": `attachment; filename="failed_accounts_${id}.csv"`
+    }
+  });
 }

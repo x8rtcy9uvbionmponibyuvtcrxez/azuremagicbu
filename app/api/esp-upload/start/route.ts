@@ -1,63 +1,38 @@
+/**
+ * Standalone ESP upload — proxies to the email-uploader service.
+ *
+ * This is the manual one-off upload page (UI at /esp-upload), separate from
+ * the bulk-batch flow. Operator drops a CSV + creds, kicks off an upload
+ * without going through Azure provisioning. Useful for cleanup runs and
+ * for users who already have mailboxes provisioned elsewhere.
+ *
+ * Previously this route used a different env var (UPLOADER_SERVICE_URL)
+ * and a different protocol (/jobs/smartlead, /jobs/instantly) that nobody
+ * was on the other side of, plus a Python subprocess fallback that didn't
+ * work because Dockerfile.web doesn't bundle Python or Chromium. Both
+ * paths were dead code. This rewrite points the route at our actual
+ * uploader (EMAIL_UPLOADER_URL → /api/start) and translates the form
+ * fields between the two protocols.
+ */
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { writeFile, mkdir } from "fs/promises";
-import { join } from "path";
-import { randomUUID } from "crypto";
-import { tmpdir } from "os";
-import { createEspRun, maskKey, type EspType } from "@/lib/esp-upload-store";
-import { spawnSmartleadRun, spawnInstantlyRun } from "@/lib/esp-upload-spawn";
 
-const UPLOADER_URL = process.env.UPLOADER_SERVICE_URL || "";
+const UPLOADER_URL = (process.env.EMAIL_UPLOADER_URL || "").trim().replace(/\/$/, "");
 
-// ---------------------------------------------------------------------------
-// Cloud mode: proxy the request to the uploader micro-service
-// ---------------------------------------------------------------------------
-
-async function proxyToUploader(formData: FormData, esp: string): Promise<Response> {
-  const file = formData.get("file") as File;
-  const apiKey = (formData.get("apiKey") as string) || "";
-  const numWorkers = parseInt(formData.get("numWorkers") as string) || 4;
-
-  const body = new FormData();
-  body.append("file", file);
-  body.append("apiKey", apiKey);
-  body.append("numWorkers", String(numWorkers));
-
-  let endpoint: string;
-
-  if (esp === "smartlead") {
-    endpoint = `${UPLOADER_URL}/jobs/smartlead`;
-    body.append("loginUrl", (formData.get("loginUrl") as string) || "");
-  } else {
-    endpoint = `${UPLOADER_URL}/jobs/instantly`;
-    body.append("loginEmail", (formData.get("loginEmail") as string) || "");
-    body.append("loginPassword", (formData.get("loginPassword") as string) || "");
-    body.append("workspace", (formData.get("workspace") as string) || "");
-    body.append("apiVersion", (formData.get("apiVersion") as string) || "v1");
-    body.append("v2ApiKey", (formData.get("v2ApiKey") as string) || "");
-  }
-
-  const res = await fetch(endpoint, { method: "POST", body });
-  const data = await res.json();
-
-  if (!res.ok) {
+export async function POST(request: Request) {
+  if (!UPLOADER_URL) {
     return NextResponse.json(
-      { error: data.detail || data.error || "Uploader service error" },
-      { status: res.status }
+      {
+        error:
+          "EMAIL_UPLOADER_URL is not configured on this service. Set it to the internal uploader URL (e.g. http://uploader.railway.internal:5050) and redeploy."
+      },
+      { status: 503 }
     );
   }
 
-  // The uploader returns { jobId }, forward as { runId } (frontend expects this key)
-  return NextResponse.json({ runId: data.jobId });
-}
-
-// ---------------------------------------------------------------------------
-// Main handler
-// ---------------------------------------------------------------------------
-
-export async function POST(request: Request) {
   try {
     const formData = await request.formData();
     const esp = formData.get("esp") as string;
@@ -71,35 +46,20 @@ export async function POST(request: Request) {
 
     const file = formData.get("file") as File | null;
     if (!file) {
-      return NextResponse.json(
-        { error: "CSV file is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "CSV file is required" }, { status: 400 });
     }
 
     const apiKey = (formData.get("apiKey") as string) || "";
     if (!apiKey) {
-      return NextResponse.json(
-        { error: "API key is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "API key is required" }, { status: 400 });
     }
 
-    // ── Cloud mode: proxy to uploader micro-service ──────────
-    if (UPLOADER_URL) {
-      return proxyToUploader(formData, esp);
-    }
-
-    // ── Local mode: spawn Python subprocess directly ─────────
-
-    // Create temp working directory
-    const workingDir = join(tmpdir(), `esp-upload-${randomUUID()}`);
-    await mkdir(workingDir, { recursive: true });
-
-    // Write CSV to disk
-    const csvBuffer = Buffer.from(await file.arrayBuffer());
-    const csvPath = join(workingDir, "accounts.csv");
-    await writeFile(csvPath, csvBuffer);
+    // Build the form payload our uploader expects (POST /api/start). The
+    // field names differ from the legacy /jobs/* protocol — translate
+    // here so the UI can stay protocol-agnostic.
+    const body = new FormData();
+    body.append("csv_file", file);
+    body.append("api_key", apiKey);
 
     if (esp === "smartlead") {
       const loginUrl = (formData.get("loginUrl") as string) || "";
@@ -109,75 +69,55 @@ export async function POST(request: Request) {
           { status: 400 }
         );
       }
+      body.append("platform", "smartlead_upload");
+      body.append("login_url", loginUrl);
+    } else {
+      const loginEmail = (formData.get("loginEmail") as string) || "";
+      const loginPassword = (formData.get("loginPassword") as string) || "";
+      const workspace = (formData.get("workspace") as string) || "";
+      const apiVersion =
+        (formData.get("apiVersion") as string) === "v2" ? "v2" : "v1";
+      const v2ApiKey = (formData.get("v2ApiKey") as string) || "";
 
-      const run = createEspRun({
-        esp: "smartlead",
-        apiKeyMasked: maskKey(apiKey),
-        csvPath,
-        workingDir,
-        loginUrl,
-      });
+      if (!loginEmail || !loginPassword) {
+        return NextResponse.json(
+          { error: "Login email and password are required for Instantly" },
+          { status: 400 }
+        );
+      }
 
-      // Fire-and-forget
-      spawnSmartleadRun({
-        runId: run.id,
-        apiKey,
-        csvPath,
-        loginUrl,
-        workingDir,
-      });
-
-      return NextResponse.json({ runId: run.id });
+      body.append("platform", "instantly");
+      // Workspace blank = mode=single (skip the workspace switch step,
+      // upload to whatever the login lands on as default workspace).
+      body.append("mode", workspace ? "multi" : "single");
+      body.append("api_version", apiVersion);
+      body.append("v2_api_key", v2ApiKey);
+      body.append("instantly_email", loginEmail);
+      body.append("instantly_password", loginPassword);
+      body.append("workspace", workspace);
+      // workers comes from EMAIL_UPLOADER_DEFAULT_WORKERS on the uploader
+      // side (Railway env var). The legacy UI exposed a 1-5 dropdown but
+      // we hide it now — RAM ceiling on Hobby plan caps it at ~2 anyway.
     }
 
-    // Instantly
-    const loginEmail = (formData.get("loginEmail") as string) || "";
-    const loginPassword = (formData.get("loginPassword") as string) || "";
-    const workspace = (formData.get("workspace") as string) || "";
-    const apiVersion =
-      (formData.get("apiVersion") as string) === "v2" ? "v2" : "v1";
-    const v2ApiKey = (formData.get("v2ApiKey") as string) || "";
-    const numWorkers = Math.max(
-      1,
-      Math.min(5, parseInt(formData.get("numWorkers") as string) || 3)
-    );
+    const res = await fetch(`${UPLOADER_URL}/api/start`, { method: "POST", body });
+    const text = await res.text();
+    let data: { job_id?: string; status?: string; error?: string } = {};
+    try {
+      data = JSON.parse(text);
+    } catch {
+      /* non-JSON body — surface as raw error below */
+    }
 
-    if (!loginEmail || !loginPassword || !workspace) {
+    if (!res.ok || !data.job_id) {
       return NextResponse.json(
-        {
-          error:
-            "Login email, password, and workspace are required for Instantly",
-        },
-        { status: 400 }
+        { error: data.error || text.slice(0, 300) || `Uploader HTTP ${res.status}` },
+        { status: res.status >= 400 && res.status < 600 ? res.status : 502 }
       );
     }
 
-    const run = createEspRun({
-      esp: "instantly",
-      apiKeyMasked: maskKey(apiKey),
-      csvPath,
-      workingDir,
-      loginEmail,
-      workspace,
-      numWorkers,
-      apiVersion: apiVersion as "v1" | "v2",
-    });
-
-    // Fire-and-forget
-    spawnInstantlyRun({
-      runId: run.id,
-      apiKey,
-      v2ApiKey,
-      loginEmail,
-      loginPassword,
-      workspace,
-      csvPath,
-      apiVersion: apiVersion as "v1" | "v2",
-      numWorkers,
-      workingDir,
-    });
-
-    return NextResponse.json({ runId: run.id });
+    // The legacy frontend expects `runId`. Keep that contract.
+    return NextResponse.json({ runId: data.job_id });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });

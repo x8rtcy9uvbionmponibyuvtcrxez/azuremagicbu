@@ -781,8 +781,26 @@ def _wait_click(driver, by, value, timeout=10, retries=2, js=True, log=None):
 
 
 def _wait_type(driver, by, value, text, timeout=10, retries=2):
-    """Find + send_keys with NoneType-tolerant retries. Clears field first.
-    Returns True on success, False on timeout."""
+    """Find + type text into an input, tolerant of the headless Chromium
+    "NoneType has no attribute is_displayed" race that shows up under load.
+
+    Behavior, in order:
+      1. Wait for presence, clear, send_keys (standard Selenium path)
+      2. On NoneType/stale errors, retry up to `retries` times with a
+         short sleep — catches most transient failures
+      3. If send_keys keeps failing, fall back to the JS path: set the
+         element's .value directly and dispatch input/change events so
+         Angular/React state listeners see the change. Many Instantly /
+         Microsoft login pages wire their bindings to these events
+         rather than to raw send_keys keydown events, so JS often
+         succeeds where send_keys can't.
+      4. If EVERYTHING fails, log diagnostic context (element tag/class,
+         page URL) so we can post-mortem without a screenshot endpoint.
+         Returns False so the caller's own retry loop can fire.
+
+    Returns True on success, False on terminal failure.
+    """
+    last_exc = None
     for attempt in range(retries + 1):
         try:
             el = WebDriverWait(driver, timeout).until(
@@ -795,15 +813,61 @@ def _wait_type(driver, by, value, text, timeout=10, retries=2):
             el.send_keys(text)
             return True
         except TimeoutException:
+            # Element never appeared — no point retrying or JS-fallback.
             return False
         except Exception as e:
+            last_exc = e
             msg = str(e).lower()
             if "nonetype" in msg or "is_displayed" in msg or "stale" in msg:
                 if attempt < retries:
                     time.sleep(0.5)
                     continue
-            return False
-    return False
+            # Fall through to JS fallback rather than return False directly.
+            break
+
+    # JS fallback — works around the send_keys race when the element is in
+    # the DOM but Selenium's is_displayed internal check segfaults on it.
+    try:
+        el = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((by, value))
+        )
+        # Set value + fire the events frameworks listen to. Without the
+        # events, the input validator / submit button won't wake up.
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const val = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            el,
+            text,
+        )
+        return True
+    except Exception as js_exc:
+        # Final failure — emit enough context to post-mortem why this
+        # specific page+element combination is wedging. Without this, we
+        # only see "could not type email" with no clue what was on screen.
+        try:
+            tag = driver.execute_script(
+                "const el = document.evaluate(arguments[0], document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; return el ? (el.tagName + '.' + (el.className || '')).slice(0,120) : '<no-element>';",
+                value,
+            ) if by == By.XPATH else "<non-xpath-selector>"
+        except Exception:
+            tag = "<diag-failed>"
+        try:
+            url = driver.current_url
+        except Exception:
+            url = "<no-url>"
+        print(
+            f"[_wait_type] hard-fail selector={value!r} url={url!r} "
+            f"element={tag!r} send_keys_err={str(last_exc)[:160]!r} "
+            f"js_err={str(js_exc)[:160]!r}",
+            flush=True,
+        )
+        return False
 
 
 def inst_dismiss_overlays(driver, log=None):
@@ -1567,14 +1631,39 @@ def sl_fetch_existing(api_key, log):
 
 
 def sl_check_added(api_key, email, log):
-    """Check first 100 accounts for email."""
+    """Verify a specific account exists in Smartlead.
+
+    Paginates through /api/v1/email-accounts (100 per page, up to 5000
+    accounts = 50 pages). Early-exits the moment we find the target email.
+
+    HISTORICAL NOTE: parity fix with inst_check_v1. The old version only
+    checked the first 100 accounts, which silently missed newly-added ones
+    in Smartlead workspaces with >100 existing accounts (same false-
+    negative pattern that made the Instantly uploader retry accounts
+    that had actually landed). See PR #30 for the Instantly version of
+    this fix.
+    """
     try:
-        r = http_req.get(
-            f"https://server.smartlead.ai/api/v1/email-accounts/?api_key={api_key}&offset=0&limit=100",
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return email in [a.get("from_email", "") for a in r.json()]
+        offset = 0
+        while True:
+            r = http_req.get(
+                f"https://server.smartlead.ai/api/v1/email-accounts/?api_key={api_key}&offset={offset}&limit=100",
+                timeout=30,
+            )
+            if r.status_code != 200:
+                log(f"Smartlead check HTTP {r.status_code}")
+                return False
+            accts = r.json()
+            if not accts:
+                return False
+            if any(a.get("from_email", "") == email for a in accts):
+                return True
+            if len(accts) < 100:
+                return False
+            offset += 100
+            if offset >= 5000:
+                log(f"Smartlead check: hit 5000-account pagination cap while searching for {email}")
+                return False
     except Exception as e:
         log(f"Smartlead check error: {e}")
     return False
