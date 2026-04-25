@@ -2521,6 +2521,19 @@ export async function initiateDeviceAuth(tenantId: string): Promise<void> {
           "openid",
           "profile",
           "User.Read",
+          // User.ReadWrite.All: needed to write user profile fields (photo,
+          // displayName, etc.) and to update mailbox attributes during the
+          // photo-apply pipeline (PUT /users/{id}/photo/$value).
+          "User.ReadWrite.All",
+          // MailboxSettings.ReadWrite: required by Exchange Online for
+          // app-only access to mailbox-backed surfaces. Without this the
+          // photo PUT returns 401 from the Exchange auth gate even when
+          // User.ReadWrite.All is granted (proven empirically on TN-003).
+          "MailboxSettings.ReadWrite",
+          // Mail.Send: lets the SP send mail as any user via /users/{id}/sendMail.
+          // Currently unused (the uploader uses SMTP) but consenting it now
+          // means future Graph-based send works without another admin click.
+          "Mail.Send",
           "Policy.Read.All",
           "Policy.ReadWrite.ConditionalAccess",
           "Domain.ReadWrite.All",
