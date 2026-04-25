@@ -5,6 +5,7 @@ import type { UploaderEsp } from "@prisma/client";
 
 import { encryptSecret, ensureEncryptionKey } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
+import { extractPersonas } from "@/lib/services/profilePhotos";
 import { logTenantEvent } from "@/lib/tenant-events";
 import { mapTenantCsvRow } from "@/lib/validation";
 import type { ParsedTenantRecord } from "@/lib/validation";
@@ -282,6 +283,23 @@ export async function POST(request: Request) {
           }
         })
       )
+    );
+
+    // Pre-extract personas right after batch creation so the operator can
+    // start uploading profile photos immediately, even before mailbox
+    // creation finishes. Idempotent (skipDuplicates on the unique constraint)
+    // and best-effort — a failure here doesn't block the batch from running,
+    // since extraction also re-runs at Phase 4.5 in the worker.
+    await Promise.allSettled(
+      batch.tenants.map(async (tenant) => {
+        try {
+          await extractPersonas(tenant.id);
+        } catch (error) {
+          console.log(
+            `[batches] Persona pre-extract failed for tenant ${tenant.id}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      })
     );
 
     // Batch-level event: record whether auto-upload is wired for this batch.

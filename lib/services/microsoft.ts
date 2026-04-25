@@ -88,7 +88,7 @@ export async function requestTenantGraphToken(organizationId: string): Promise<s
   return data.access_token;
 }
 
-async function graphRequest<T>(token: string, endpoint: string, init: RequestInit = {}): Promise<T> {
+export async function graphRequest<T>(token: string, endpoint: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${GRAPH_BASE_URL}${endpoint}`, {
     ...init,
     headers: {
@@ -989,25 +989,57 @@ export async function createLicensedUser(
   // Grant Global Administrator to the primary user. This is what lets the user
   // self-consent during Instantly/Smartlead OAuth (their tenant-wide consent
   // prompt only shows the "on behalf of organization" option if the signing-in
-  // user holds an admin role). Best-effort — failure here doesn't block
-  // provisioning; we can retroactively grant via /api/tenant/{id}/grant-primary-global-admin.
-  try {
-    const grantResult = await grantGlobalAdmin(accessToken, { kind: "user", id: userId });
-    if (grantResult.ok) {
+  // user holds an admin role).
+  //
+  // Microsoft Graph has eventual consistency: a user created seconds ago may
+  // not yet be visible to /directoryRoles/{id}/members/$ref, so the grant
+  // intermittently returns "Resource not found"/"BadRequest". Retry with
+  // backoff until propagation lands. On final failure we persist the error
+  // to Tenant.errorMessage so it cannot silently rot — a dropped grant means
+  // every Instantly OAuth on that tenant hits the "Need admin approval" wall.
+  const GRANT_ATTEMPTS = 6;
+  const GRANT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000];
+  let grantSucceeded = false;
+  let grantError: string | null = null;
+  for (let attempt = 0; attempt < GRANT_ATTEMPTS; attempt++) {
+    try {
+      const grantResult = await grantGlobalAdmin(accessToken, { kind: "user", id: userId });
+      if (grantResult.ok) {
+        console.log(
+          grantResult.alreadyAssigned
+            ? `ℹ️ [Microsoft] Primary user ${userPrincipalName} already had Global Admin`
+            : `✅ [Microsoft] Granted Global Admin to primary user ${userPrincipalName}${attempt > 0 ? ` (attempt ${attempt + 1})` : ""}`
+        );
+        grantSucceeded = true;
+        grantError = null;
+        break;
+      }
+      grantError = grantResult.error || "unknown error";
+    } catch (error) {
+      grantError = error instanceof Error ? error.message : String(error);
+    }
+    const isLast = attempt === GRANT_ATTEMPTS - 1;
+    console.log(
+      `⚠️ [Microsoft] Global Admin grant attempt ${attempt + 1}/${GRANT_ATTEMPTS} for ${userPrincipalName} failed: ${grantError}${isLast ? "" : ` — retrying in ${GRANT_BACKOFF_MS[attempt] / 1000}s`}`
+    );
+    if (!isLast) {
+      await new Promise((resolve) => setTimeout(resolve, GRANT_BACKOFF_MS[attempt]));
+    }
+  }
+
+  if (!grantSucceeded) {
+    const errorLine = `Global Admin grant to ${userPrincipalName} failed after ${GRANT_ATTEMPTS} attempts: ${grantError}. Run POST /api/tenant/${tenantDbId}/grant-primary-global-admin to retry, or every Instantly/Smartlead OAuth on this tenant will hit "Need admin approval".`;
+    console.log(`❌ [Microsoft] ${errorLine}`);
+    try {
+      await prisma.tenant.update({
+        where: { id: tenantDbId },
+        data: { errorMessage: errorLine }
+      });
+    } catch (persistError) {
       console.log(
-        grantResult.alreadyAssigned
-          ? `ℹ️ [Microsoft] Primary user ${userPrincipalName} already had Global Admin`
-          : `✅ [Microsoft] Granted Global Admin to primary user ${userPrincipalName}`
-      );
-    } else {
-      console.log(
-        `⚠️ [Microsoft] Could not grant Global Admin to primary user ${userPrincipalName}: ${grantResult.error}`
+        `⚠️ [Microsoft] Could not persist Global Admin grant failure to Tenant.errorMessage: ${persistError instanceof Error ? persistError.message : String(persistError)}`
       );
     }
-  } catch (error) {
-    console.log(
-      `⚠️ [Microsoft] Global Admin grant to primary user threw: ${error instanceof Error ? error.message : String(error)}`
-    );
   }
 
   await prisma.tenant.update({
