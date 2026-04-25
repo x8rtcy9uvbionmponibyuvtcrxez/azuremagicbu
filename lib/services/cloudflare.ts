@@ -97,7 +97,14 @@ async function clearDnsRecords(zoneId: string, headers: Record<string, string>) 
 async function createDnsRecords(zoneId: string, domain: string, headers: Record<string, string>) {
   const records: CloudflareRecord[] = [
     { type: "TXT", name: "@", content: "v=spf1 include:spf.protection.outlook.com -all" },
-    { type: "TXT", name: "_dmarc", content: "v=DMARC1; p=none;" },
+    // DMARC at p=quarantine: unauthenticated mail (failing both SPF and DKIM
+    // alignment) lands in spam at receiving providers. We default to enforce
+    // because every tenant has SPF + DKIM aligned by the time mailboxes are
+    // sending — so quarantine bites only on spoofers, not legit traffic. Going
+    // straight to enforcement also satisfies the prerequisite for future BIMI
+    // logo display in Gmail/Yahoo. pct=100 = applied to 100% of failing mail.
+    // aspf=r adkim=r = relaxed alignment (subdomain matches still align).
+    { type: "TXT", name: "_dmarc", content: "v=DMARC1; p=quarantine; pct=100; aspf=r; adkim=r;" },
     { type: "MX", name: "@", content: domainToMxTarget(domain), priority: 0 },
     { type: "CNAME", name: "autodiscover", content: "autodiscover.outlook.com" },
     { type: "A", name: "@", content: "44.227.65.245", proxied: true },
