@@ -1365,12 +1365,155 @@ def run_instantly_job(job):
                         job.succeeded += len(reconciled)
                         job.failed -= len(reconciled)
                         job.failed_accounts = still_failed
+                        # Reflect the reconciliation in account_status too,
+                        # so a retry pass below doesn't try to re-OAuth them.
+                        for row in reconciled:
+                            em = (
+                                row.get("EmailAddress") or row.get("Email") or row.get("email") or ""
+                            ).strip()
+                            if em:
+                                job.set_account_status(em, "succeeded", "reconciled post-OAuth")
                 if reconciled:
                     job.log(
                         f"✓ Reconciled {len(reconciled)} account(s) that landed after the verify window"
                     )
             except Exception as e:
                 job.log(f"Reconcile non-fatal: {e}")
+
+        # Retry pass: anything still in failed_accounts is genuinely missing
+        # from Instantly per the just-fetched existing set. Most of these
+        # are transient OAuth races (the headless Chromium "_wait_type"
+        # NoneType issue) that recover on a clean browser. Run them through
+        # inst_add_account once more with a fresh driver; the function has
+        # its own 3-attempt internal retry, and a final reconcile catches
+        # any that land but verify late.
+        if job.failed_accounts and not job.should_stop:
+            retry_count = len(job.failed_accounts)
+            job.log(f"♻ Retry pass on {retry_count} still-missing account(s) with fresh browser")
+
+            # Snapshot + reset so the retry pass's own mark_success/failure
+            # calls land with a clean slate. We accumulate retry outcomes
+            # into job.succeeded / job.failed normally.
+            with job._lock:
+                retry_rows = list(job.failed_accounts)
+                job.failed_accounts = []
+                job.failed -= retry_count  # we'll re-increment below for any that fail again
+
+            # Single-driver retry — gentler than the parallel main pass and
+            # avoids spawning a second IPRoyal session right after the
+            # previous pool of drivers shut down.
+            set_proxy_session(f"retry-{uuid.uuid4().hex[:8]}")
+            retry_driver = None
+            try:
+                retry_driver = make_inst_driver()
+                job.register_driver(retry_driver)
+                if not inst_login(retry_driver, inst_email, inst_pass, job.log, job=job):
+                    job.log("Retry pass: login failed — bailing out, accounts stay marked failed")
+                    with job._lock:
+                        # Restore failures since we couldn't actually retry.
+                        job.failed_accounts = retry_rows
+                        job.failed += len(retry_rows)
+                    raise RuntimeError("retry-login-failed")
+                if not job.should_stop and workspace:
+                    inst_switch_workspace(retry_driver, workspace, job.log)
+
+                for idx, row in enumerate(retry_rows):
+                    if job.should_stop:
+                        # Push back any row whose retry didn't complete to a
+                        # terminal account_status (current + everything after).
+                        # Anything before idx that succeeded/failed already
+                        # moved counters appropriately and won't be touched.
+                        with job._lock:
+                            for r in retry_rows[idx:]:
+                                em = (r.get("EmailAddress") or r.get("Email") or r.get("email") or "").strip()
+                                if not em:
+                                    continue
+                                state = (job.account_status.get(em.lower()) or {}).get("state")
+                                if state not in ("succeeded", "failed", "skipped"):
+                                    job.failed_accounts.append(r)
+                                    job.failed += 1
+                        break
+
+                    email = (row.get("EmailAddress") or row.get("Email") or row.get("email") or "").strip()
+                    pw = (row.get("Password") or row.get("password") or "").strip()
+                    if not email or not pw:
+                        # Malformed row — keep as failed.
+                        with job._lock:
+                            job.failed_accounts.append(row)
+                            job.failed += 1
+                        continue
+
+                    job.set_account_status(email, "processing", "retry pass")
+                    job.log(f"♻ Retry: {email}")
+                    try:
+                        new_driver, ok = inst_add_account(
+                            retry_driver, verify_key, inst_email, inst_pass, workspace,
+                            email, pw, job.log, api_ver, job=job,
+                        )
+                        if new_driver is not retry_driver:
+                            job.unregister_driver(retry_driver)
+                            retry_driver = new_driver
+                            job.register_driver(retry_driver)
+                        if ok:
+                            job.mark_success()
+                            job.set_account_status(email, "succeeded", "succeeded on retry pass")
+                            job.log(f"✓ Retry succeeded: {email}")
+                        else:
+                            with job._lock:
+                                job.failed_accounts.append(row)
+                                job.failed += 1
+                            job.set_account_status(email, "failed", "still failed after retry pass")
+                    except Exception as e:
+                        with job._lock:
+                            job.failed_accounts.append(row)
+                            job.failed += 1
+                        job.set_account_status(email, "failed", f"retry exception: {str(e)[:160]}")
+                        job.log(f"Retry error for {email}: {e}")
+            except Exception as e:
+                # Setup failure (driver launch, login). Already restored
+                # failed_accounts above on login failure; for other paths
+                # the per-account loop handles its own bookkeeping.
+                job.log(f"Retry pass setup failed: {e}")
+            finally:
+                if retry_driver is not None:
+                    job.unregister_driver(retry_driver)
+                    try:
+                        retry_driver.quit()
+                    except Exception:
+                        pass
+
+            # Final reconcile after retry — catches any retry that succeeded
+            # OAuth-side but missed its own verify window.
+            if job.failed_accounts and not job.should_stop:
+                try:
+                    if api_ver == "v2":
+                        current_existing = inst_fetch_existing_v2(verify_key, job.log)
+                    else:
+                        current_existing = inst_fetch_existing_v1(api_key, job.log)
+                    current_set = {e.lower() for e in current_existing}
+                    with job._lock:
+                        late_recon, still_failed = [], []
+                        for row in job.failed_accounts:
+                            em = (
+                                row.get("EmailAddress") or row.get("Email") or row.get("email") or ""
+                            ).strip().lower()
+                            if em and em in current_set:
+                                late_recon.append(row)
+                            else:
+                                still_failed.append(row)
+                        if late_recon:
+                            job.succeeded += len(late_recon)
+                            job.failed -= len(late_recon)
+                            job.failed_accounts = still_failed
+                    if late_recon:
+                        job.log(f"✓ Post-retry reconcile: {len(late_recon)} more landed")
+                except Exception as e:
+                    job.log(f"Post-retry reconcile non-fatal: {e}")
+
+            job.log(
+                f"♻ Retry pass complete — {job.succeeded} succeeded, "
+                f"{job.failed} still failed, {job.skipped} skipped of {job.total}"
+            )
 
         # Finish disposition logic — the historical default of always calling
         # finish("completed") unless .should_stop masked catastrophic outcomes
@@ -1606,7 +1749,151 @@ def run_smartlead_upload(job):
 
             save_job(job)
 
-        job.finish("cancelled" if job.should_stop else "completed")
+        # Reconcile + retry pass — mirror of the Instantly path. After the
+        # main loop, anything in failed_accounts gets re-checked against
+        # the Smartlead API; if landed late we flip to succeeded. If
+        # genuinely missing, we run the OAuth flow once more with a fresh
+        # browser. The function-level retry inside sl_oauth_flow already
+        # handles per-attempt flakiness; this end-of-job pass catches the
+        # cumulative-failure case (e.g. all 4 inner retries hit the
+        # _wait_type race).
+        if job.failed > 0 and not job.should_stop:
+            job.log(f"Reconciling {job.failed} unverified account(s) against Smartlead API…")
+            try:
+                current_existing = sl_fetch_existing(api_key, job.log)
+                current_set = set(current_existing)
+                with job._lock:
+                    reconciled, still_failed = [], []
+                    for row in job.failed_accounts:
+                        em = (
+                            row.get("EmailAddress") or row.get("Email") or row.get("email") or ""
+                        ).strip()
+                        if em and em in current_set:
+                            reconciled.append(row)
+                        else:
+                            still_failed.append(row)
+                    if reconciled:
+                        job.succeeded += len(reconciled)
+                        job.failed -= len(reconciled)
+                        job.failed_accounts = still_failed
+                        for row in reconciled:
+                            em = (
+                                row.get("EmailAddress") or row.get("Email") or row.get("email") or ""
+                            ).strip()
+                            if em:
+                                job.set_account_status(em, "succeeded", "reconciled post-OAuth")
+                if reconciled:
+                    job.log(f"✓ Reconciled {len(reconciled)} account(s) that landed late")
+            except Exception as e:
+                job.log(f"Smartlead reconcile non-fatal: {e}")
+
+        if job.failed_accounts and not job.should_stop:
+            retry_count = len(job.failed_accounts)
+            job.log(f"♻ Smartlead retry pass on {retry_count} still-missing account(s)")
+
+            with job._lock:
+                retry_rows = list(job.failed_accounts)
+                job.failed_accounts = []
+                job.failed -= retry_count
+
+            set_proxy_session(f"sl-retry-{uuid.uuid4().hex[:8]}")
+            for idx, row in enumerate(retry_rows):
+                if job.should_stop:
+                    # Push back any row whose retry hasn't completed yet
+                    # (current + remaining). Earlier rows that already
+                    # mark_success'd or got their state set to failed are
+                    # in their correct counter buckets and untouched here.
+                    with job._lock:
+                        for r in retry_rows[idx:]:
+                            em = (r.get("EmailAddress") or r.get("Email") or r.get("email") or "").strip()
+                            if not em:
+                                continue
+                            state = (job.account_status.get(em.lower()) or {}).get("state")
+                            if state not in ("succeeded", "failed", "skipped"):
+                                job.failed_accounts.append(r)
+                                job.failed += 1
+                    break
+
+                email = (row.get("EmailAddress") or row.get("Email") or row.get("email") or "").strip()
+                pw = (row.get("Password") or row.get("password") or "").strip()
+                if not email or not pw:
+                    with job._lock:
+                        job.failed_accounts.append(row)
+                        job.failed += 1
+                    continue
+
+                job.set_account_status(email, "processing", "retry pass")
+                job.log(f"♻ Smartlead retry: {email}")
+                driver = None
+                landed = False
+                try:
+                    driver = make_sl_driver()
+                    job.register_driver(driver)
+                    driver.get(login_url)
+                    if cancelable_sleep(5, job) and sl_oauth_flow(driver, email, pw, job.log, job=job):
+                        if cancelable_sleep(3, job) and sl_check_added(api_key, email, job.log):
+                            landed = True
+                except Exception as e:
+                    job.log(f"Smartlead retry error for {email}: {e}")
+                finally:
+                    if driver is not None:
+                        job.unregister_driver(driver)
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+
+                if landed:
+                    job.mark_success()
+                    job.set_account_status(email, "succeeded", "succeeded on retry pass")
+                    job.log(f"✓ Retry succeeded: {email}")
+                else:
+                    with job._lock:
+                        job.failed_accounts.append(row)
+                        job.failed += 1
+                    job.set_account_status(email, "failed", "still failed after retry pass")
+
+            # Final reconcile after retry — accounts that OAuth'd but
+            # missed sl_check_added's window.
+            if job.failed_accounts and not job.should_stop:
+                try:
+                    current_existing = sl_fetch_existing(api_key, job.log)
+                    current_set = set(current_existing)
+                    with job._lock:
+                        late_recon, still_failed = [], []
+                        for row in job.failed_accounts:
+                            em = (
+                                row.get("EmailAddress") or row.get("Email") or row.get("email") or ""
+                            ).strip()
+                            if em and em in current_set:
+                                late_recon.append(row)
+                            else:
+                                still_failed.append(row)
+                        if late_recon:
+                            job.succeeded += len(late_recon)
+                            job.failed -= len(late_recon)
+                            job.failed_accounts = still_failed
+                    if late_recon:
+                        job.log(f"✓ Post-retry reconcile: {len(late_recon)} more landed")
+                except Exception as e:
+                    job.log(f"Post-retry Smartlead reconcile non-fatal: {e}")
+
+            job.log(
+                f"♻ Smartlead retry pass complete — {job.succeeded} succeeded, "
+                f"{job.failed} still failed, {job.skipped} skipped of {job.total}"
+            )
+
+        # Finish disposition: failed if non-zero accounts to process but
+        # zero made it through. Otherwise normal completion.
+        if job.should_stop:
+            job.finish("cancelled")
+        elif job.total > 0 and job.processed == 0:
+            job.log(
+                "⚠ Smartlead job ran end-to-end without processing any accounts — marking FAILED"
+            )
+            job.finish("failed")
+        else:
+            job.finish("completed")
     except Exception as e:
         job.log(f"Fatal error: {e}")
         job.finish("failed")

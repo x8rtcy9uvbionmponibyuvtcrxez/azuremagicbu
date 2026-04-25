@@ -158,11 +158,18 @@ export async function enqueueTenantProcessingJob(
 // ─────────────────────────────────────────────────────────────────────────
 
 const uploadJobOptions: JobsOptions = {
-  // Allow generous retries for the start job specifically — 429s from the
-  // uploader's MAX_CONCURRENT_JOBS cap are expected under parallel tenant
-  // completion. Exponential backoff keeps us polite.
-  attempts: 12,
-  backoff: { type: "exponential", delay: 30_000 },
+  // Generous retry budget for start-upload — 429s from the uploader's
+  // MAX_CONCURRENT_JOBS cap are expected when multiple tenants complete
+  // provisioning in parallel. We previously used exponential backoff but
+  // it grew to 30+ minute waits at attempt 7+, which left ~30-70 minute
+  // dead gaps between tenants finishing and the next one picking up
+  // (caught during the 4-tenant TN-003..006 run, where 1h 48m of the
+  // 5h12m wall-clock was pure backoff waiting). Fixed 30s delay matches
+  // the actual signal — "slot is taken" — far better. Combined with the
+  // poll-handler's promote-next-sibling logic (uploadWorker.ts), the
+  // practical wait between tenants is sub-second on the happy path.
+  attempts: 30,
+  backoff: { type: "fixed", delay: 30_000 },
   removeOnComplete: 500,
   removeOnFail: 500
 };

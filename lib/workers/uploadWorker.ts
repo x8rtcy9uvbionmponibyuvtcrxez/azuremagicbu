@@ -19,6 +19,7 @@ import { prisma } from "@/lib/prisma";
 import {
   TENANT_UPLOAD_QUEUE,
   enqueuePollUpload,
+  getUploadQueue,
   redisConnection,
   type TenantUploadJobData,
   type TenantUploadJobName
@@ -292,6 +293,38 @@ async function handlePollUpload(job: Job<TenantUploadJobData, unknown, TenantUpl
         (data.warnings ? `, ${data.warnings} warnings` : ""),
       outcomeLevel
     );
+    // Fast handoff: as soon as a tenant terminates, the uploader's slot
+    // frees up. Find the next pending start-upload for this batch (likely
+    // sitting in the delayed queue waiting for its 30s backoff window) and
+    // promote it to fire immediately. Replaces the previous behavior where
+    // the next tenant waited for its own backoff to elapse — that left
+    // dead 30+ minute gaps under exponential backoff.
+    try {
+      const queue = getUploadQueue();
+      const delayed = await queue.getJobs(["delayed"], 0, 100, true);
+      const sameBatchSiblings = delayed
+        .filter((j) => j.name === "start-upload" && j.data?.batchId === batchId)
+        // Oldest first (FIFO) — the tenant that's been waiting longest.
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      if (sameBatchSiblings.length > 0) {
+        try {
+          await sameBatchSiblings[0].promote();
+          console.log(
+            `↗ [UploadWorker] Fast handoff: promoted next sibling ${sameBatchSiblings[0].id} for batch ${batchId}`
+          );
+        } catch {
+          // Job may have transitioned states between getJobs and promote.
+          // Non-fatal — fixed-delay backoff will pick it up shortly anyway.
+        }
+      }
+    } catch (err) {
+      // Promotion is an optimization. If listing the queue fails for any
+      // reason, the regular backoff retry still handles the next tenant.
+      console.error(
+        "[UploadWorker] sibling-promote skipped:",
+        err instanceof Error ? err.message : String(err)
+      );
+    }
     await maybeFinalizeBatchUpload(batchId);
     return { ok: true, terminal: true, status: dbStatus };
   }
