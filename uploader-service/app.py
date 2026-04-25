@@ -161,6 +161,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "history.db")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Diagnostic dumps (screenshots + DOM snapshots) for debugging Selenium-side
+# issues that only reproduce on Railway/headless. Served back via /api/diag/*.
+# Self-prunes to a hard cap so it can never fill the volume.
+DIAG_DIR = os.path.join(DATA_DIR, "diag")
+os.makedirs(DIAG_DIR, exist_ok=True)
+DIAG_MAX_FILES = 200
 
 MAX_RETRIES_INSTANTLY = 3
 MAX_RETRIES_SMARTLEAD = 4
@@ -941,6 +947,117 @@ def inst_login(driver, email, password, log, job=None):
         return False
 
 
+def _dump_diag(driver, label, log=None):
+    """Snapshot the current page state for offline analysis. Writes a JSON
+    sidecar (URL, viewport, UA, headless-detection signals, button list,
+    topbar HTML) plus a PNG screenshot to DIAG_DIR. Files are named
+    <ts>-<label>.{json,png} so they sort chronologically.
+
+    Used to diagnose Selenium issues that only reproduce on Railway/headless
+    (notably workspace-switch failures). Each call also prunes DIAG_DIR to
+    DIAG_MAX_FILES so the volume can never fill up. Best-effort — exceptions
+    are swallowed so a diag failure cannot break the main flow."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(DIAG_DIR, f"{ts}-{label}")
+        info = {
+            "label": label,
+            "ts": ts,
+            "url": "",
+            "title": "",
+            "user_agent": "",
+            "viewport": [0, 0],
+            "ready_state": "",
+            "navigator_webdriver": None,
+            "navigator_plugins_count": None,
+            "has_window_chrome": None,
+            "has_chrome_runtime": None,
+            "buttons": [],
+            "role_buttons": [],
+            "topbar_html": "",
+        }
+        try: info["url"] = driver.current_url
+        except Exception: pass
+        try: info["title"] = driver.title
+        except Exception: pass
+        try:
+            sig = driver.execute_script(
+                "return {ua: navigator.userAgent,"
+                " w: window.innerWidth, h: window.innerHeight,"
+                " ready: document.readyState,"
+                " webdriver: navigator.webdriver,"
+                " plugins: (navigator.plugins ? navigator.plugins.length : null),"
+                " chrome: !!window.chrome,"
+                " runtime: !!(window.chrome && window.chrome.runtime)};"
+            )
+            info["user_agent"] = sig.get("ua", "")
+            info["viewport"] = [sig.get("w"), sig.get("h")]
+            info["ready_state"] = sig.get("ready", "")
+            info["navigator_webdriver"] = sig.get("webdriver")
+            info["navigator_plugins_count"] = sig.get("plugins")
+            info["has_window_chrome"] = sig.get("chrome")
+            info["has_chrome_runtime"] = sig.get("runtime")
+        except Exception: pass
+        # Buttons + role=button elements (top 30 each)
+        try:
+            info["buttons"] = driver.execute_script(
+                "return Array.from(document.querySelectorAll('button')).slice(0, 30).map(b => ({"
+                "  text: (b.textContent || '').trim().slice(0, 120),"
+                "  classes: b.className || '',"
+                "  id: b.id || '',"
+                "  aria: b.getAttribute('aria-label') || '',"
+                "  parent: (b.parentElement ? b.parentElement.tagName.toLowerCase() : ''),"
+                "  visible: !!(b.offsetParent !== null)"
+                "}));"
+            ) or []
+        except Exception: pass
+        try:
+            info["role_buttons"] = driver.execute_script(
+                "return Array.from(document.querySelectorAll('[role=button]:not(button)')).slice(0, 30).map(b => ({"
+                "  tag: b.tagName.toLowerCase(),"
+                "  text: (b.textContent || '').trim().slice(0, 120),"
+                "  classes: b.className || '',"
+                "  id: b.id || '',"
+                "  aria: b.getAttribute('aria-label') || ''"
+                "}));"
+            ) or []
+        except Exception: pass
+        # Topbar HTML — try a few candidate roots, keep the first that hits
+        try:
+            info["topbar_html"] = (driver.execute_script(
+                "var sels = ['#mainAppBar', '[id*=\"AppBar\"]', '[class*=\"Topbar\"]',"
+                "            '[class*=\"AppTopbar\"]', 'header', 'nav'];"
+                "for (var s of sels) {"
+                "  var el = document.querySelector(s);"
+                "  if (el) { return s + '\\n' + el.outerHTML.slice(0, 8000); }"
+                "}"
+                "return '';"
+            ) or "")
+        except Exception: pass
+        # Persist JSON
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        # Persist screenshot
+        try: driver.save_screenshot(base + ".png")
+        except Exception: pass
+        # Prune oldest if we're over the cap
+        try:
+            files = sorted(
+                [os.path.join(DIAG_DIR, n) for n in os.listdir(DIAG_DIR)],
+                key=lambda p: os.path.getmtime(p),
+            )
+            extra = len(files) - DIAG_MAX_FILES
+            for p in files[:max(0, extra)]:
+                try: os.remove(p)
+                except Exception: pass
+        except Exception: pass
+        if log: log(f"diag: dumped {os.path.basename(base)}.{{json,png}}")
+        return base
+    except Exception as e:
+        if log: log(f"diag: dump failed ({e})")
+        return None
+
+
 def inst_switch_workspace(driver, target, log):
     """Switch workspace via MUI dropdown — matches original switch_workspace().
     Phase 1 fix: dismiss the Featurebase changelog overlay BEFORE searching
@@ -954,6 +1071,10 @@ def inst_switch_workspace(driver, target, log):
         # Was being called after the search timed out; moved to the top.
         inst_dismiss_overlays(driver, log)
         time.sleep(5)
+        # Snapshot the page right before the picker search — gives us a
+        # ground-truth view of what the DOM looks like to compare success
+        # vs failure runs.
+        _dump_diag(driver, "ws-pre-search", log=log)
         ws_btn = None
         btn_sels = [
             "//button[contains(@class,'MuiButton-root') and contains(@class,'MuiButton-outlined')]//div[contains(@class,'MuiGrid-item')]",
@@ -971,6 +1092,7 @@ def inst_switch_workspace(driver, target, log):
                 continue
         if not ws_btn:
             log("Could not find workspace button")
+            _dump_diag(driver, "ws-notfound", log=log)
             return False
 
         cur = ""
@@ -2487,6 +2609,53 @@ def api_stop(job_id):
         return jsonify({"error": "Job not found"}), 404
     job.request_stop()
     return jsonify({"status": "stopping"})
+
+
+@app.route("/api/diag/list")
+def api_diag_list():
+    """List diagnostic dumps written by _dump_diag (workspace-switch debugging
+    etc.). Returns most-recent first. Pair with /api/diag/<filename> to fetch
+    the JSON or PNG body."""
+    try:
+        names = os.listdir(DIAG_DIR)
+    except FileNotFoundError:
+        return jsonify({"files": []})
+    items = []
+    for n in names:
+        p = os.path.join(DIAG_DIR, n)
+        try:
+            stat = os.stat(p)
+            items.append({
+                "name": n,
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            })
+        except OSError:
+            pass
+    items.sort(key=lambda i: i["mtime"], reverse=True)
+    return jsonify({"files": items})
+
+
+@app.route("/api/diag/<path:filename>")
+def api_diag_file(filename):
+    """Serve a single diagnostic dump file. Path-traversal-safe: rejects any
+    name containing path separators or starting with a dot."""
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        return jsonify({"error": "invalid filename"}), 400
+    path = os.path.join(DIAG_DIR, filename)
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(DIAG_DIR) + os.sep):
+        return jsonify({"error": "invalid path"}), 400
+    if not os.path.isfile(real):
+        return jsonify({"error": "not found"}), 404
+    if filename.endswith(".png"):
+        with open(real, "rb") as f:
+            return f.read(), 200, {"Content-Type": "image/png"}
+    if filename.endswith(".json"):
+        with open(real, "r", encoding="utf-8") as f:
+            return f.read(), 200, {"Content-Type": "application/json"}
+    with open(real, "rb") as f:
+        return f.read(), 200, {"Content-Type": "application/octet-stream"}
 
 
 @app.route("/api/history")
