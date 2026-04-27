@@ -148,6 +148,7 @@ model Tenant {
   batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
   events TenantEvent[]
   personas TenantPersona[]
+  serviceOps ServiceOperation[]
 
   @@index([batchId, status])
   @@index([domain])
@@ -194,3 +195,31 @@ model TenantEvent {
   @@index([tenantId, createdAt])
 }
 
+// Auxiliary "Services" tab operations: bulk rename, remove, swap, photo
+// apply. One row per invocation. Stores the operator's input CSV (so we can
+// re-run if needed), the per-row results, and a status rollup. Lets us audit
+// what happened, retry failed rows, and surface history in the UI.
+model ServiceOperation {
+  id            String    @id @default(cuid())
+  tenantId      String?   // null when paste-creds escape hatch was used
+  opType        String    // "rename" | "remove" | "swap" | "photo"
+  status        String    @default("queued")
+                          // queued | running | completed | failed | cancelled
+  csvData       String    // raw CSV text the operator uploaded
+  csvRowCount   Int       @default(0)
+  options       String?   // JSON: per-op flags (skipInstantly, skipSmartlead, dryRun, ...)
+  results       String?   // JSON array of per-row outcomes (state, message, ...)
+  succeeded     Int       @default(0)
+  failed        Int       @default(0)
+  skipped       Int       @default(0)
+  errorMessage  String?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  tenant        Tenant?   @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([opType, status])
+}
