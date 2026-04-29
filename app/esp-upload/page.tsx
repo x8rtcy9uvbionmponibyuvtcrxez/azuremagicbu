@@ -76,7 +76,14 @@ export default function EspUploadPage() {
         const res = await fetch(`/api/esp-upload/${runId}`, { cache: "no-store" });
         const data = (await res.json()) as { run?: EspRun; error?: string };
         if (!res.ok) throw new Error(data.error || "Failed to fetch run");
-        if (data.run) setRun(data.run);
+        if (data.run) {
+          setRun(data.run);
+          // Clear any error from a previous transient poll failure now that
+          // we've got a fresh good response. Without this, one network blip
+          // pins the red "fetch failed" banner forever even though polls
+          // continue and the run streams new logs.
+          setError(null);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Polling failed");
       }
@@ -291,15 +298,22 @@ export default function EspUploadPage() {
           </label>
 
           <label className="grid gap-1">
-            <span className="text-sm font-medium">Workspace Name</span>
+            <span className="text-sm font-medium">
+              Workspace Name <span className="font-normal text-muted-foreground">(optional)</span>
+            </span>
             <input
               className="rounded border px-3 py-2 text-sm"
               type="text"
               value={instWorkspace}
               onChange={(e) => setInstWorkspace(e.target.value)}
-              placeholder="Workspace name as shown in Instantly"
-              required
+              placeholder="Leave blank to upload to your default workspace"
             />
+            <span className="text-xs text-muted-foreground">
+              Leave blank for single-workspace mode (uses whichever workspace
+              your Instantly login defaults to). Fill in only if your account
+              has multiple workspaces and you need to target a specific one —
+              the value must match the name shown in Instantly exactly.
+            </span>
           </label>
 
           <label className="grid gap-1">
