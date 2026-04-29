@@ -4,6 +4,7 @@ import path from "path";
 import type { Prisma } from "@prisma/client";
 
 import { decryptSecret } from "@/lib/crypto";
+import { generateEmailVariations } from "@/lib/services/email-generator";
 import { parseInboxNamesValue } from "@/lib/utils";
 
 type TenantCsvInput = {
@@ -20,6 +21,36 @@ type TenantCsvInput = {
   adminPassword?: string | null;
   mailboxStatuses?: string | null;
 };
+
+/**
+ * Build a lookup table from email-address → DisplayName for the canonical
+ * permutation set this tenant produced. The email-generator is deterministic
+ * given the same names, domain, and totalCount, so we can reconstruct the
+ * mapping locally instead of having to persist it on every mailbox row.
+ *
+ * Falls back to an empty map on any error — caller will then default to
+ * the first inboxName, which matches the previous (buggy) behaviour but at
+ * least doesn't crash.
+ */
+function buildEmailToDisplayNameMap(
+  names: string[],
+  domain: string,
+  inboxCount: number
+): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!names.length || !domain || !inboxCount) return map;
+  try {
+    const variations = generateEmailVariations(names, domain, inboxCount);
+    for (const v of variations) {
+      const key = v.email.trim().toLowerCase();
+      if (key) map.set(key, v.displayName);
+    }
+  } catch {
+    // Most likely cause: inboxCount mismatch or domain edge-case. The
+    // caller has a names[0] fallback so we just hand back an empty map.
+  }
+  return map;
+}
 
 function normalizeLocalPart(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -135,22 +166,37 @@ function generateCsvFromDbState(tenant: TenantCsvInput): string | null {
   }
 
   const names = parseInboxNamesValue(tenant.inboxNames);
-  const displayName = names[0] || "Inbox User";
+  const fallbackDisplayName = names[0] || "Inbox User";
+
+  // Reconstruct the email→DisplayName map the worker would have produced.
+  // Same names + domain + count = same permutations + same name pairing,
+  // so each created mailbox can recover its real display name (e.g.
+  // "Olivia Smith" for olivia.smith@..., not whatever names[0] happens
+  // to be).
+  const emailToDisplayName = buildEmailToDisplayNameMap(
+    names,
+    tenant.domain,
+    tenant.inboxCount
+  );
+  const displayNameFor = (email: string): string =>
+    emailToDisplayName.get(email.trim().toLowerCase()) || fallbackDisplayName;
 
   const licensedLower = (tenant.licensedUserUpn || "").trim().toLowerCase();
   const seen = new Set<string>();
   const rows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
 
-  // Licensed user first (she has a real mailbox backed by the single license).
+  // Licensed user first. Her UPN is the first persona's local-part
+  // (microsoft.ts builds it from extractedNames[0]), so the lookup will
+  // resolve to the matching displayName naturally.
   if (licensedLower) {
-    rows.push([displayName, licensedLower, password]);
+    rows.push([displayNameFor(licensedLower), licensedLower, password]);
     seen.add(licensedLower);
   }
 
   // Then each shared mailbox that was actually created, deduped.
   for (const email of createdEmails) {
     if (seen.has(email)) continue;
-    rows.push([displayName, email, password]);
+    rows.push([displayNameFor(email), email, password]);
     seen.add(email);
   }
 
