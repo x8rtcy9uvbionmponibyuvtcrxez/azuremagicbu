@@ -88,6 +88,53 @@ export async function requestTenantGraphToken(organizationId: string): Promise<s
   return data.access_token;
 }
 
+/**
+ * Look up a user by UPN, waiting through Graph's eventual-consistency window
+ * before giving up. POST /users commits immediately, but a $filter query
+ * right after often misses the new row because filter hits a different
+ * (eventually-consistent) replica. The fixed waits below are sized to the
+ * propagation window we've measured in production: most users appear within
+ * 10s, the long tail extends to ~60s.
+ *
+ * Returns the matching user, or null after exhausting all attempts. Caller
+ * decides whether null is a hard failure or a soft skip.
+ */
+async function lookupUserByUpnWaitingForPropagation(
+  accessToken: string,
+  upn: string
+): Promise<{ id: string; assignedLicenses?: Array<{ skuId: string }> } | null> {
+  // Total budget ~75s. ConsistencyLevel: eventual enables Graph's advanced
+  // query mode which is strongly consistent across replicas — combined with
+  // the wait this nearly always succeeds on first or second attempt.
+  const waitsMs = [0, 5_000, 15_000, 25_000, 30_000];
+  const filter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(upn)}'`);
+  for (let attempt = 0; attempt < waitsMs.length; attempt += 1) {
+    if (waitsMs[attempt] > 0) {
+      console.log(
+        `⏳ [Graph] Waiting ${waitsMs[attempt] / 1000}s for propagation of ${upn} (attempt ${attempt + 1}/${waitsMs.length})...`
+      );
+      await sleep(waitsMs[attempt]);
+    }
+    try {
+      const result = await graphRequest<{
+        value: Array<{ id: string; userPrincipalName?: string; assignedLicenses?: Array<{ skuId: string }> }>;
+      }>(
+        accessToken,
+        `/users?$count=true&$filter=${filter}&$select=id,userPrincipalName,assignedLicenses`,
+        { headers: { ConsistencyLevel: "eventual" } }
+      );
+      const hit = result.value?.[0];
+      if (hit?.id) return hit;
+    } catch (error) {
+      console.log(
+        `⚠️ [Graph] Lookup attempt ${attempt + 1} for ${upn} failed:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+  return null;
+}
+
 export async function graphRequest<T>(token: string, endpoint: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${GRAPH_BASE_URL}${endpoint}`, {
     ...init,
@@ -806,24 +853,39 @@ export async function setDomainAsDefault(tenantDbId: string, domain: string, acc
  */
 async function ensurePrimaryUserLicensed(
   accessToken: string,
-  primaryUpn: string
+  primary: { id?: string; upn: string } | string
 ): Promise<{ skuPartNumber: string }> {
-  // Step A: Does primary already have a license?
-  const primaryFilter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(primaryUpn)}'`);
-  const primaryResult = await graphRequest<{
-    value: Array<{ id: string; userPrincipalName?: string; assignedLicenses?: Array<{ skuId: string }> }>;
-  }>(accessToken, `/users?$filter=${primaryFilter}&$select=id,userPrincipalName,assignedLicenses`);
+  // Back-compat: callers that only have a UPN can still pass a string. New
+  // callers should pass { id, upn } so we skip the post-create $filter
+  // lookup (which races against Graph's eventual consistency and was the
+  // root cause of the "Primary user not found in tenant" failure).
+  const primaryUpn = typeof primary === "string" ? primary : primary.upn;
+  const knownId = typeof primary === "string" ? undefined : primary.id;
 
-  const primary = primaryResult.value?.[0];
-  if (!primary?.id) {
+  // Step A: Does primary already have a license?
+  // Prefer GET /users/{id} (read-by-id is strongly consistent on Graph). If
+  // we don't have the id, fall back to a paged $filter with a built-in
+  // wait that matches our measured create→filter propagation window.
+  let primaryRecord: { id: string; assignedLicenses?: Array<{ skuId: string }> } | null = null;
+  if (knownId) {
+    primaryRecord = await graphRequest<{ id: string; assignedLicenses?: Array<{ skuId: string }> }>(
+      accessToken,
+      `/users/${knownId}?$select=id,userPrincipalName,assignedLicenses`
+    );
+  } else {
+    primaryRecord = await lookupUserByUpnWaitingForPropagation(accessToken, primaryUpn);
+  }
+
+  if (!primaryRecord?.id) {
     throw new Error(
       `Primary user '${primaryUpn}' not found in tenant. Ensure the licensed user was created before attempting license allocation.`
     );
   }
+  const primaryUser = primaryRecord;
 
-  if (Array.isArray(primary.assignedLicenses) && primary.assignedLicenses.length > 0) {
-    const skuId = primary.assignedLicenses[0].skuId || "unknown";
-    console.log(`✅ [License] ${primaryUpn} already has ${primary.assignedLicenses.length} license(s) (${skuId}) — continuing`);
+  if (Array.isArray(primaryUser.assignedLicenses) && primaryUser.assignedLicenses.length > 0) {
+    const skuId = primaryUser.assignedLicenses[0].skuId || "unknown";
+    console.log(`✅ [License] ${primaryUpn} already has ${primaryUser.assignedLicenses.length} license(s) (${skuId}) — continuing`);
     return { skuPartNumber: skuId };
   }
 
@@ -835,7 +897,7 @@ async function ensurePrimaryUserLicensed(
   }>(accessToken, `/users?$select=id,userPrincipalName,assignedLicenses&$top=999`);
 
   const otherLicensed = (allUsers.value || []).filter(
-    (u) => u.id !== primary.id && Array.isArray(u.assignedLicenses) && u.assignedLicenses.length > 0
+    (u) => u.id !== primaryUser.id && Array.isArray(u.assignedLicenses) && u.assignedLicenses.length > 0
   );
 
   if (otherLicensed.length > 0) {
@@ -877,7 +939,7 @@ async function ensurePrimaryUserLicensed(
 
   // Step D: PATCH usageLocation (required by Graph), then POST assignLicense, verify. Retry up to 3 times.
   try {
-    await graphRequest<Record<string, unknown>>(accessToken, `/users/${primary.id}`, {
+    await graphRequest<Record<string, unknown>>(accessToken, `/users/${primaryUser.id}`, {
       method: "PATCH",
       body: JSON.stringify({ usageLocation: "US" })
     });
@@ -899,7 +961,7 @@ async function ensurePrimaryUserLicensed(
     }
 
     try {
-      await graphRequest<Record<string, unknown>>(accessToken, `/users/${primary.id}/assignLicense`, {
+      await graphRequest<Record<string, unknown>>(accessToken, `/users/${primaryUser.id}/assignLicense`, {
         method: "POST",
         body: JSON.stringify({ addLicenses: [{ skuId: availableSku.skuId }], removeLicenses: [] })
       });
@@ -916,7 +978,7 @@ async function ensurePrimaryUserLicensed(
     try {
       const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
         accessToken,
-        `/users/${primary.id}?$select=assignedLicenses`
+        `/users/${primaryUser.id}?$select=assignedLicenses`
       );
       const stuck =
         Array.isArray(verify.assignedLicenses) && verify.assignedLicenses.some((l) => l?.skuId === availableSku.skuId);
@@ -988,11 +1050,10 @@ export async function createLicensedUser(
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("already exists")) {
       console.log(`ℹ️ [Microsoft] User ${userPrincipalName} already exists, looking up...`);
-      const existing = await graphRequest<{ value: Array<{ id: string }> }>(
-        accessToken,
-        `/users?$filter=${encodeURIComponent(`userPrincipalName eq '${userPrincipalName}'`)}`
-      );
-      userId = existing.value?.[0]?.id || "";
+      // Wait through the propagation window if the $filter happens to race
+      // with another worker that JUST created this user.
+      const existingUser = await lookupUserByUpnWaitingForPropagation(accessToken, userPrincipalName);
+      userId = existingUser?.id || "";
       if (!userId) {
         throw new Error(`User ${userPrincipalName} exists but couldn't find ID`);
       }
@@ -1000,6 +1061,15 @@ export async function createLicensedUser(
       throw error;
     }
   }
+
+  // Persist the user identity NOW, before downstream license + grant steps
+  // run. If any of those throw, we still know the user exists — the retry
+  // route's resume logic uses licensedUserId to decide whether to re-run
+  // the create step, and we don't want to duplicate-create on retry.
+  await prisma.tenant.update({
+    where: { id: tenantDbId },
+    data: { licensedUserId: userId, licensedUserUpn: userPrincipalName }
+  });
 
   try {
     await graphRequest<Record<string, unknown>>(accessToken, `/users/${userId}`, {
@@ -1021,8 +1091,11 @@ export async function createLicensedUser(
     data: { currentStep: "Allocating license to primary user...", progress: 85 }
   });
 
-  // Centralised license allocation — see ensurePrimaryUserLicensed() for the 4-step algorithm.
-  await ensurePrimaryUserLicensed(accessToken, userPrincipalName);
+  // Centralised license allocation — see ensurePrimaryUserLicensed() for the
+  // 4-step algorithm. We pass the userId we just got from POST /users so the
+  // function can do a strongly-consistent GET /users/{id} instead of a
+  // $filter that races against eventual consistency.
+  await ensurePrimaryUserLicensed(accessToken, { id: userId, upn: userPrincipalName });
 
   // Grant Global Administrator to the primary user. This is what lets the user
   // self-consent during Instantly/Smartlead OAuth (their tenant-wide consent
@@ -1080,11 +1153,12 @@ export async function createLicensedUser(
     }
   }
 
+  // licensedUserId / licensedUserUpn are persisted earlier (right after
+  // POST /users succeeds) so retries don't re-create the user. Here we just
+  // mark the phase complete.
   await prisma.tenant.update({
     where: { id: tenantDbId },
     data: {
-      licensedUserId: userId,
-      licensedUserUpn: userPrincipalName,
       currentStep: "Domain setup complete",
       progress: 90
     }
@@ -1288,7 +1362,12 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       // primary, verifies. If it fails, delegation fails fast with a clear
       // license error instead of burning PowerShell attempts against a user
       // who has no Exchange mailbox.
-      await ensurePrimaryUserLicensed(accessToken, preferredUpn);
+      // Pass the licensedUserId we have on the tenant row so the lookup is
+      // strongly consistent (avoids the $filter race).
+      await ensurePrimaryUserLicensed(accessToken, {
+        id: licensedUserId || undefined,
+        upn: preferredUpn
+      });
 
       const preferredFilter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(preferredUpn)}'`);
       const preferredUsers = await graphRequest<{
@@ -1548,47 +1627,71 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     // mailboxes then cause downstream delegation failures with a cryptic
     // "X/98 missing delegated permissions" error 2 phases later. Catch them
     // here by cross-checking Graph's user list against what PowerShell claimed.
+    //
+    // PowerShell→Graph propagation is slow (Exchange writes commit, then sync
+    // to Azure AD takes 30s–3min). Polling with fixed waits matches our
+    // observed window: most batches are visible by the 30s read, the long
+    // tail by 90s. After 4 attempts (~3.5 min) we accept the missing ones as
+    // genuine ghosts and downgrade them so the next retry can re-create.
     try {
       const claimed = filteredMailboxData
         .filter((mailbox) => mailboxStatuses[mailbox.email]?.created)
         .map((mailbox) => mailbox.email);
 
       if (claimed.length > 0) {
-        // Match against UPN, mail, AND proxyAddresses. When Exchange creates a
-        // shared mailbox via New-Mailbox with a -Name that collides with any
-        // existing Azure AD object, it silently suffixes the auto-derived UPN
-        // ("kgoyal" -> UPN "kgoyal1@domain") while keeping the requested
-        // primary SMTP ("kgoyal@domain"). Checking only UPN misses these as
-        // "ghosts" when they're actually fully-functional mailboxes whose
-        // primarySMTP matches what we asked for.
-        const graphUsers = await graphRequest<{
-          value: Array<{
-            userPrincipalName?: string;
-            mail?: string | null;
-            proxyAddresses?: string[];
-          }>;
-        }>(accessToken, "/users?$select=userPrincipalName,mail,proxyAddresses&$top=999");
+        const visibilityWaitsMs = [0, 30_000, 60_000, 90_000];
+        let ghosts: string[] = claimed;
+        for (let attempt = 0; attempt < visibilityWaitsMs.length; attempt += 1) {
+          if (visibilityWaitsMs[attempt] > 0) {
+            console.log(
+              `⏳ [Microsoft] Waiting ${visibilityWaitsMs[attempt] / 1000}s for ${ghosts.length}/${claimed.length} mailboxes to propagate to Graph (attempt ${attempt + 1}/${visibilityWaitsMs.length})...`
+            );
+            await sleep(visibilityWaitsMs[attempt]);
+          }
+          // Match against UPN, mail, AND proxyAddresses. When Exchange creates a
+          // shared mailbox via New-Mailbox with a -Name that collides with any
+          // existing Azure AD object, it silently suffixes the auto-derived UPN
+          // ("kgoyal" -> UPN "kgoyal1@domain") while keeping the requested
+          // primary SMTP ("kgoyal@domain"). Checking only UPN misses these as
+          // "ghosts" when they're actually fully-functional mailboxes whose
+          // primarySMTP matches what we asked for.
+          const graphUsers = await graphRequest<{
+            value: Array<{
+              userPrincipalName?: string;
+              mail?: string | null;
+              proxyAddresses?: string[];
+            }>;
+          }>(
+            accessToken,
+            "/users?$count=true&$select=userPrincipalName,mail,proxyAddresses&$top=999",
+            { headers: { ConsistencyLevel: "eventual" } }
+          );
 
-        const graphKnownEmails = new Set<string>();
-        for (const u of graphUsers.value || []) {
-          if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.trim().toLowerCase());
-          if (u.mail) graphKnownEmails.add(u.mail.trim().toLowerCase());
-          for (const addr of u.proxyAddresses || []) {
-            if (typeof addr !== "string") continue;
-            // proxyAddresses come as "SMTP:primary@..." or "smtp:alias@..."
-            const lower = addr.toLowerCase();
-            if (lower.startsWith("smtp:")) {
-              graphKnownEmails.add(lower.slice(5));
-            } else {
-              graphKnownEmails.add(lower);
+          const graphKnownEmails = new Set<string>();
+          for (const u of graphUsers.value || []) {
+            if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.trim().toLowerCase());
+            if (u.mail) graphKnownEmails.add(u.mail.trim().toLowerCase());
+            for (const addr of u.proxyAddresses || []) {
+              if (typeof addr !== "string") continue;
+              const lower = addr.toLowerCase();
+              if (lower.startsWith("smtp:")) {
+                graphKnownEmails.add(lower.slice(5));
+              } else {
+                graphKnownEmails.add(lower);
+              }
             }
+          }
+
+          ghosts = claimed.filter((email) => !graphKnownEmails.has(email));
+          if (ghosts.length === 0) {
+            console.log(`✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph (took ${attempt + 1} attempt(s)).`);
+            break;
           }
         }
 
-        const ghosts = claimed.filter((email) => !graphKnownEmails.has(email));
         if (ghosts.length > 0) {
           console.log(
-            `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes PowerShell claimed to create are missing in Graph. Downgrading. Examples: ${ghosts.slice(0, 5).join(", ")}`
+            `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes still missing in Graph after propagation window. Downgrading so retry will recreate them. Examples: ${ghosts.slice(0, 5).join(", ")}`
           );
           for (const email of ghosts) {
             if (mailboxStatuses[email]) {
@@ -1598,8 +1701,6 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
               };
             }
           }
-        } else {
-          console.log(`✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph.`);
         }
       }
     } catch (error) {

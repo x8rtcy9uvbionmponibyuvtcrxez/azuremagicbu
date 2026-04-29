@@ -37,6 +37,22 @@ export async function GET(_request: Request, { params }: Params) {
             setupConfirmed: true,
             createdAt: true,
             updatedAt: true,
+            // Per-step completion flags — surfaced so the UI can render a
+            // checklist of what's done vs in-flight instead of a useless
+            // "Processing in progress." spinner.
+            domainAdded: true,
+            domainVerified: true,
+            domainDefault: true,
+            licensedUserId: true,
+            sharedMailboxesCreated: true,
+            passwordsSet: true,
+            smtpAuthEnabled: true,
+            delegationComplete: true,
+            signInEnabled: true,
+            cloudAppAdminAssigned: true,
+            dkimConfigured: true,
+            smartleadConnected: true,
+            instantlyConnected: true,
             // Uploader tracking
             uploaderJobId: true,
             uploaderStatus: true,

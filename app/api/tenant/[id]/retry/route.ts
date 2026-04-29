@@ -135,7 +135,12 @@ export async function POST(_request: Request, { params }: Params) {
         lowerErr.includes("no license assigned") ||
         lowerErr.includes("has no assigned licenses") ||
         lowerErr.includes("exchange online license") ||
-        lowerErr.includes("no available") && lowerErr.includes("license"));
+        (lowerErr.includes("no available") && lowerErr.includes("license")) ||
+        // Graph eventual-consistency races: the user creation step succeeded
+        // but the subsequent $filter lookup missed it. Both messages mean the
+        // license phase didn't complete and we should re-run it from the top.
+        lowerErr.includes("primary user") && lowerErr.includes("not found in tenant") ||
+        lowerErr.includes("user exists but couldn't find id"));
 
     if (tenantIdentifierInvalid) {
       restartStatus = "tenant_prep";

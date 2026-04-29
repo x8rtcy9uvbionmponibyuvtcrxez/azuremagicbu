@@ -71,6 +71,20 @@ type BatchPayload = {
     setupConfirmed: boolean;
     createdAt: string;
     updatedAt: string;
+    // Per-step completion flags for the sub-step checklist UI.
+    domainAdded: boolean;
+    domainVerified: boolean;
+    domainDefault: boolean;
+    licensedUserId: string | null;
+    sharedMailboxesCreated: boolean;
+    passwordsSet: boolean;
+    smtpAuthEnabled: boolean;
+    delegationComplete: boolean;
+    signInEnabled: boolean;
+    cloudAppAdminAssigned: boolean;
+    dkimConfigured: boolean;
+    smartleadConnected: boolean;
+    instantlyConnected: boolean;
     uploaderJobId: string | null;
     uploaderStatus: UploaderStatus;
     uploaderQueuedAt: string | null;
@@ -1293,12 +1307,63 @@ export default function BatchPage({ params }: PageProps) {
                   </div>
                 ) : null}
 
-                {processingStatuses.has(tenant.status) ? (
-                  <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
-                    <CircleAlert className="h-4 w-4" />
-                    Processing in progress.
-                  </div>
-                ) : null}
+                {processingStatuses.has(tenant.status) ? (() => {
+                  // Sub-step checklist. Each row is { label, done, isCurrent? }.
+                  // We mark the FIRST not-done row as the in-flight step so the
+                  // operator sees exactly where the worker is right now.
+                  const steps: Array<{ label: string; done: boolean }> = [
+                    { label: "Domain added",        done: tenant.domainAdded },
+                    { label: "Domain verified",     done: tenant.domainVerified },
+                    { label: "Domain set default",  done: tenant.domainDefault },
+                    { label: "Licensed user",       done: Boolean(tenant.licensedUserId) },
+                    { label: "Mailboxes created",   done: tenant.sharedMailboxesCreated },
+                    { label: "Passwords set",       done: tenant.passwordsSet },
+                    { label: "SMTP auth",           done: tenant.smtpAuthEnabled },
+                    { label: "Delegation",          done: tenant.delegationComplete },
+                    { label: "Sign-in enabled",     done: tenant.signInEnabled },
+                    { label: "Cloud App Admin",     done: tenant.cloudAppAdminAssigned },
+                    { label: "DKIM",                done: tenant.dkimConfigured }
+                  ];
+                  const firstUnfinished = steps.findIndex((s) => !s.done);
+                  const updatedAtMs = new Date(tenant.updatedAt).getTime();
+                  const staleSec = Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000));
+                  const isStale = staleSec > 5 * 60;
+                  return (
+                    <div className={`rounded-lg border p-3 text-sm ${isStale ? "border-amber-300 bg-amber-50 text-amber-900" : "border-blue-200 bg-blue-50 text-blue-900"}`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <CircleAlert className="h-4 w-4" />
+                          <span className="font-medium">
+                            {tenant.currentStep || "Processing"}
+                          </span>
+                        </div>
+                        <span className="text-xs">
+                          {isStale
+                            ? `⚠ no update for ${Math.floor(staleSec / 60)}m ${staleSec % 60}s`
+                            : staleSec < 60
+                              ? `updated ${staleSec}s ago`
+                              : `updated ${Math.floor(staleSec / 60)}m ago`}
+                        </span>
+                      </div>
+                      <ul className="mt-2 space-y-0.5 text-xs">
+                        {steps.map((s, i) => {
+                          const isCurrent = i === firstUnfinished;
+                          const icon = s.done ? "✅" : isCurrent ? "🔄" : "⏳";
+                          return (
+                            <li key={s.label} className={isCurrent ? "font-medium" : "opacity-80"}>
+                              {icon} {s.label}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      {isStale ? (
+                        <p className="mt-2 text-xs">
+                          Worker hasn&apos;t updated this tenant in over 5 minutes. If it stays stuck, click Retry.
+                        </p>
+                      ) : null}
+                    </div>
+                  );
+                })() : null}
               </CardContent>
             </Card>
           );
