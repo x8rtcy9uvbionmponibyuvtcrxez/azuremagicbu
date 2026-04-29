@@ -654,7 +654,33 @@ export async function verifyDomainWithDns(
     }
   });
 
+  // Verification can fail for two fundamentally different reasons:
+  //
+  //   1. Transient — DNS not propagated yet, Microsoft cached an NXDOMAIN,
+  //      our token doesn't yet have the right scope post-grant. These
+  //      genuinely benefit from waiting + retrying.
+  //
+  //   2. Permanent — domain is already verified in another M365 tenant
+  //      ("Domain is being used by an active tenant" / DomainInUse /
+  //      Name.Conflict). Retrying never helps; Microsoft will keep saying
+  //      no until somebody removes the domain from the OTHER tenant.
+  //
+  // We detect (2) and bail immediately with the real message. For (1) we
+  // keep the existing 5-attempt loop. Either way, when we throw, the
+  // operator sees Microsoft's actual error in Tenant.errorMessage instead
+  // of the generic "5 attempts failed" we used to produce.
   let verified = false;
+  let lastError: string | null = null;
+
+  function isPermanentInUseError(message: string): boolean {
+    const lower = message.toLowerCase();
+    return (
+      lower.includes("domain is being used") ||
+      lower.includes("domaininuse") ||
+      lower.includes("name.conflict")
+    );
+  }
+
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       await graphRequest<Record<string, unknown>>(accessToken, `/domains/${encodeURIComponent(domain)}/verify`, {
@@ -665,6 +691,7 @@ export async function verifyDomainWithDns(
       break;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      lastError = message;
       if (message.toLowerCase().includes("already verified")) {
         await prisma.tenant.update({
           where: { id: tenantDbId },
@@ -672,6 +699,15 @@ export async function verifyDomainWithDns(
         });
         console.log("ℹ️ [Microsoft] Domain already verified, skipping");
         return;
+      }
+
+      if (isPermanentInUseError(message)) {
+        // Retrying won't help — fail fast with the real error so the
+        // operator can act on it (release the domain from the other tenant).
+        console.log(`❌ [Microsoft] Domain ${domain} is registered in another M365 tenant — aborting retries: ${message}`);
+        throw new Error(
+          `Domain ${domain} is registered in another Microsoft 365 tenant and must be released before it can be verified here. Microsoft response: ${message}`
+        );
       }
 
       console.log(
@@ -685,7 +721,9 @@ export async function verifyDomainWithDns(
   }
 
   if (!verified) {
-    throw new Error(`Domain ${domain} verification failed after 5 attempts`);
+    throw new Error(
+      `Domain ${domain} verification failed after 5 attempts. Last error from Microsoft: ${lastError || "(none captured)"}`
+    );
   }
 
   await prisma.tenant.update({
