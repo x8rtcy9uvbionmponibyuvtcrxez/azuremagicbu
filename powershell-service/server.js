@@ -5,12 +5,39 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+const { makeJobStore } = require("./jobStore");
+
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PS_SERVICE_PORT || 3099;
-const delegationJobs = new Map();
-const mailboxCreationJobs = new Map();
+
+// Phase 2.1: durable job state. Default backend is in-memory (legacy).
+// Set JOB_STORE_BACKEND=redis + REDIS_URL to enable Redis-backed durable
+// state that survives container restarts. See jobStore.js.
+let redisClient = null;
+if (process.env.JOB_STORE_BACKEND === "redis") {
+  if (!process.env.REDIS_URL) {
+    console.log("⚠️ [JobStore] JOB_STORE_BACKEND=redis but REDIS_URL not set — falling back to memory backend");
+  } else {
+    try {
+      const Redis = require("ioredis");
+      redisClient = new Redis(process.env.REDIS_URL, {
+        maxRetriesPerRequest: 3,
+        enableReadyCheck: true
+      });
+      redisClient.on("error", (err) => {
+        console.log(`⚠️ [JobStore] Redis client error: ${err.message}`);
+      });
+    } catch (err) {
+      console.log(`⚠️ [JobStore] Could not initialize ioredis: ${err.message}. Falling back to memory backend.`);
+      redisClient = null;
+    }
+  }
+}
+
+const delegationJobs = makeJobStore("delegation", redisClient);
+const mailboxCreationJobs = makeJobStore("mailbox-create", redisClient);
 
 function escapePowerShellString(value) {
   return String(value || "")
@@ -392,7 +419,13 @@ app.post("/start-create-shared-mailboxes", async (req, res) => {
 
     const jobId = `create-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const job = { status: "running", completed: 0, total: mailboxes.length, error: null, results: [] };
-    mailboxCreationJobs.set(jobId, job);
+    await mailboxCreationJobs.set(jobId, job);
+    // Phase 2.1: while the job is running, flush in-memory state to the
+    // store every 2s so /status survives a container restart with at most
+    // 2s of lost progress. Cancelled in .finally() below.
+    const flushTimer = setInterval(() => {
+      mailboxCreationJobs.set(jobId, job).catch(() => { /* swallow store errors; the local job is still authoritative */ });
+    }, 2000);
 
     res.json({ success: true, jobId, status: "started", total: mailboxes.length });
 
@@ -498,7 +531,13 @@ $results | ConvertTo-Json -Compress
         job.status = "failed";
         job.error = error.message || String(error);
       })
-      .finally(() => {
+      .finally(async () => {
+        clearInterval(flushTimer);
+        // Final write so /status reflects the terminal state without
+        // waiting on the next periodic flush tick.
+        try {
+          await mailboxCreationJobs.set(jobId, job);
+        } catch {}
         if (tmpFile) {
           try {
             fs.unlinkSync(tmpFile);
@@ -510,10 +549,14 @@ $results | ConvertTo-Json -Compress
   }
 });
 
-app.get("/create-shared-mailboxes-status/:jobId", (req, res) => {
-  const job = mailboxCreationJobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
-  res.json(job);
+app.get("/create-shared-mailboxes-status/:jobId", async (req, res) => {
+  try {
+    const job = await mailboxCreationJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    res.json(job);
+  } catch (error) {
+    res.status(500).json({ error: error.message || String(error) });
+  }
 });
 
 app.post("/enable-smtp-auth", async (req, res) => {
@@ -579,7 +622,12 @@ app.post("/start-delegation", async (req, res) => {
 
     const jobId = Date.now().toString();
     const job = { status: "running", completed: 0, total: emails.length, errors: [], results: [] };
-    delegationJobs.set(jobId, job);
+    await delegationJobs.set(jobId, job);
+    // Phase 2.1: periodic flush so /delegation-status survives a container
+    // restart with at most 2s of lost progress. Cancelled in .finally().
+    const flushTimer = setInterval(() => {
+      delegationJobs.set(jobId, job).catch(() => {});
+    }, 2000);
 
     // Respond immediately with jobId
     res.json({ success: true, jobId, status: "started", total: emails.length });
@@ -764,7 +812,13 @@ $results | ConvertTo-Json -Compress
         job.error = error.message;
         console.error(`Delegation job ${jobId} failed:`, error.message);
       })
-      .finally(() => {
+      .finally(async () => {
+        clearInterval(flushTimer);
+        // Final write so /delegation-status reflects the terminal state
+        // without waiting for the next periodic flush tick.
+        try {
+          await delegationJobs.set(jobId, job);
+        } catch {}
         try { fs.unlinkSync(tmpFile); } catch {}
       });
 
@@ -773,10 +827,14 @@ $results | ConvertTo-Json -Compress
   }
 });
 
-app.get("/delegation-status/:jobId", (req, res) => {
-  const job = delegationJobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
-  res.json(job);
+app.get("/delegation-status/:jobId", async (req, res) => {
+  try {
+    const job = await delegationJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    res.json(job);
+  } catch (error) {
+    res.status(500).json({ error: error.message || String(error) });
+  }
 });
 
 app.post("/verify-delegation", async (req, res) => {
