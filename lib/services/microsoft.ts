@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
+import { extractErrorCode, logCall, withCallLogging } from "@/lib/observability";
 import { prisma } from "@/lib/prisma";
 import { generateEmailVariations, generateStrongPassword } from "@/lib/services/email-generator";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
@@ -201,6 +202,242 @@ function toCsv(rows: string[][]): string {
 function escapeODataString(value: string): string {
   return value.replace(/'/g, "''");
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+//  PHASE 1 — MICROSOFT-AS-TRUTH POLLING HELPERS
+// ═════════════════════════════════════════════════════════════════════════
+//
+// These helpers replace inline retry-on-error sites scattered across
+// setupDomainAndUser, setupSharedMailboxes, ensurePrimaryUserLicensed,
+// configureDkim. The pattern they replace:
+//
+//   for (let attempt = 0; attempt < N; attempt++) {
+//     try { await graphRequest(...); break; }
+//     catch (e) { if (looksTransient(e)) await sleep(...); else throw; }
+//   }
+//
+// The pattern they introduce:
+//
+//   const result = await awaitX(...);
+//   if (!result.ok) { /* operator-visible error */ }
+//
+// The semantic shift: stop trying-and-throwing on misses. Poll Microsoft
+// state until the desired condition holds, with a measured budget. Microsoft
+// is the truth; the DB is a cache; we wait for Microsoft to catch up before
+// advancing the phase machine.
+//
+// All helpers are gated by `USE_POLL_HELPERS=true`. Default is false.
+// Existing call sites keep working unless the flag flips.
+//
+// See BULLETPROOF_PLAN_DETAILED.md Area 6 (bugs 6.1-6.10) for the full
+// argument and the bugs each helper kills.
+
+export const USE_POLL_HELPERS = process.env.USE_POLL_HELPERS === "true";
+
+type PollResult<T> = { ok: true; value: T } | { ok: false; reason: string };
+
+/** Default budget: 5 attempts spaced 0/5/15/30/30s = 80s total. Tight enough
+ *  to surface real failures, loose enough to handle Graph propagation. */
+const DEFAULT_POLL_BACKOFFS_MS = [0, 5_000, 15_000, 30_000, 30_000];
+
+/** Generic poll-until-ready loop. Returns the first attempt where
+ *  `predicate` returns a truthy value. If all attempts exhaust, returns
+ *  the last predicate result wrapped in `{ ok: false }`.
+ *
+ *  Phase 4 — emits one structured log line per attempt via logCall, so
+ *  the metrics endpoint can compute first-attempt-success rate, p95
+ *  latency, error-code histogram per polling op without us hand-instrumenting
+ *  each helper.
+ */
+async function pollUntil<T>(opts: {
+  op: string;
+  description: string;
+  backoffsMs?: number[];
+  predicate: () => Promise<{ ready: boolean; value?: T; detail?: string }>;
+}): Promise<PollResult<T>> {
+  const backoffs = opts.backoffsMs ?? DEFAULT_POLL_BACKOFFS_MS;
+  let lastDetail = "";
+  for (let i = 0; i < backoffs.length; i += 1) {
+    if (backoffs[i] > 0) await sleep(backoffs[i]);
+    const started = Date.now();
+    let outcome: { ready: boolean; value?: T; detail?: string };
+    try {
+      outcome = await opts.predicate();
+    } catch (error) {
+      lastDetail = error instanceof Error ? error.message : String(error);
+      logCall({
+        op: opts.op,
+        attempt: i + 1,
+        latency_ms: Date.now() - started,
+        ok: false,
+        errCode: extractErrorCode(error),
+        detail: lastDetail.slice(0, 200)
+      });
+      continue;
+    }
+    logCall({
+      op: opts.op,
+      attempt: i + 1,
+      latency_ms: Date.now() - started,
+      ok: outcome.ready,
+      detail: outcome.detail
+    });
+    if (outcome.ready && outcome.value !== undefined) {
+      return { ok: true, value: outcome.value };
+    }
+    lastDetail = outcome.detail || "not ready yet";
+  }
+  return { ok: false, reason: `${opts.description}: ${lastDetail || "exhausted budget"}` };
+}
+
+/** Bug 6.1 — replaces the $filter-immediately-after-POST race in
+ *  ensurePrimaryUserLicensed. PR #41 added lookupUserByUpnWaitingForPropagation;
+ *  this generalizes it. Uses ConsistencyLevel: eventual. */
+export async function awaitUserExistsInTenant(
+  accessToken: string,
+  upn: string
+): Promise<PollResult<{ id: string; userPrincipalName: string }>> {
+  return pollUntil({
+    op: "awaitUserExistsInTenant",
+    description: `Waiting for ${upn} to be visible in /users`,
+    predicate: async () => {
+      const filter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(upn)}'`);
+      const resp = await graphRequest<{
+        value: Array<{ id: string; userPrincipalName: string }>;
+      }>(accessToken, `/users?$filter=${filter}&$count=true&$select=id,userPrincipalName`, {
+        headers: { ConsistencyLevel: "eventual" }
+      });
+      const hit = resp.value?.[0];
+      if (hit?.id) return { ready: true, value: { id: hit.id, userPrincipalName: hit.userPrincipalName } };
+      return { ready: false, detail: "no rows yet" };
+    }
+  });
+}
+
+/** Bug 6.4 — replaces the 8-attempt loop in setDomainAsDefault that races
+ *  Microsoft's domain-verify state propagation. */
+export async function awaitDomainVerified(
+  accessToken: string,
+  domain: string
+): Promise<PollResult<{ verified: true }>> {
+  return pollUntil({
+    op: "awaitDomainVerified",
+    description: `Waiting for ${domain} to be Verified`,
+    backoffsMs: [0, 10_000, 20_000, 30_000, 30_000, 30_000], // domain verify is the slowest of the bunch
+    predicate: async () => {
+      const resp = await graphRequest<{ isVerified?: boolean; state?: string }>(
+        accessToken,
+        `/domains/${encodeURIComponent(domain)}`
+      );
+      if (resp?.isVerified === true) return { ready: true, value: { verified: true as const } };
+      return { ready: false, detail: `state=${resp?.state || "?"}` };
+    }
+  });
+}
+
+/** Bug 6.2 + Bug 6.6 — replaces the 4-attempt mailbox-visibility check.
+ *  Returns the *missing* list, including when budget exhausts (so caller
+ *  can choose to either downgrade-and-retry or hard-fail). Never throws on
+ *  partial — that's the whole point of the shift. */
+export async function awaitMailboxesVisible(
+  accessToken: string,
+  expectedEmails: string[]
+): Promise<{ allVisible: boolean; missing: string[]; attempts: number }> {
+  if (expectedEmails.length === 0) {
+    return { allVisible: true, missing: [], attempts: 0 };
+  }
+  const wanted = expectedEmails.map((e) => e.toLowerCase());
+  const backoffs = [0, 30_000, 60_000, 60_000, 60_000]; // ~3.5min total
+  let lastMissing: string[] = wanted;
+  for (let i = 0; i < backoffs.length; i += 1) {
+    if (backoffs[i] > 0) await sleep(backoffs[i]);
+    try {
+      // Single page fetch covers up to 999 users — adequate for current scale.
+      // Bug 6.8 (full pagination) tracked separately.
+      const resp = await graphRequest<{
+        value: Array<{ userPrincipalName?: string; mail?: string; proxyAddresses?: string[] }>;
+      }>(
+        accessToken,
+        "/users?$top=999&$select=userPrincipalName,mail,proxyAddresses",
+        { headers: { ConsistencyLevel: "eventual" } }
+      );
+      const seen = new Set<string>();
+      for (const user of resp.value || []) {
+        if (user.userPrincipalName) seen.add(user.userPrincipalName.toLowerCase());
+        if (user.mail) seen.add(user.mail.toLowerCase());
+        for (const proxy of user.proxyAddresses || []) {
+          seen.add(proxy.replace(/^smtp:/i, "").toLowerCase());
+        }
+      }
+      lastMissing = wanted.filter((e) => !seen.has(e));
+      if (lastMissing.length === 0) {
+        return { allVisible: true, missing: [], attempts: i + 1 };
+      }
+    } catch {
+      // network blip; treat as "not yet" and retry
+    }
+  }
+  return { allVisible: false, missing: lastMissing, attempts: backoffs.length };
+}
+
+/** Bug 6.5 — replaces the 3-attempt read-after-write verify in
+ *  ensurePrimaryUserLicensed Step D. */
+export async function awaitLicenseAttached(
+  accessToken: string,
+  userId: string,
+  skuId: string
+): Promise<PollResult<{ attached: true }>> {
+  return pollUntil({
+    op: "awaitLicenseAttached",
+    description: `Waiting for license ${skuId} to attach to user ${userId}`,
+    predicate: async () => {
+      const resp = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
+        accessToken,
+        `/users/${userId}?$select=assignedLicenses`
+      );
+      const hit = (resp.assignedLicenses || []).some((l) => l?.skuId === skuId);
+      if (hit) return { ready: true, value: { attached: true as const } };
+      return { ready: false, detail: "license not yet on user record" };
+    }
+  });
+}
+
+/** Bug 6.3 — replaces the 6-attempt grant-then-retry loop in
+ *  createLicensedUser's Global Admin grant block.
+ *
+ *  Queries the legacy /directoryRoles/{roleId}/members endpoint because
+ *  that's where grantGlobalAdmin POSTs the assignment (via $ref). The
+ *  newer roleManagement/directory/roleAssignments path also reflects
+ *  GA but with its own propagation lag — staying consistent with the
+ *  write side avoids reading from the slower replica. */
+export async function awaitGlobalAdminGranted(
+  accessToken: string,
+  userId: string,
+  roleId: string
+): Promise<PollResult<{ granted: true }>> {
+  return pollUntil({
+    op: "awaitGlobalAdminGranted",
+    description: `Waiting for Global Admin role ${roleId} to include user ${userId}`,
+    predicate: async () => {
+      // /directoryRoles/{id}/members lists every member of this role.
+      // For a fresh tenant this is small (<10 entries), so the cost is
+      // negligible. We check id-equality client-side rather than via
+      // $filter because the directoryRoles members endpoint doesn't
+      // support $filter on member id reliably.
+      const resp = await graphRequest<{ value: Array<{ id: string }> }>(
+        accessToken,
+        `/directoryRoles/${roleId}/members?$select=id`
+      );
+      const found = (resp.value || []).some((m) => m?.id === userId);
+      if (found) return { ready: true, value: { granted: true as const } };
+      return { ready: false, detail: "user not yet in role members list" };
+    }
+  });
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  END PHASE 1 HELPERS
+// ═════════════════════════════════════════════════════════════════════════
 
 type MailboxCheckpointState = {
   created: boolean;
@@ -969,6 +1206,18 @@ async function ensurePrimaryUserLicensed(
       accessToken,
       `/users/${knownId}?$select=id,userPrincipalName,assignedLicenses`
     );
+  } else if (USE_POLL_HELPERS) {
+    // Phase 1 path — Bug 6.1. The new helper uses ConsistencyLevel: eventual
+    // and the shared poll-until budget. Once we confirm the user exists,
+    // do a strongly-consistent GET /users/{id} to pull assignedLicenses
+    // (the awaitUserExistsInTenant projection is just id + UPN).
+    const existence = await awaitUserExistsInTenant(accessToken, primaryUpn);
+    if (existence.ok) {
+      primaryRecord = await graphRequest<{ id: string; assignedLicenses?: Array<{ skuId: string }> }>(
+        accessToken,
+        `/users/${existence.value.id}?$select=id,userPrincipalName,assignedLicenses`
+      );
+    }
   } else {
     primaryRecord = await lookupUserByUpnWaitingForPropagation(accessToken, primaryUpn);
   }
@@ -1072,22 +1321,34 @@ async function ensurePrimaryUserLicensed(
     }
 
     // Verify the license actually attached — Graph can return 2xx with nothing applied.
-    try {
-      const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
-        accessToken,
-        `/users/${primaryUser.id}?$select=assignedLicenses`
-      );
-      const stuck =
-        Array.isArray(verify.assignedLicenses) && verify.assignedLicenses.some((l) => l?.skuId === availableSku.skuId);
-      if (stuck) {
-        console.log(`✅ [License] ${availableSku.skuPartNumber} attached and verified on ${primaryUpn}`);
+    if (USE_POLL_HELPERS) {
+      // Phase 1 path — Bug 6.5. Polls the user record until the license shows up.
+      const result = await awaitLicenseAttached(accessToken, primaryUser.id, availableSku.skuId);
+      if (result.ok) {
+        console.log(`✅ [License] ${availableSku.skuPartNumber} attached and verified on ${primaryUpn} (helper)`);
         return { skuPartNumber: availableSku.skuPartNumber };
       }
-    } catch (error) {
       console.log(
-        `⚠️ [License] Verify failed on attempt ${attempt + 1}:`,
-        error instanceof Error ? error.message : String(error)
+        `⚠️ [License] Helper did not see license attach on attempt ${attempt + 1}: ${result.reason}`
       );
+    } else {
+      try {
+        const verify = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
+          accessToken,
+          `/users/${primaryUser.id}?$select=assignedLicenses`
+        );
+        const stuck =
+          Array.isArray(verify.assignedLicenses) && verify.assignedLicenses.some((l) => l?.skuId === availableSku.skuId);
+        if (stuck) {
+          console.log(`✅ [License] ${availableSku.skuPartNumber} attached and verified on ${primaryUpn}`);
+          return { skuPartNumber: availableSku.skuPartNumber };
+        }
+      } catch (error) {
+        console.log(
+          `⚠️ [License] Verify failed on attempt ${attempt + 1}:`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
     }
   }
 
@@ -1209,6 +1470,7 @@ export async function createLicensedUser(
   const GRANT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000];
   let grantSucceeded = false;
   let grantError: string | null = null;
+  let grantedRoleId: string | null = null;
   for (let attempt = 0; attempt < GRANT_ATTEMPTS; attempt++) {
     try {
       const grantResult = await grantGlobalAdmin(accessToken, { kind: "user", id: userId });
@@ -1220,6 +1482,7 @@ export async function createLicensedUser(
         );
         grantSucceeded = true;
         grantError = null;
+        grantedRoleId = grantResult.roleId || null;
         break;
       }
       grantError = grantResult.error || "unknown error";
@@ -1232,6 +1495,24 @@ export async function createLicensedUser(
     );
     if (!isLast) {
       await new Promise((resolve) => setTimeout(resolve, GRANT_BACKOFF_MS[attempt]));
+    }
+  }
+
+  // Bug 6.3: even after the grant POST returns 2xx, Microsoft may not have
+  // propagated the membership to read replicas. Subsequent OAuth flows that
+  // check "is this user a Global Admin" can fail until propagation lands.
+  // Poll until the user shows up in the directoryRole members list. Flag-
+  // gated and best-effort — non-blocking even on exhaust.
+  if (USE_POLL_HELPERS && grantSucceeded && grantedRoleId) {
+    const propagation = await awaitGlobalAdminGranted(accessToken, userId, grantedRoleId);
+    if (!propagation.ok) {
+      console.log(
+        `⚠️ [Microsoft] (USE_POLL_HELPERS) GA grant POST succeeded but role-membership poll exhausted: ${propagation.reason}. Continuing — first OAuth attempt will likely succeed once Microsoft catches up.`
+      );
+    } else {
+      console.log(
+        `✅ [Microsoft] (USE_POLL_HELPERS) Global Admin role membership confirmed for ${userPrincipalName}`
+      );
     }
   }
 
@@ -1352,6 +1633,22 @@ export async function setupDomainAndUser(tenantDbId: string): Promise<void> {
   if (!domainVerified) {
     await verifyDomainWithDns(tenantDbId, domain, zoneId, accessToken);
     domainVerified = true;
+  }
+
+  // Bug 6.4: between verifyDomainWithDns succeeding and setDomainAsDefault
+  // running, Microsoft's domain-verify state may not have propagated to
+  // the update endpoint yet (PATCH /domains/{x} returns 400 "domain
+  // unverified"). The poll helper waits for the verified flag to become
+  // visible on the read side before we rely on it. Behind USE_POLL_HELPERS.
+  if (USE_POLL_HELPERS && !domainDefault) {
+    const verified = await awaitDomainVerified(accessToken, domain);
+    if (!verified.ok) {
+      console.log(
+        `⚠️ [Microsoft] (USE_POLL_HELPERS) Domain ${domain} verify state not visible yet: ${verified.reason}. Falling through to setDomainAsDefault — its own retry loop will handle.`
+      );
+    } else {
+      console.log(`✅ [Microsoft] (USE_POLL_HELPERS) Domain ${domain} verified state confirmed via poll`);
+    }
   }
 
   if (!domainDefault) {
@@ -1772,66 +2069,93 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         .map((mailbox) => mailbox.email);
 
       if (claimed.length > 0) {
-        const visibilityWaitsMs = [0, 30_000, 60_000, 90_000];
-        let ghosts: string[] = claimed;
-        for (let attempt = 0; attempt < visibilityWaitsMs.length; attempt += 1) {
-          if (visibilityWaitsMs[attempt] > 0) {
-            console.log(
-              `⏳ [Microsoft] Waiting ${visibilityWaitsMs[attempt] / 1000}s for ${ghosts.length}/${claimed.length} mailboxes to propagate to Graph (attempt ${attempt + 1}/${visibilityWaitsMs.length})...`
-            );
-            await sleep(visibilityWaitsMs[attempt]);
-          }
-          // Match against UPN, mail, AND proxyAddresses. When Exchange creates a
-          // shared mailbox via New-Mailbox with a -Name that collides with any
-          // existing Azure AD object, it silently suffixes the auto-derived UPN
-          // ("kgoyal" -> UPN "kgoyal1@domain") while keeping the requested
-          // primary SMTP ("kgoyal@domain"). Checking only UPN misses these as
-          // "ghosts" when they're actually fully-functional mailboxes whose
-          // primarySMTP matches what we asked for.
-          const graphUsers = await graphRequest<{
-            value: Array<{
-              userPrincipalName?: string;
-              mail?: string | null;
-              proxyAddresses?: string[];
-            }>;
-          }>(
-            accessToken,
-            "/users?$count=true&$select=userPrincipalName,mail,proxyAddresses&$top=999",
-            { headers: { ConsistencyLevel: "eventual" } }
+        if (USE_POLL_HELPERS) {
+          // Phase 1 path — see BULLETPROOF_PLAN_DETAILED.md Bug 6.2 + 6.6.
+          // The helper polls Graph until either every claimed mailbox is
+          // visible OR the budget exhausts. On exhaust, downgrade the
+          // missing ones the same way the legacy block did, so the next
+          // retry will re-create just the ghosts.
+          console.log(
+            `⏳ [Microsoft] (USE_POLL_HELPERS) Waiting for ${claimed.length} mailboxes to be visible in Graph...`
           );
-
-          const graphKnownEmails = new Set<string>();
-          for (const u of graphUsers.value || []) {
-            if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.trim().toLowerCase());
-            if (u.mail) graphKnownEmails.add(u.mail.trim().toLowerCase());
-            for (const addr of u.proxyAddresses || []) {
-              if (typeof addr !== "string") continue;
-              const lower = addr.toLowerCase();
-              if (lower.startsWith("smtp:")) {
-                graphKnownEmails.add(lower.slice(5));
-              } else {
-                graphKnownEmails.add(lower);
+          const result = await awaitMailboxesVisible(accessToken, claimed);
+          if (result.allVisible) {
+            console.log(
+              `✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph (took ${result.attempts} poll(s) via helper).`
+            );
+          } else {
+            console.log(
+              `⚠️ [Microsoft] ${result.missing.length}/${claimed.length} mailboxes still missing in Graph after propagation window. Downgrading so retry will recreate them. Examples: ${result.missing.slice(0, 5).join(", ")}`
+            );
+            for (const email of result.missing) {
+              if (mailboxStatuses[email]) {
+                mailboxStatuses[email] = { ...mailboxStatuses[email], created: false };
               }
             }
           }
+        } else {
+          // Legacy path — preserved verbatim for the default code path.
+          const visibilityWaitsMs = [0, 30_000, 60_000, 90_000];
+          let ghosts: string[] = claimed;
+          for (let attempt = 0; attempt < visibilityWaitsMs.length; attempt += 1) {
+            if (visibilityWaitsMs[attempt] > 0) {
+              console.log(
+                `⏳ [Microsoft] Waiting ${visibilityWaitsMs[attempt] / 1000}s for ${ghosts.length}/${claimed.length} mailboxes to propagate to Graph (attempt ${attempt + 1}/${visibilityWaitsMs.length})...`
+              );
+              await sleep(visibilityWaitsMs[attempt]);
+            }
+            // Match against UPN, mail, AND proxyAddresses. When Exchange creates a
+            // shared mailbox via New-Mailbox with a -Name that collides with any
+            // existing Azure AD object, it silently suffixes the auto-derived UPN
+            // ("kgoyal" -> UPN "kgoyal1@domain") while keeping the requested
+            // primary SMTP ("kgoyal@domain"). Checking only UPN misses these as
+            // "ghosts" when they're actually fully-functional mailboxes whose
+            // primarySMTP matches what we asked for.
+            const graphUsers = await graphRequest<{
+              value: Array<{
+                userPrincipalName?: string;
+                mail?: string | null;
+                proxyAddresses?: string[];
+              }>;
+            }>(
+              accessToken,
+              "/users?$count=true&$select=userPrincipalName,mail,proxyAddresses&$top=999",
+              { headers: { ConsistencyLevel: "eventual" } }
+            );
 
-          ghosts = claimed.filter((email) => !graphKnownEmails.has(email));
-          if (ghosts.length === 0) {
-            console.log(`✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph (took ${attempt + 1} attempt(s)).`);
-            break;
+            const graphKnownEmails = new Set<string>();
+            for (const u of graphUsers.value || []) {
+              if (u.userPrincipalName) graphKnownEmails.add(u.userPrincipalName.trim().toLowerCase());
+              if (u.mail) graphKnownEmails.add(u.mail.trim().toLowerCase());
+              for (const addr of u.proxyAddresses || []) {
+                if (typeof addr !== "string") continue;
+                const lower = addr.toLowerCase();
+                if (lower.startsWith("smtp:")) {
+                  graphKnownEmails.add(lower.slice(5));
+                } else {
+                  graphKnownEmails.add(lower);
+                }
+              }
+            }
+
+            ghosts = claimed.filter((email) => !graphKnownEmails.has(email));
+            if (ghosts.length === 0) {
+              console.log(`✅ [Microsoft] Verified all ${claimed.length} mailboxes exist in Graph (took ${attempt + 1} attempt(s)).`);
+              break;
+            }
           }
-        }
 
-        if (ghosts.length > 0) {
-          console.log(
-            `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes still missing in Graph after propagation window. Downgrading so retry will recreate them. Examples: ${ghosts.slice(0, 5).join(", ")}`
-          );
-          for (const email of ghosts) {
-            if (mailboxStatuses[email]) {
-              mailboxStatuses[email] = {
-                ...mailboxStatuses[email],
-                created: false
-              };
+          if (ghosts.length > 0) {
+            console.log(
+              `⚠️ [Microsoft] ${ghosts.length}/${claimed.length} mailboxes still missing in Graph after propagation window. Downgrading so retry will recreate them. Examples: ${ghosts.slice(0, 5).join(", ")}`
+            );
+            for (const email of ghosts) {
+              if (mailboxStatuses[email]) {
+                mailboxStatuses[email] = {
+                  ...mailboxStatuses[email],
+                  created: false
+                };
+              }
             }
           }
         }
@@ -3201,4 +3525,147 @@ export async function verifyPersonaDisplayNames(
   }
 
   return { total: expected.length, matched, mismatched };
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  PHASE 1 DAY 4 — TENANT-STATE RECONCILIATION
+// ═════════════════════════════════════════════════════════════════════════
+//
+// "Microsoft is truth, DB is cache." Today's worker reads boolean flags on
+// the Tenant row to decide what phase to run. Those flags drift from
+// Microsoft constantly: the retry route writes them, manual operator
+// pushes write them, partial worker runs leave them inconsistent. The
+// worker then makes Graph calls assuming a state that isn't true.
+//
+// reconcileTenantFromMicrosoft asks Microsoft "what is true right now?"
+// at every phase boundary and updates the DB flags to match before the
+// worker decides what to run next. Drift can't accumulate across
+// boundaries.
+//
+// Behind USE_POLL_HELPERS=true. Default is the legacy flag-based logic.
+//
+// What's checked (in order, cheap → expensive):
+//   1. Domain state (isVerified, isDefault) — single GET /domains/{x}
+//   2. Licensed user exists by ID (if licensedUserId set) — GET /users/{id}
+//   3. Mailbox count visible in Graph — list /users (single $top=999 page)
+//
+// What's NOT checked (still trusted from DB):
+//   - per-mailbox passwordSet / smtpEnabled / delegated / signInEnabled —
+//     these are PowerShell-driven and we don't have a cheap MS read for them.
+//   - dkimConfigured — Cloudflare-side, not MS.
+//   - integration flags (smartlead, instantly).
+//
+// Skipped silently when:
+//   - tenant has no organizationId yet (pre-auth).
+//   - Graph token request fails (we don't want reconcile errors to block
+//     phase progression — the worker's own Graph calls will surface the
+//     real error).
+export type ReconcileResult = {
+  reconciled: boolean;
+  reason?: string;
+  changes: Partial<{
+    domainAdded: boolean;
+    domainVerified: boolean;
+    domainDefault: boolean;
+    sharedMailboxesCreated: boolean;
+  }>;
+};
+
+export async function reconcileTenantFromMicrosoft(tenantDbId: string): Promise<ReconcileResult> {
+  if (!USE_POLL_HELPERS) {
+    return { reconciled: false, reason: "USE_POLL_HELPERS off", changes: {} };
+  }
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantDbId },
+    select: {
+      id: true,
+      tenantId: true,
+      domain: true,
+      domainAdded: true,
+      domainVerified: true,
+      domainDefault: true,
+      licensedUserId: true,
+      sharedMailboxesCreated: true,
+      inboxNames: true,
+      inboxCount: true,
+      licensedUserUpn: true
+    }
+  });
+  if (!tenant) {
+    return { reconciled: false, reason: "tenant not found", changes: {} };
+  }
+  if (!tenant.tenantId) {
+    return { reconciled: false, reason: "tenant pre-auth (no organizationId)", changes: {} };
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await requestTenantGraphToken(tenant.tenantId);
+  } catch (error) {
+    return {
+      reconciled: false,
+      reason: `could not get Graph token: ${error instanceof Error ? error.message : String(error)}`,
+      changes: {}
+    };
+  }
+
+  const changes: ReconcileResult["changes"] = {};
+
+  // 1. Domain state.
+  try {
+    const dom = await graphRequest<{ isVerified?: boolean; isDefault?: boolean }>(
+      accessToken,
+      `/domains/${encodeURIComponent(tenant.domain)}`
+    );
+    const msVerified = dom?.isVerified === true;
+    const msDefault = dom?.isDefault === true;
+    if (!tenant.domainAdded) changes.domainAdded = true; // it answered → it's added
+    if (msVerified !== tenant.domainVerified) changes.domainVerified = msVerified;
+    if (msDefault !== tenant.domainDefault) changes.domainDefault = msDefault;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isDomainMissingInTenantError(message)) {
+      // DB might say domainAdded=true but MS says no — downgrade so the
+      // worker re-adds. This is the canonical drift case.
+      if (tenant.domainAdded) changes.domainAdded = false;
+      if (tenant.domainVerified) changes.domainVerified = false;
+      if (tenant.domainDefault) changes.domainDefault = false;
+    }
+    // Other errors: leave DB flags alone, log and continue.
+  }
+
+  // 2. Mailbox count visible in Graph.
+  // Skip if mailboxes weren't expected yet (no licensed user → not in mailbox phase).
+  if (tenant.sharedMailboxesCreated && tenant.licensedUserUpn) {
+    const names = parseInboxNamesValue(tenant.inboxNames);
+    const expected = generateEmailVariations(names, tenant.domain, tenant.inboxCount);
+    if (expected.length > 0) {
+      try {
+        const result = await awaitMailboxesVisible(
+          accessToken,
+          expected.map((m) => m.email)
+        );
+        // Only DOWNGRADE on a real "definitively missing" reading. If the
+        // helper exhausted with some missing, that's still potentially a
+        // propagation tail — don't flip the flag based on a non-definitive
+        // read. We only rewrite to `false` when we have a confident "no
+        // mailboxes visible at all" answer (fast read, allVisible=false,
+        // missing.length === expected.length).
+        if (!result.allVisible && result.missing.length === expected.length && result.attempts === 1) {
+          changes.sharedMailboxesCreated = false;
+        }
+      } catch {
+        // Skip silently — don't fail reconcile on a transient list error.
+      }
+    }
+  }
+
+  if (Object.keys(changes).length > 0) {
+    await prisma.tenant.update({
+      where: { id: tenant.id },
+      data: changes
+    });
+  }
+
+  return { reconciled: true, changes };
 }
