@@ -559,7 +559,13 @@ export default function BatchPage({ params }: PageProps) {
 
   const authGridTenants = useMemo(() => {
     if (!data) return [];
-    return data.tenants.filter((tenant) => tenant.status === "auth_pending" || Boolean(tenant.authCode));
+    // Show ALL tenants from the original CSV unconditionally, not just the
+    // ones currently in auth_pending. Per-row rendering already branches
+    // on status (Completed / Failed badge for done, "New code" + "I've
+    // Entered the Code" buttons for in-flight auth). Filtering here
+    // caused tenants to "disappear" from the grid the moment they
+    // advanced past auth, which made operators panic.
+    return data.tenants;
   }, [data]);
 
   const showAuthGrid = useMemo(() => {
