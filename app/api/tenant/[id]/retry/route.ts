@@ -3,6 +3,7 @@ import type { TenantStatus } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { enqueueTenantProcessingJob, getTenantQueue } from "@/lib/queue";
+import { initiateDeviceAuth } from "@/lib/services/microsoft";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { logTenantEvent } from "@/lib/tenant-events";
 
@@ -277,6 +278,26 @@ export async function POST(_request: Request, { params }: Params) {
       where: { id: tenant.batchId },
       data: { status: "processing" }
     });
+
+    // When the operator clicks "New code" we rewind to tenant_prep, which
+    // wipes authCode/deviceCode/authCodeExpiry. The device-auth UI list
+    // filters on `auth_pending` status OR `Boolean(authCode)`, so the row
+    // would otherwise vanish for the 5-30s gap between this update and
+    // the worker picking up the job + calling initiateDeviceAuth. Generate
+    // the fresh code synchronously here so the new authCode lands before
+    // we return to the UI — the row stays visible the whole time.
+    if (restartStatus === "tenant_prep") {
+      try {
+        await initiateDeviceAuth(tenant.id);
+      } catch (error) {
+        // Don't fail the retry if device-auth init has a transient hiccup.
+        // The worker will retry it on the next phase pass anyway.
+        console.error(
+          "[Retry] Eager initiateDeviceAuth failed (worker will retry):",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
 
     let enqueuedJob = await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
     let enqueueState = await enqueuedJob.getState();
