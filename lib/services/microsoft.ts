@@ -1,9 +1,9 @@
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 
-import { decryptSecret } from "@/lib/crypto";
+import { decryptSecret, encryptSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
-import { generateEmailVariations } from "@/lib/services/email-generator";
+import { generateEmailVariations, generateStrongPassword } from "@/lib/services/email-generator";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
 import { parseInboxNamesValue } from "@/lib/utils";
 
@@ -209,6 +209,13 @@ type MailboxCheckpointState = {
   delegated: boolean;
   signInEnabled: boolean;
   cloudAppAdminAssigned: boolean;
+  // Bug 12.3: each mailbox gets its own unique strong password instead of
+  // sharing the tenant admin password. Stored encrypted; decrypted at use
+  // time (PS password set + CSV download). Generated lazily on first
+  // mailbox-phase entry. Optional for back-compat with batches that
+  // finished before this column was populated — those fall back to the
+  // tenant admin password as before.
+  password?: string;
 };
 
 type MailboxCheckpointMap = Record<string, MailboxCheckpointState>;
@@ -247,7 +254,8 @@ function normalizeMailboxStatuses(raw: unknown): MailboxCheckpointMap {
       smtpEnabled: item.smtpEnabled === true,
       delegated: item.delegated === true,
       signInEnabled: item.signInEnabled === true,
-      cloudAppAdminAssigned: item.cloudAppAdminAssigned === true
+      cloudAppAdminAssigned: item.cloudAppAdminAssigned === true,
+      password: typeof item.password === "string" && item.password ? item.password : undefined
     };
   }
 
@@ -1384,10 +1392,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     }
   })();
 
-  const mailboxData = generateEmailVariations(names, domain, tenant.inboxCount).map((mailbox) => ({
+  const baseMailboxData = generateEmailVariations(names, domain, tenant.inboxCount).map((mailbox) => ({
     email: mailbox.email,
-    displayName: mailbox.displayName || mailbox.email.split("@")[0],
-    password: resolvedAdminPassword
+    displayName: mailbox.displayName || mailbox.email.split("@")[0]
   }));
   // Exclude the delegation principal AND the first-name user (who was provisioned as a regular
   // user, not a shared mailbox). The first inbox name generates the licensed user UPN, which may
@@ -1395,15 +1402,18 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
   const firstInboxNameParts = names[0]?.split(/\s+/).filter(Boolean) || [];
   const firstNameMailNickname = firstInboxNameParts.join(".").toLowerCase().replace(/[^a-z0-9.]/g, "");
   const firstNameUpn = firstNameMailNickname ? `${firstNameMailNickname}@${domain}` : null;
-  const filteredMailboxData = mailboxData.filter(
+  const filteredMailboxBase = baseMailboxData.filter(
     (mb) => mb.email !== licensedUserUpn && mb.email !== firstNameUpn
   );
   const mailboxStatuses = normalizeMailboxStatuses(tenant.mailboxStatuses);
-  const totalMailboxTarget = filteredMailboxData.length;
-  const countCreated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.created).length;
-  const countDelegated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.delegated).length;
 
-  for (const mailbox of filteredMailboxData) {
+  // Bug 12.3: lazily generate a unique password per mailbox the first time
+  // the mailbox phase runs. Persisted (encrypted) into mailboxStatuses so
+  // retries reuse the same password — important because Microsoft already
+  // has whichever password was set on the first successful Set-MailboxPassword
+  // call, and a fresh random one would create drift.
+  let mailboxStatusesDirty = false;
+  for (const mailbox of filteredMailboxBase) {
     if (!mailboxStatuses[mailbox.email]) {
       mailboxStatuses[mailbox.email] = {
         created: false,
@@ -1413,8 +1423,42 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
         signInEnabled: false,
         cloudAppAdminAssigned: false
       };
+      mailboxStatusesDirty = true;
+    }
+    if (!mailboxStatuses[mailbox.email].password) {
+      const fresh = generateStrongPassword({ forbiddenTokens: [domain] });
+      mailboxStatuses[mailbox.email].password = encryptSecret(fresh);
+      mailboxStatusesDirty = true;
     }
   }
+
+  // Persist the per-mailbox passwords BEFORE any PS calls so a mid-loop
+  // crash doesn't lose them (and force a re-generation that diverges from
+  // what Microsoft already has).
+  if (mailboxStatusesDirty) {
+    await prisma.tenant.update({
+      where: { id: tenant.id },
+      data: { mailboxStatuses: serializeMailboxStatuses(mailboxStatuses) }
+    });
+  }
+
+  const decryptMailboxPassword = (encrypted: string | undefined): string => {
+    if (!encrypted) return resolvedAdminPassword;
+    try {
+      return decryptSecret(encrypted);
+    } catch {
+      return resolvedAdminPassword;
+    }
+  };
+
+  const filteredMailboxData = filteredMailboxBase.map((mb) => ({
+    ...mb,
+    password: decryptMailboxPassword(mailboxStatuses[mb.email].password)
+  }));
+
+  const totalMailboxTarget = filteredMailboxData.length;
+  const countCreated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.created).length;
+  const countDelegated = () => filteredMailboxData.filter((mailbox) => mailboxStatuses[mailbox.email]?.delegated).length;
 
   if (filteredMailboxData.length === 0) {
     console.log("ℹ️ [Microsoft] No new mailboxes to create");
@@ -2501,8 +2545,13 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     }
   }
 
+  // Bug 12.3: each row gets the mailbox's own unique password. Shared
+  // mailboxes pull from filteredMailboxData (already decrypted into
+  // .password during the per-mailbox lazy-generate step). The licensed
+  // user is added separately if not already in the list — and its UPN
+  // matches the first persona's email, so we look it up the same way.
   const csvRows: string[][] = [["DisplayName", "EmailAddress", "Password"]];
-  const csvMailboxRows = [...mailboxData];
+  const csvMailboxRows = [...filteredMailboxData];
   if (
     licensedUserUpn &&
     !csvMailboxRows.some((mailbox) => normalizeEmail(mailbox.email) === normalizeEmail(licensedUserUpn))
@@ -2511,6 +2560,9 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
       parseInboxNamesValue(tenant.inboxNames)[0] ||
       licensedUserUpn.split("@")[0].replace(/[._-]+/g, " ").trim() ||
       "Licensed User";
+    // The licensed user shares the admin password (it's the same
+    // identity Microsoft uses to sign in as the admin). Per-mailbox
+    // password rotation is just for the shared mailboxes.
     csvMailboxRows.unshift({
       email: licensedUserUpn,
       displayName: fallbackDisplayName,
@@ -2518,7 +2570,7 @@ export async function setupSharedMailboxes(tenantDbId: string): Promise<void> {
     });
   }
   for (const mailbox of csvMailboxRows) {
-    csvRows.push([mailbox.displayName, mailbox.email, resolvedAdminPassword]);
+    csvRows.push([mailbox.displayName, mailbox.email, mailbox.password]);
   }
 
   const csvBody = toCsv(csvRows);
@@ -3048,4 +3100,105 @@ export async function pollDeviceAuthToken(
   }
 
   throw new Error(payload.error_description || payload.error || "Device auth verification failed");
+}
+
+/**
+ * Bug 12.6 — verify, end-of-flow, that every persona's expected
+ * displayName actually shows up correctly in the tenant.
+ *
+ * The pipeline generates per-persona display names (e.g. "Emma Thompson",
+ * "Abigail Morris") and assigns them to mailboxes via PowerShell. There's
+ * no current end-of-flow check that "user e.thompson@x.com actually has
+ * displayName 'Emma Thompson' in Microsoft." If something silently
+ * misapplied — PS script ran but Microsoft rejected the displayName, two
+ * mailboxes collided on the same generated name, etc. — operator finds
+ * out only when end-users see the wrong names.
+ *
+ * Returns a structured summary; caller logs as a phase_warning if
+ * `mismatched.length > 0`. Tenant still completes; mismatches are not
+ * blocking. This is a verification pass, not a gate.
+ */
+export async function verifyPersonaDisplayNames(
+  tenantDbId: string
+): Promise<{
+  total: number;
+  matched: number;
+  mismatched: Array<{ email: string; expected: string; actual: string | null }>;
+  reason?: string;
+}> {
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantDbId },
+    select: {
+      id: true,
+      tenantId: true,
+      domain: true,
+      inboxCount: true,
+      inboxNames: true,
+    },
+  });
+
+  if (!tenant) {
+    return { total: 0, matched: 0, mismatched: [], reason: "Tenant not found" };
+  }
+  if (!tenant.tenantId) {
+    return { total: 0, matched: 0, mismatched: [], reason: "Tenant has no organizationId yet — verification skipped" };
+  }
+
+  const names = parseInboxNamesValue(tenant.inboxNames);
+  const expected = generateEmailVariations(names, tenant.domain, tenant.inboxCount);
+  if (expected.length === 0) {
+    return { total: 0, matched: 0, mismatched: [], reason: "No expected personas generated" };
+  }
+
+  const accessToken = await requestTenantGraphToken(tenant.tenantId);
+
+  // 99 mailboxes per tenant fits easily in one $top=999 page. If a tenant
+  // ever has >999 users (rare for our flow) the pagination helper from
+  // Bug 6.8 will replace this single fetch.
+  const usersResp = await graphRequest<{
+    value: Array<{
+      userPrincipalName?: string;
+      displayName?: string;
+      mail?: string;
+      proxyAddresses?: string[];
+    }>;
+  }>(
+    accessToken,
+    "/users?$top=999&$select=userPrincipalName,displayName,mail,proxyAddresses"
+  );
+
+  // Build email → displayName lookup. Key on lowercased UPN, mail, and
+  // every proxyAddress so the generator's email format (which may match
+  // any of these) finds the right user.
+  const lookup = new Map<string, string>();
+  for (const user of usersResp.value || []) {
+    const dn = user.displayName || "";
+    const candidates: string[] = [];
+    if (user.userPrincipalName) candidates.push(user.userPrincipalName.toLowerCase());
+    if (user.mail) candidates.push(user.mail.toLowerCase());
+    for (const proxy of user.proxyAddresses || []) {
+      const stripped = proxy.replace(/^smtp:/i, "").toLowerCase();
+      if (stripped) candidates.push(stripped);
+    }
+    for (const key of candidates) {
+      // First write wins — UPN should take priority over proxy aliases.
+      if (!lookup.has(key)) lookup.set(key, dn);
+    }
+  }
+
+  const mismatched: Array<{ email: string; expected: string; actual: string | null }> = [];
+  let matched = 0;
+
+  for (const persona of expected) {
+    const actual = lookup.get(persona.email.toLowerCase()) ?? null;
+    if (actual === null) {
+      mismatched.push({ email: persona.email, expected: persona.displayName, actual: null });
+    } else if (actual !== persona.displayName) {
+      mismatched.push({ email: persona.email, expected: persona.displayName, actual });
+    } else {
+      matched += 1;
+    }
+  }
+
+  return { total: expected.length, matched, mismatched };
 }

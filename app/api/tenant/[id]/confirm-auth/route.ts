@@ -118,14 +118,47 @@ export async function POST(request: Request, { params }: Params) {
       );
     }
 
+    // Bug 12.5: don't trust the device-auth response by itself. Microsoft
+    // returned a token, but we want a real Graph call to confirm we can
+    // actually read from this tenant before flipping status to "mailboxes."
+    // If consent didn't actually propagate (rare but seen), the worker
+    // would otherwise advance and fail mysteriously two phases later.
+    if (verification.organizationId) {
+      const consent = await isAppConsentedInTenant(verification.organizationId);
+      if (!consent.exists) {
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            errorMessage: `Device code accepted but Graph verification failed: ${consent.reason || "service principal not visible"}. Wait ~30s and click again — Microsoft consent propagation can take time.`,
+            currentStep: "Verifying Microsoft Graph access..."
+          }
+        });
+        await logTenantEvent({
+          batchId: tenant.batchId,
+          tenantId: tenant.id,
+          eventType: "auth_verification_failed",
+          level: "warn",
+          message: "Device code confirmed but Graph verification failed.",
+          details: { organizationId: verification.organizationId, reason: consent.reason || null }
+        });
+        return NextResponse.json(
+          {
+            error: `Device code accepted but Graph verification failed: ${consent.reason || "service principal not visible"}. Wait ~30s and try again.`
+          },
+          { status: 409 }
+        );
+      }
+    }
+
     await prisma.tenant.update({
       where: { id: tenant.id },
       data: {
         authConfirmed: true,
         tenantId: verification.organizationId || undefined,
         status: "mailboxes",
-        currentStep: "Auth confirmed. Continuing mailbox setup...",
-        progress: 68
+        currentStep: "Auth confirmed and Graph access verified. Continuing mailbox setup...",
+        progress: 68,
+        errorMessage: null
       }
     });
 
@@ -134,11 +167,11 @@ export async function POST(request: Request, { params }: Params) {
       batchId: tenant.batchId,
       tenantId: tenant.id,
       eventType: "auth_confirmed",
-      message: "Device code confirmed. Tenant queued for processing.",
+      message: "Device code confirmed and Graph access verified. Tenant queued for processing.",
       details: { organizationId: verification.organizationId || null }
     });
 
-    return NextResponse.json({ ok: true, tenantId: tenant.id, resumed: true });
+    return NextResponse.json({ ok: true, tenantId: tenant.id, resumed: true, verified: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to confirm auth";
     const normalized = message.toLowerCase();

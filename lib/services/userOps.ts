@@ -74,7 +74,7 @@ type TenantContext = {
   instantlyEmail: string | null;
   instantlyPassword: string | null;
   instantlyV2Key: string | null;
-  instantlyApiVersion: string | null;
+  // v1 was dropped — Instantly is rolling v1 down. v2 is the only supported path.
   instantlyWorkspace: string | null;
   smartleadApiKey: string | null;
   smartleadLoginUrl: string | null;
@@ -108,7 +108,6 @@ async function loadTenantContext(tenantDbId: string): Promise<TenantContext> {
     instantlyEmail: tenant.batch.instantlyEmail,
     instantlyPassword: safeDecrypt(tenant.batch.instantlyPassword),
     instantlyV2Key: safeDecrypt(tenant.batch.instantlyV2Key),
-    instantlyApiVersion: tenant.batch.instantlyApiVersion,
     instantlyWorkspace: tenant.batch.instantlyWorkspace,
     smartleadApiKey: safeDecrypt(tenant.batch.smartleadApiKey),
     smartleadLoginUrl: tenant.batch.smartleadLoginUrl,
@@ -163,7 +162,8 @@ async function triggerUploaderForOneAccount(opts: {
   const form = new FormData();
   form.append("platform", "instantly");
   form.append("mode", opts.tenant.instantlyWorkspace ? "multi" : "single");
-  form.append("api_version", opts.tenant.instantlyApiVersion || "v2");
+  // v1 was dropped — uploader-service / Instantly v2 is the only supported path.
+  form.append("api_version", "v2");
   form.append("v2_api_key", opts.tenant.instantlyV2Key || "");
   form.append("api_key", opts.tenant.instantlyV2Key || "");
   form.append("instantly_email", opts.tenant.instantlyEmail);

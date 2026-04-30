@@ -18,7 +18,7 @@ export async function GET(_request: Request, { params }: Params) {
       where: { id: params.id },
       include: {
         tenants: {
-          orderBy: { createdAt: "asc" },
+          orderBy: [{ tenantName: "asc" }, { createdAt: "asc" }],
           select: {
             id: true,
             tenantName: true,

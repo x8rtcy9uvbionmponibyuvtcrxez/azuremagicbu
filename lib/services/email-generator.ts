@@ -116,7 +116,12 @@ export function generateStrongPassword(options?: {
   const uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const lowercase = "abcdefghijklmnopqrstuvwxyz";
   const numbers = "0123456789";
-  const symbols = "!@#$%&*_+-=?";
+  // `$` is intentionally excluded — it's a variable-expansion sigil in
+  // PowerShell, bash, etc. The PS service interpolates passwords into
+  // double-quoted PowerShell strings (Bug 3.1); a `$` in the password
+  // would silently expand to nothing. Other symbols satisfy the M365
+  // complexity requirement just as well.
+  const symbols = "!@#%&*_+-=?";
   const all = uppercase + lowercase + numbers + symbols;
   const forbidden = (options?.forbiddenTokens ?? [])
     .map((token) => token.toLowerCase().trim())

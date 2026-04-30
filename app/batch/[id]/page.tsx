@@ -40,6 +40,15 @@ const processingStatuses = new Set<TenantStatus>([
   "sequencer_connect"
 ]);
 
+// Status priority for sorting tenant cards: failed first (needs attention),
+// then in-progress (worth watching), then completed (done, scroll past).
+// queued/auth_pending sit alongside in-progress because they're not terminal.
+function statusBucket(status: TenantStatus): number {
+  if (status === "failed") return 0;
+  if (status === "completed") return 2;
+  return 1; // queued, auth_pending, every processing status
+}
+
 type UploaderEsp = "instantly" | "smartlead" | null;
 type UploaderStatus = "idle" | "queued" | "running" | "completed" | "failed";
 
@@ -456,6 +465,127 @@ function tagLabel(tag: EventPhaseTag): string {
     default:
       return tag.charAt(0).toUpperCase() + tag.slice(1);
   }
+}
+
+// Bug 12.1: cumulative uploader log + queue panel.
+//
+// Aggregates every tenant's uploader_log events into a single chronological
+// feed (latest at the bottom), tagged by tenantName, plus a small queue
+// panel above. Polls the batch's /uploader-stream endpoint every 5s.
+// Renders nothing if the batch has no ESP configured (keeps the page
+// uncluttered for setup-only batches).
+type UploaderStreamPayload = {
+  batchId: string;
+  uploaderEsp: UploaderEsp;
+  uploaderAutoTrigger: boolean;
+  summary: { idle: number; queued: number; running: number; completed: number; failed: number };
+  queue: Array<{
+    tenantId: string;
+    tenantName: string;
+    status: UploaderStatus | null;
+    total: number | null;
+    succeeded: number | null;
+    failed: number | null;
+    queuedAt: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
+    lastLogAt: string | null;
+  }>;
+  lines: Array<{ tenantId: string; tenantName: string; at: string; text: string }>;
+  truncated: boolean;
+};
+
+function UploaderLiveFeed({ batchId, esp }: { batchId: string; esp: UploaderEsp }) {
+  const [feed, setFeed] = useState<UploaderStreamPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!esp) return; // Batch has no uploader configured — skip polling entirely.
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`/api/batch/${batchId}/uploader-stream`, { cache: "no-store" });
+        const data = (await res.json()) as UploaderStreamPayload & { error?: string };
+        if (cancelled) return;
+        if (!res.ok) throw new Error(data.error || "Failed to load uploader stream");
+        setFeed(data);
+        // Clear any prior transient error now that we have a fresh good response.
+        setError(null);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [batchId, esp]);
+
+  if (!esp) return null;
+  if (!feed) return null;
+
+  const summaryParts = [
+    `${feed.summary.running} running`,
+    `${feed.summary.queued} queued`,
+    `${feed.summary.completed} completed`,
+    `${feed.summary.failed} failed`
+  ];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Uploader Live Feed</CardTitle>
+        <CardDescription>
+          {esp} — {summaryParts.join(" • ")}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {feed.queue.length > 0 && (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs md:grid-cols-3">
+            {feed.queue
+              .slice()
+              .sort((a, b) => a.tenantName.localeCompare(b.tenantName))
+              .map((row) => {
+                const progressLabel =
+                  row.total && row.total > 0
+                    ? ` ${row.succeeded || 0}/${row.total}${row.failed ? ` (${row.failed} failed)` : ""}`
+                    : "";
+                return (
+                  <div
+                    key={row.tenantId}
+                    className="flex items-center justify-between gap-2 rounded border px-2 py-1"
+                  >
+                    <span className="truncate font-medium">{row.tenantName}</span>
+                    <span className="whitespace-nowrap text-muted-foreground">
+                      {row.status || "—"}
+                      {progressLabel}
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        )}
+        <pre className="h-96 overflow-auto rounded border bg-zinc-950 p-3 font-mono text-xs leading-snug text-zinc-100">
+          {feed.lines.length === 0 ? (
+            <span className="text-zinc-500">No uploader activity yet.</span>
+          ) : (
+            feed.lines.map((line, i) => (
+              <div key={`${line.at}-${i}`} className="whitespace-pre-wrap">
+                <span className="text-emerald-400">[{line.tenantName}]</span>{" "}
+                <span>{line.text}</span>
+              </div>
+            ))
+          )}
+        </pre>
+        {feed.truncated && (
+          <p className="text-xs text-muted-foreground">Showing the last 200 lines.</p>
+        )}
+        {error && <p className="text-xs text-red-600">{error}</p>}
+      </CardContent>
+    </Card>
+  );
 }
 
 export default function BatchPage({ params }: PageProps) {
@@ -1037,8 +1167,18 @@ export default function BatchPage({ params }: PageProps) {
         </CardContent>
       </Card>
 
+      <UploaderLiveFeed batchId={data.batch.id} esp={data.batch.uploaderEsp} />
+
       <div className="grid gap-4">
-        {data.tenants.map((tenant) => {
+        {data.tenants
+          .slice()
+          .sort((a, b) => {
+            const bucketDiff = statusBucket(a.status) - statusBucket(b.status);
+            if (bucketDiff !== 0) return bucketDiff;
+            // Within a bucket, preserve tenantName order from the API.
+            return a.tenantName.localeCompare(b.tenantName);
+          })
+          .map((tenant) => {
           const isBusy = (endpoint: string) => actionBusy[`${tenant.id}:${endpoint}`];
 
           return (

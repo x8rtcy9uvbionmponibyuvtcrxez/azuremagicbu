@@ -32,7 +32,7 @@ export async function GET() {
             updatedAt: true,
             errorMessage: true
           },
-          orderBy: { createdAt: "asc" }
+          orderBy: [{ tenantName: "asc" }, { createdAt: "asc" }]
         }
       }
     });

@@ -57,10 +57,10 @@ export default function EspUploadPage() {
   const [slApiKey, setSlApiKey] = useState("");
   const [slLoginUrl, setSlLoginUrl] = useState("");
 
-  // Instantly fields
-  const [instApiKey, setInstApiKey] = useState("");
+  // Instantly fields — v1 was dropped (Instantly is rolling v1 down; v1 returned
+  // 401 for some workspaces with no obvious cause, silently failing entire
+  // upload runs). v2 only.
   const [instV2ApiKey, setInstV2ApiKey] = useState("");
-  const [instApiVersion, setInstApiVersion] = useState<"v1" | "v2">("v1");
   const [instEmail, setInstEmail] = useState("");
   const [instPassword, setInstPassword] = useState("");
   const [instWorkspace, setInstWorkspace] = useState("");
@@ -113,9 +113,11 @@ export default function EspUploadPage() {
         formData.append("apiKey", slApiKey);
         formData.append("loginUrl", slLoginUrl);
       } else {
-        formData.append("apiKey", instApiKey);
+        // v2 only. The uploader-service still reads `apiKey` as the primary
+        // key field; we send the v2 key there so existing code paths work.
+        formData.append("apiKey", instV2ApiKey);
         formData.append("v2ApiKey", instV2ApiKey);
-        formData.append("apiVersion", instApiVersion);
+        formData.append("apiVersion", "v2");
         formData.append("loginEmail", instEmail);
         formData.append("loginPassword", instPassword);
         formData.append("workspace", instWorkspace);
@@ -240,40 +242,20 @@ export default function EspUploadPage() {
           <h2 className="text-lg font-medium">Instantly Upload</h2>
 
           <label className="grid gap-1">
-            <span className="text-sm font-medium">API Version</span>
-            <select
-              className="rounded border px-3 py-2 text-sm"
-              value={instApiVersion}
-              onChange={(e) => setInstApiVersion(e.target.value === "v2" ? "v2" : "v1")}
-            >
-              <option value="v1">v1</option>
-              <option value="v2">v2</option>
-            </select>
-          </label>
-
-          <label className="grid gap-1">
-            <span className="text-sm font-medium">Instantly API Key (v1)</span>
+            <span className="text-sm font-medium">Instantly API Key</span>
             <input
               className="rounded border px-3 py-2 text-sm"
               type="password"
-              value={instApiKey}
-              onChange={(e) => setInstApiKey(e.target.value)}
+              value={instV2ApiKey}
+              onChange={(e) => setInstV2ApiKey(e.target.value)}
+              placeholder="v2 API key"
               required
             />
+            <span className="text-xs text-muted-foreground">
+              Get from Instantly → Settings → Integrations. v1 is no longer
+              supported.
+            </span>
           </label>
-
-          {instApiVersion === "v2" && (
-            <label className="grid gap-1">
-              <span className="text-sm font-medium">Instantly API Key (v2)</span>
-              <input
-                className="rounded border px-3 py-2 text-sm"
-                type="password"
-                value={instV2ApiKey}
-                onChange={(e) => setInstV2ApiKey(e.target.value)}
-                required
-              />
-            </label>
-          )}
 
           <label className="grid gap-1">
             <span className="text-sm font-medium">Instantly Login Email</span>

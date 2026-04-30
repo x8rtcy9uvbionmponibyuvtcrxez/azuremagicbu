@@ -137,7 +137,10 @@ function generateCsvFromDbState(tenant: TenantCsvInput): string | null {
     return null;
   }
 
-  let parsed: Record<string, { created?: boolean }>;
+  // Bug 12.3: each mailbox can carry its own encrypted password under
+  // `password`. For batches that finished before that field was populated,
+  // fall back to the tenant admin password (the historical behavior).
+  let parsed: Record<string, { created?: boolean; password?: string }>;
   try {
     parsed = JSON.parse(tenant.mailboxStatuses);
   } catch {
@@ -158,12 +161,29 @@ function generateCsvFromDbState(tenant: TenantCsvInput): string | null {
     return null;
   }
 
-  let password: string;
+  let adminPasswordPlain: string;
   try {
-    password = decryptSecret(tenant.adminPassword);
+    adminPasswordPlain = decryptSecret(tenant.adminPassword);
   } catch {
     return null;
   }
+
+  // Per-mailbox password lookup. Falls back to the admin password for any
+  // mailbox without its own stored password (legacy batches).
+  const passwordFor = (email: string): string => {
+    const lower = email.trim().toLowerCase();
+    // Try exact match first, then case-insensitive scan in case the key
+    // casing differs between mailboxStatuses and the email we're given.
+    const direct = parsed[email] || parsed[lower];
+    if (direct?.password) {
+      try {
+        return decryptSecret(direct.password);
+      } catch {
+        // Encrypted blob is unreadable — fall through to admin password.
+      }
+    }
+    return adminPasswordPlain;
+  };
 
   const names = parseInboxNamesValue(tenant.inboxNames);
   const fallbackDisplayName = names[0] || "Inbox User";
@@ -189,14 +209,14 @@ function generateCsvFromDbState(tenant: TenantCsvInput): string | null {
   // (microsoft.ts builds it from extractedNames[0]), so the lookup will
   // resolve to the matching displayName naturally.
   if (licensedLower) {
-    rows.push([displayNameFor(licensedLower), licensedLower, password]);
+    rows.push([displayNameFor(licensedLower), licensedLower, passwordFor(licensedLower)]);
     seen.add(licensedLower);
   }
 
   // Then each shared mailbox that was actually created, deduped.
   for (const email of createdEmails) {
     if (seen.has(email)) continue;
-    rows.push([displayNameFor(email), email, password]);
+    rows.push([displayNameFor(email), email, passwordFor(email)]);
     seen.add(email);
   }
 

@@ -227,10 +227,9 @@ type UploaderConfigInput =
       esp: "instantly";
       instantlyEmail: string;
       instantlyPassword: string;
-      instantlyV1Key: string;
+      // v1 was dropped — Instantly is rolling v1 down and we hit silent 401s.
       instantlyV2Key: string;
       instantlyWorkspace: string;
-      instantlyApiVersion: "v1" | "v2";
     }
   | {
       enabled: true;
@@ -253,10 +252,9 @@ async function uploadCsvAndCreateBatch(
     if (uploader.esp === "instantly") {
       formData.append("instantly_email", uploader.instantlyEmail);
       formData.append("instantly_password", uploader.instantlyPassword);
-      formData.append("instantly_v1_key", uploader.instantlyV1Key);
       formData.append("instantly_v2_key", uploader.instantlyV2Key);
       formData.append("instantly_workspace", uploader.instantlyWorkspace);
-      formData.append("instantly_api_version", uploader.instantlyApiVersion);
+      formData.append("instantly_api_version", "v2");
     } else {
       formData.append("smartlead_api_key", uploader.smartleadApiKey);
       formData.append("smartlead_login_url", uploader.smartleadLoginUrl);
@@ -299,10 +297,9 @@ export default function HomePage() {
   // Instantly-specific
   const [instEmail, setInstEmail] = useState("");
   const [instPassword, setInstPassword] = useState("");
-  const [instV1Key, setInstV1Key] = useState("");
+  // v1 was dropped — Instantly is rolling v1 down. v2 only.
   const [instV2Key, setInstV2Key] = useState("");
   const [instWorkspace, setInstWorkspace] = useState("");
-  const [instApiVersion, setInstApiVersion] = useState<"v1" | "v2">("v1");
   // Smartlead-specific
   const [slApiKey, setSlApiKey] = useState("");
   const [slLoginUrl, setSlLoginUrl] = useState("");
@@ -446,21 +443,16 @@ export default function HomePage() {
       if (!instEmail.trim() || !instPassword) {
         return { error: "Instantly login email and password are required" };
       }
-      if (!instV1Key.trim() && !instV2Key.trim()) {
-        return { error: "At least one Instantly API key (v1 or v2) is required" };
-      }
-      if (instApiVersion === "v2" && !instV2Key.trim()) {
-        return { error: "Selected API version is v2 — enter the v2 API key" };
+      if (!instV2Key.trim()) {
+        return { error: "Instantly v2 API key is required (v1 is no longer supported)" };
       }
       return {
         enabled: true,
         esp: "instantly",
         instantlyEmail: instEmail.trim(),
         instantlyPassword: instPassword,
-        instantlyV1Key: instV1Key.trim(),
         instantlyV2Key: instV2Key.trim(),
-        instantlyWorkspace: instWorkspace.trim(),
-        instantlyApiVersion: instApiVersion
+        instantlyWorkspace: instWorkspace.trim()
       };
     }
 
@@ -926,17 +918,6 @@ export default function HomePage() {
                             </div>
                           </label>
                           <label className="grid gap-1 text-sm">
-                            <span className="font-medium">API Version</span>
-                            <select
-                              className="rounded border bg-background px-3 py-2 text-sm"
-                              value={instApiVersion}
-                              onChange={(e) => setInstApiVersion(e.target.value === "v2" ? "v2" : "v1")}
-                            >
-                              <option value="v1">v1</option>
-                              <option value="v2">v2</option>
-                            </select>
-                          </label>
-                          <label className="grid gap-1 text-sm">
                             <span className="font-medium">Workspace (leave blank for single)</span>
                             <Input
                               value={instWorkspace}
@@ -944,22 +925,17 @@ export default function HomePage() {
                               placeholder="Inbox Nav"
                             />
                           </label>
-                          <label className="grid gap-1 text-sm">
-                            <span className="font-medium">API Key (v1)</span>
-                            <Input
-                              type={showUploaderSecrets ? "text" : "password"}
-                              value={instV1Key}
-                              onChange={(e) => setInstV1Key(e.target.value)}
-                            />
-                          </label>
-                          <label className="grid gap-1 text-sm">
-                            <span className="font-medium">API Key (v2)</span>
+                          <label className="grid gap-1 text-sm md:col-span-2">
+                            <span className="font-medium">Instantly API Key (v2)</span>
                             <Input
                               type={showUploaderSecrets ? "text" : "password"}
                               value={instV2Key}
                               onChange={(e) => setInstV2Key(e.target.value)}
-                              placeholder={instApiVersion === "v2" ? "required" : "optional"}
+                              placeholder="required"
                             />
+                            <span className="text-xs text-muted-foreground">
+                              v1 is no longer supported. Get the v2 key from Instantly → Settings → Integrations.
+                            </span>
                           </label>
                         </div>
                       ) : (
