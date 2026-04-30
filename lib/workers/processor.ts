@@ -18,7 +18,8 @@ import {
   initiateDeviceAuth,
   setupDomainAndUser,
   setupSharedMailboxes,
-  setupTenantPrep
+  setupTenantPrep,
+  verifyPersonaDisplayNames
 } from "@/lib/services/microsoft";
 import { applyPhotosToTenant, extractPersonas } from "@/lib/services/profilePhotos";
 import { connectMailboxesToSequencer } from "@/lib/services/sequencer";
@@ -585,6 +586,49 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
     (!shouldConnectInstantly || tenant.instantlyConnected);
 
   if (phaseFourComplete && tenant.status !== "completed") {
+    // Bug 12.6: verify, end-of-flow, that every persona's display name
+    // actually matches in Microsoft. Non-blocking — mismatches surface
+    // as a phase_warning so the operator can spot them, but the tenant
+    // still completes. If the verification call itself errors, log and
+    // proceed; this is a safety check, not a gate.
+    try {
+      const dnCheck = await verifyPersonaDisplayNames(tenant.id);
+      if (dnCheck.mismatched.length > 0) {
+        console.log(
+          `⚠️ [Worker] ${tenant.tenantName}: ${dnCheck.mismatched.length}/${dnCheck.total} persona display names did not match Microsoft state`
+        );
+        await logTenantEvent({
+          batchId,
+          tenantId: tenant.id,
+          eventType: "phase_warning",
+          level: "warn",
+          message: `Display name verification: ${dnCheck.mismatched.length} of ${dnCheck.total} did not match expected`,
+          details: {
+            total: dnCheck.total,
+            matched: dnCheck.matched,
+            // Cap to first 10 so the event stays readable in tools.
+            mismatched: dnCheck.mismatched.slice(0, 10),
+            mismatchedCount: dnCheck.mismatched.length
+          }
+        });
+      } else if (dnCheck.total > 0) {
+        console.log(
+          `✓ [Worker] ${tenant.tenantName}: all ${dnCheck.total} persona display names verified`
+        );
+      } else if (dnCheck.reason) {
+        console.log(`ℹ️ [Worker] ${tenant.tenantName}: display-name verification skipped — ${dnCheck.reason}`);
+      }
+    } catch (error) {
+      // Verification failure is non-fatal — log and continue. The pipeline
+      // already passed every other completion gate; refusing to mark the
+      // tenant complete because the verification call hit a transient 5xx
+      // would do more harm than good.
+      console.log(
+        `⚠️ [Worker] Display name verification failed for ${tenant.tenantName}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
     await prisma.tenant.update({
       where: { id: tenant.id },
       data: {

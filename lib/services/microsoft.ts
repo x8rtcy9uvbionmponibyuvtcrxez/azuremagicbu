@@ -3049,3 +3049,104 @@ export async function pollDeviceAuthToken(
 
   throw new Error(payload.error_description || payload.error || "Device auth verification failed");
 }
+
+/**
+ * Bug 12.6 — verify, end-of-flow, that every persona's expected
+ * displayName actually shows up correctly in the tenant.
+ *
+ * The pipeline generates per-persona display names (e.g. "Emma Thompson",
+ * "Abigail Morris") and assigns them to mailboxes via PowerShell. There's
+ * no current end-of-flow check that "user e.thompson@x.com actually has
+ * displayName 'Emma Thompson' in Microsoft." If something silently
+ * misapplied — PS script ran but Microsoft rejected the displayName, two
+ * mailboxes collided on the same generated name, etc. — operator finds
+ * out only when end-users see the wrong names.
+ *
+ * Returns a structured summary; caller logs as a phase_warning if
+ * `mismatched.length > 0`. Tenant still completes; mismatches are not
+ * blocking. This is a verification pass, not a gate.
+ */
+export async function verifyPersonaDisplayNames(
+  tenantDbId: string
+): Promise<{
+  total: number;
+  matched: number;
+  mismatched: Array<{ email: string; expected: string; actual: string | null }>;
+  reason?: string;
+}> {
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantDbId },
+    select: {
+      id: true,
+      tenantId: true,
+      domain: true,
+      inboxCount: true,
+      inboxNames: true,
+    },
+  });
+
+  if (!tenant) {
+    return { total: 0, matched: 0, mismatched: [], reason: "Tenant not found" };
+  }
+  if (!tenant.tenantId) {
+    return { total: 0, matched: 0, mismatched: [], reason: "Tenant has no organizationId yet — verification skipped" };
+  }
+
+  const names = parseInboxNamesValue(tenant.inboxNames);
+  const expected = generateEmailVariations(names, tenant.domain, tenant.inboxCount);
+  if (expected.length === 0) {
+    return { total: 0, matched: 0, mismatched: [], reason: "No expected personas generated" };
+  }
+
+  const accessToken = await requestTenantGraphToken(tenant.tenantId);
+
+  // 99 mailboxes per tenant fits easily in one $top=999 page. If a tenant
+  // ever has >999 users (rare for our flow) the pagination helper from
+  // Bug 6.8 will replace this single fetch.
+  const usersResp = await graphRequest<{
+    value: Array<{
+      userPrincipalName?: string;
+      displayName?: string;
+      mail?: string;
+      proxyAddresses?: string[];
+    }>;
+  }>(
+    accessToken,
+    "/users?$top=999&$select=userPrincipalName,displayName,mail,proxyAddresses"
+  );
+
+  // Build email → displayName lookup. Key on lowercased UPN, mail, and
+  // every proxyAddress so the generator's email format (which may match
+  // any of these) finds the right user.
+  const lookup = new Map<string, string>();
+  for (const user of usersResp.value || []) {
+    const dn = user.displayName || "";
+    const candidates: string[] = [];
+    if (user.userPrincipalName) candidates.push(user.userPrincipalName.toLowerCase());
+    if (user.mail) candidates.push(user.mail.toLowerCase());
+    for (const proxy of user.proxyAddresses || []) {
+      const stripped = proxy.replace(/^smtp:/i, "").toLowerCase();
+      if (stripped) candidates.push(stripped);
+    }
+    for (const key of candidates) {
+      // First write wins — UPN should take priority over proxy aliases.
+      if (!lookup.has(key)) lookup.set(key, dn);
+    }
+  }
+
+  const mismatched: Array<{ email: string; expected: string; actual: string | null }> = [];
+  let matched = 0;
+
+  for (const persona of expected) {
+    const actual = lookup.get(persona.email.toLowerCase()) ?? null;
+    if (actual === null) {
+      mismatched.push({ email: persona.email, expected: persona.displayName, actual: null });
+    } else if (actual !== persona.displayName) {
+      mismatched.push({ email: persona.email, expected: persona.displayName, actual });
+    } else {
+      matched += 1;
+    }
+  }
+
+  return { total: expected.length, matched, mismatched };
+}
