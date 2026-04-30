@@ -16,6 +16,7 @@ import {
   configureDkim,
   createMailboxes,
   initiateDeviceAuth,
+  reconcileTenantFromMicrosoft,
   setupDomainAndUser,
   setupSharedMailboxes,
   setupTenantPrep,
@@ -154,6 +155,49 @@ async function processTenant(job: Job<TenantProcessingJobData>): Promise<{ state
   if (tenant.status === "completed" || tenant.status === "failed") {
     await updateBatchStatus(batchId);
     return { state: tenant.status };
+  }
+
+  // Phase 1 Day 4 — reconcile DB flags against Microsoft state at the top
+  // of every worker invocation (when USE_POLL_HELPERS is on). The
+  // existing phase-completion checks below all read those flags; once
+  // they reflect Microsoft truth, drift can't accumulate across phase
+  // boundaries. No-op when the flag is off.
+  let reconcileChanges: Record<string, unknown> | null = null;
+  let reconcileError: string | null = null;
+  try {
+    const reconcile = await reconcileTenantFromMicrosoft(tenant.id);
+    if (reconcile.reconciled && Object.keys(reconcile.changes).length > 0) {
+      reconcileChanges = reconcile.changes as Record<string, unknown>;
+    }
+  } catch (error) {
+    // Reconcile is a safety check, never a gate. Log and continue with
+    // the flags we have — the worker's own Graph calls will surface any
+    // real Microsoft problems.
+    reconcileError = error instanceof Error ? error.message : String(error);
+  }
+  if (reconcileChanges) {
+    console.log(
+      `🔄 [Worker] (USE_POLL_HELPERS) Reconciled DB → MS state for ${tenant.tenantName}: ${JSON.stringify(reconcileChanges)}`
+    );
+    await logTenantEvent({
+      batchId,
+      tenantId: tenant.id,
+      eventType: "phase_warning",
+      level: "info",
+      message: "Reconciled DB flags from Microsoft state",
+      details: reconcileChanges
+    });
+    // Reload the tenant so the rest of the function sees the corrected
+    // flags. Without this we'd still branch on the stale snapshot.
+    const reloaded = await loadTenant();
+    if (!reloaded) {
+      throw new Error(`Tenant ${tenantId} disappeared after reconcile`);
+    }
+    tenant = reloaded;
+  } else if (reconcileError) {
+    console.log(
+      `⚠️ [Worker] Reconcile from Microsoft failed for ${tenant.tenantName}: ${reconcileError} — continuing with DB flags as-is`
+    );
   }
 
   await logTenantEvent({
