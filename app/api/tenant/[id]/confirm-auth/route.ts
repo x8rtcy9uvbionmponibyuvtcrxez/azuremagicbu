@@ -41,6 +41,25 @@ export async function POST(request: Request, { params }: Params) {
     }
 
     if (tenant.authConfirmed) {
+      // Without this status flip the UI keeps showing "auth_pending" with
+      // the old "Enter code" instruction even though consent is done. The
+      // worker will progress past auth based on authConfirmed=true, but
+      // the operator-visible state stays a lie until the next phase
+      // boundary writes a fresh currentStep. Update here so the UI
+      // immediately reflects "we're past auth, continuing setup."
+      if (tenant.status === "auth_pending") {
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            status: "mailboxes",
+            progress: 68,
+            currentStep: "Auth confirmed. Continuing mailbox setup...",
+            authCode: null,
+            deviceCode: null,
+            authCodeExpiry: null
+          }
+        });
+      }
       await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
       await logTenantEvent({
         batchId: tenant.batchId,

@@ -604,11 +604,69 @@ export async function completeTenantPrep(tenantId: string, accessToken: string):
   }
 }
 
+/**
+ * Pre-flight: ask Microsoft's public OIDC discovery whether this domain
+ * is already verified in some other Microsoft tenant. If yes, fail fast
+ * with a clear actionable error instead of letting the worker burn 30+
+ * minutes adding the domain, polling DNS, and finally hitting the
+ * "Domain is being used by an active tenant" error from Graph's verify
+ * endpoint. The customer needs to do an Admin Takeover or open a
+ * Microsoft Support ticket to release the domain — a code retry never
+ * fixes this.
+ *
+ * Returns null if the domain is free to add to expectedTenantId.
+ * Returns a string error message if it's locked in another tenant.
+ */
+async function preflightDomainNotInOtherTenant(
+  domain: string,
+  expectedTenantId: string | null
+): Promise<string | null> {
+  if (!expectedTenantId) return null;
+  try {
+    const response = await fetch(
+      `https://login.microsoftonline.com/${encodeURIComponent(domain)}/.well-known/openid-configuration`,
+      { method: "GET" }
+    );
+    if (!response.ok) return null; // Domain not in any tenant — proceed.
+    const data = (await response.json()) as { issuer?: string };
+    const issuer = data.issuer || "";
+    const match = issuer.match(/sts\.windows\.net\/([0-9a-f-]{36})/i);
+    if (!match) return null;
+    const resolvedTenantId = match[1].toLowerCase();
+    const expected = expectedTenantId.toLowerCase();
+    if (resolvedTenantId === expected) return null; // Already in our tenant — fine.
+    return (
+      `Domain ${domain} is already verified in Microsoft tenant ${resolvedTenantId} ` +
+      `(expected ${expected}). Customer must release the domain from that tenant — ` +
+      `Internal Admin Takeover at https://admin.microsoft.com or a Microsoft Support ticket ` +
+      `citing the colliding tenant ID. A code retry will not unstick this.`
+    );
+  } catch {
+    // OIDC lookup failed for some other reason (network, DNS, etc).
+    // Don't block on this — fall through to the normal add path which
+    // will surface its own error.
+    return null;
+  }
+}
+
 export async function addDomainToTenant(tenantDbId: string, domain: string, accessToken: string): Promise<void> {
   await prisma.tenant.update({
     where: { id: tenantDbId },
     data: { currentStep: "Adding domain to tenant...", progress: 60, status: "domain_add" }
   });
+
+  // Fail fast if the domain is locked in another Microsoft tenant. This
+  // saves 30+ minutes of futile DNS polling and gives the operator a
+  // clear, actionable next step instead of a cryptic "Domain is being
+  // used by an active tenant" error 30 minutes in.
+  const tenantRow = await prisma.tenant.findUnique({
+    where: { id: tenantDbId },
+    select: { tenantId: true }
+  });
+  const conflictMessage = await preflightDomainNotInOtherTenant(domain, tenantRow?.tenantId || null);
+  if (conflictMessage) {
+    throw new Error(conflictMessage);
+  }
 
   try {
     await graphRequest<Record<string, unknown>>(accessToken, "/domains", {
