@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { prisma } from "@/lib/prisma";
 import { enqueueTenantProcessingJob } from "@/lib/queue";
-import { pollDeviceAuthToken } from "@/lib/services/microsoft";
+import { isAppConsentedInTenant, pollDeviceAuthToken } from "@/lib/services/microsoft";
 import { logTenantEvent } from "@/lib/tenant-events";
 
 export const runtime = "nodejs";
@@ -164,6 +164,56 @@ export async function POST(request: Request, { params }: Params) {
         },
         { status: 409 }
       );
+    }
+
+    // AADSTS650051: "service principal name is already present for the
+    // tenant". Microsoft is saying our app is already consented in this
+    // tenant — i.e. consent already happened on a previous run. We don't
+    // need a fresh device-code consent. Verify the SP is reachable via
+    // client_credentials and, if so, advance the tenant.
+    const isSpAlreadyPresent =
+      message.includes("AADSTS650051") ||
+      normalized.includes("service principal name is already present");
+
+    if (isSpAlreadyPresent) {
+      const tenant = await prisma.tenant.findUnique({
+        where: { id: params.id },
+        select: { id: true, batchId: true, tenantId: true }
+      });
+
+      if (tenant?.tenantId) {
+        const consent = await isAppConsentedInTenant(tenant.tenantId);
+        if (consent.exists) {
+          await prisma.tenant.update({
+            where: { id: tenant.id },
+            data: {
+              authConfirmed: true,
+              status: "mailboxes",
+              progress: 68,
+              currentStep: "Auth already confirmed (SP exists in tenant). Continuing setup...",
+              authCode: null,
+              deviceCode: null,
+              authCodeExpiry: null,
+              errorMessage: null
+            }
+          });
+          await enqueueTenantProcessingJob({ tenantId: tenant.id, batchId: tenant.batchId });
+          await logTenantEvent({
+            batchId: tenant.batchId,
+            tenantId: tenant.id,
+            eventType: "auth_bypassed",
+            level: "warn",
+            message: "Service principal already present in tenant; skipping device-code re-consent."
+          });
+          return NextResponse.json({
+            ok: true,
+            tenantId: tenant.id,
+            resumed: true,
+            bypassed: true,
+            message: "App already consented in tenant; resumed setup."
+          });
+        }
+      }
     }
 
     return NextResponse.json(

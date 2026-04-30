@@ -89,6 +89,37 @@ export async function requestTenantGraphToken(organizationId: string): Promise<s
 }
 
 /**
+ * Check whether the multi-tenant app's service principal already exists in
+ * a customer tenant — i.e. consent has already happened on a previous run.
+ *
+ * Implementation: try to mint a client_credentials token for the tenant. If
+ * it succeeds, the SP exists and we never need device-code consent again
+ * (we can mint app-only tokens forever). If it fails with AADSTS7000229
+ * ("client application is missing service principal in the tenant"), the
+ * SP is genuinely absent and the caller should fall through to the
+ * device-code consent flow.
+ *
+ * Returns { exists, accessToken? }. accessToken is included on success
+ * so the caller can immediately use it without a second token mint.
+ */
+export async function isAppConsentedInTenant(
+  organizationId: string
+): Promise<{ exists: boolean; accessToken?: string; reason?: string }> {
+  if (!organizationId) return { exists: false, reason: "no organizationId" };
+  try {
+    const token = await requestTenantGraphToken(organizationId);
+    return { exists: true, accessToken: token };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // AADSTS7000229: SP genuinely missing. Anything else (network, secret
+    // wrong, tenant disabled) we conservatively treat as "don't know" and
+    // also return false so the caller falls through to device-code, which
+    // will surface a more descriptive error if it's a real config problem.
+    return { exists: false, reason: message };
+  }
+}
+
+/**
  * Look up a user by UPN, waiting through Graph's eventual-consistency window
  * before giving up. POST /users commits immediately, but a $filter query
  * right after often misses the new row because filter hits a different
@@ -2616,6 +2647,30 @@ export async function initiateDeviceAuth(tenantId: string): Promise<void> {
 
     if (!tenant) {
       throw new Error(`Tenant ${tenantId} not found`);
+    }
+
+    // Pre-flight: if the customer's M365 tenantId is known and the vibes
+    // app SP is already present in it, consent has already happened on a
+    // previous run. Re-running device-code now would just hit AADSTS650051
+    // ("service principal already present") for the operator. Skip the
+    // device-code flow, mark auth confirmed, and let the worker resume.
+    if (tenant.tenantId) {
+      const consent = await isAppConsentedInTenant(tenant.tenantId);
+      if (consent.exists) {
+        await prisma.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            authConfirmed: true,
+            status: "mailboxes",
+            progress: 68,
+            currentStep: "Auth already confirmed (SP exists in tenant). Continuing setup..."
+          }
+        });
+        console.log(
+          `✅ [Microsoft] vibes SP already in tenant ${tenant.tenantId} — skipping device-code consent for ${tenant.id}`
+        );
+        return;
+      }
     }
 
     await prisma.tenant.update({
