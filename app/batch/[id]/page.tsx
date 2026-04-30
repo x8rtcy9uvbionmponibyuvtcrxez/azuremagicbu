@@ -40,6 +40,15 @@ const processingStatuses = new Set<TenantStatus>([
   "sequencer_connect"
 ]);
 
+// Status priority for sorting tenant cards: failed first (needs attention),
+// then in-progress (worth watching), then completed (done, scroll past).
+// queued/auth_pending sit alongside in-progress because they're not terminal.
+function statusBucket(status: TenantStatus): number {
+  if (status === "failed") return 0;
+  if (status === "completed") return 2;
+  return 1; // queued, auth_pending, every processing status
+}
+
 type UploaderEsp = "instantly" | "smartlead" | null;
 type UploaderStatus = "idle" | "queued" | "running" | "completed" | "failed";
 
@@ -1038,7 +1047,15 @@ export default function BatchPage({ params }: PageProps) {
       </Card>
 
       <div className="grid gap-4">
-        {data.tenants.map((tenant) => {
+        {data.tenants
+          .slice()
+          .sort((a, b) => {
+            const bucketDiff = statusBucket(a.status) - statusBucket(b.status);
+            if (bucketDiff !== 0) return bucketDiff;
+            // Within a bucket, preserve tenantName order from the API.
+            return a.tenantName.localeCompare(b.tenantName);
+          })
+          .map((tenant) => {
           const isBusy = (endpoint: string) => actionBusy[`${tenant.id}:${endpoint}`];
 
           return (
