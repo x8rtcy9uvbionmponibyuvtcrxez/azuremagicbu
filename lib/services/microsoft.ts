@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
+import { extractErrorCode, logCall, withCallLogging } from "@/lib/observability";
 import { prisma } from "@/lib/prisma";
 import { generateEmailVariations, generateStrongPassword } from "@/lib/services/email-generator";
 import { isLikelyTenantIdentifier, isSyntheticTestTenantId } from "@/lib/tenant-identifier";
@@ -241,8 +242,15 @@ const DEFAULT_POLL_BACKOFFS_MS = [0, 5_000, 15_000, 30_000, 30_000];
 
 /** Generic poll-until-ready loop. Returns the first attempt where
  *  `predicate` returns a truthy value. If all attempts exhaust, returns
- *  the last predicate result wrapped in `{ ok: false }`. */
+ *  the last predicate result wrapped in `{ ok: false }`.
+ *
+ *  Phase 4 — emits one structured log line per attempt via logCall, so
+ *  the metrics endpoint can compute first-attempt-success rate, p95
+ *  latency, error-code histogram per polling op without us hand-instrumenting
+ *  each helper.
+ */
 async function pollUntil<T>(opts: {
+  op: string;
   description: string;
   backoffsMs?: number[];
   predicate: () => Promise<{ ready: boolean; value?: T; detail?: string }>;
@@ -251,13 +259,29 @@ async function pollUntil<T>(opts: {
   let lastDetail = "";
   for (let i = 0; i < backoffs.length; i += 1) {
     if (backoffs[i] > 0) await sleep(backoffs[i]);
+    const started = Date.now();
     let outcome: { ready: boolean; value?: T; detail?: string };
     try {
       outcome = await opts.predicate();
     } catch (error) {
       lastDetail = error instanceof Error ? error.message : String(error);
+      logCall({
+        op: opts.op,
+        attempt: i + 1,
+        latency_ms: Date.now() - started,
+        ok: false,
+        errCode: extractErrorCode(error),
+        detail: lastDetail.slice(0, 200)
+      });
       continue;
     }
+    logCall({
+      op: opts.op,
+      attempt: i + 1,
+      latency_ms: Date.now() - started,
+      ok: outcome.ready,
+      detail: outcome.detail
+    });
     if (outcome.ready && outcome.value !== undefined) {
       return { ok: true, value: outcome.value };
     }
@@ -274,6 +298,7 @@ export async function awaitUserExistsInTenant(
   upn: string
 ): Promise<PollResult<{ id: string; userPrincipalName: string }>> {
   return pollUntil({
+    op: "awaitUserExistsInTenant",
     description: `Waiting for ${upn} to be visible in /users`,
     predicate: async () => {
       const filter = encodeURIComponent(`userPrincipalName eq '${escapeODataString(upn)}'`);
@@ -296,6 +321,7 @@ export async function awaitDomainVerified(
   domain: string
 ): Promise<PollResult<{ verified: true }>> {
   return pollUntil({
+    op: "awaitDomainVerified",
     description: `Waiting for ${domain} to be Verified`,
     backoffsMs: [0, 10_000, 20_000, 30_000, 30_000, 30_000], // domain verify is the slowest of the bunch
     predicate: async () => {
@@ -362,6 +388,7 @@ export async function awaitLicenseAttached(
   skuId: string
 ): Promise<PollResult<{ attached: true }>> {
   return pollUntil({
+    op: "awaitLicenseAttached",
     description: `Waiting for license ${skuId} to attach to user ${userId}`,
     predicate: async () => {
       const resp = await graphRequest<{ assignedLicenses?: Array<{ skuId: string }> }>(
@@ -376,26 +403,34 @@ export async function awaitLicenseAttached(
 }
 
 /** Bug 6.3 — replaces the 6-attempt grant-then-retry loop in
- *  createLicensedUser's Global Admin grant block. Polls the
- *  roleAssignments collection until our principalId shows up. */
+ *  createLicensedUser's Global Admin grant block.
+ *
+ *  Queries the legacy /directoryRoles/{roleId}/members endpoint because
+ *  that's where grantGlobalAdmin POSTs the assignment (via $ref). The
+ *  newer roleManagement/directory/roleAssignments path also reflects
+ *  GA but with its own propagation lag — staying consistent with the
+ *  write side avoids reading from the slower replica. */
 export async function awaitGlobalAdminGranted(
   accessToken: string,
   userId: string,
-  roleDefinitionId: string
+  roleId: string
 ): Promise<PollResult<{ granted: true }>> {
   return pollUntil({
-    description: `Waiting for Global Admin role to attach to user ${userId}`,
+    op: "awaitGlobalAdminGranted",
+    description: `Waiting for Global Admin role ${roleId} to include user ${userId}`,
     predicate: async () => {
-      const filter = encodeURIComponent(
-        `roleDefinitionId eq '${escapeODataString(roleDefinitionId)}' and principalId eq '${escapeODataString(userId)}'`
-      );
+      // /directoryRoles/{id}/members lists every member of this role.
+      // For a fresh tenant this is small (<10 entries), so the cost is
+      // negligible. We check id-equality client-side rather than via
+      // $filter because the directoryRoles members endpoint doesn't
+      // support $filter on member id reliably.
       const resp = await graphRequest<{ value: Array<{ id: string }> }>(
         accessToken,
-        `/roleManagement/directory/roleAssignments?$filter=${filter}&$count=true`,
-        { headers: { ConsistencyLevel: "eventual" } }
+        `/directoryRoles/${roleId}/members?$select=id`
       );
-      if ((resp.value || []).length > 0) return { ready: true, value: { granted: true as const } };
-      return { ready: false, detail: "role assignment not yet visible" };
+      const found = (resp.value || []).some((m) => m?.id === userId);
+      if (found) return { ready: true, value: { granted: true as const } };
+      return { ready: false, detail: "user not yet in role members list" };
     }
   });
 }
@@ -1171,6 +1206,18 @@ async function ensurePrimaryUserLicensed(
       accessToken,
       `/users/${knownId}?$select=id,userPrincipalName,assignedLicenses`
     );
+  } else if (USE_POLL_HELPERS) {
+    // Phase 1 path — Bug 6.1. The new helper uses ConsistencyLevel: eventual
+    // and the shared poll-until budget. Once we confirm the user exists,
+    // do a strongly-consistent GET /users/{id} to pull assignedLicenses
+    // (the awaitUserExistsInTenant projection is just id + UPN).
+    const existence = await awaitUserExistsInTenant(accessToken, primaryUpn);
+    if (existence.ok) {
+      primaryRecord = await graphRequest<{ id: string; assignedLicenses?: Array<{ skuId: string }> }>(
+        accessToken,
+        `/users/${existence.value.id}?$select=id,userPrincipalName,assignedLicenses`
+      );
+    }
   } else {
     primaryRecord = await lookupUserByUpnWaitingForPropagation(accessToken, primaryUpn);
   }
@@ -1423,6 +1470,7 @@ export async function createLicensedUser(
   const GRANT_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000];
   let grantSucceeded = false;
   let grantError: string | null = null;
+  let grantedRoleId: string | null = null;
   for (let attempt = 0; attempt < GRANT_ATTEMPTS; attempt++) {
     try {
       const grantResult = await grantGlobalAdmin(accessToken, { kind: "user", id: userId });
@@ -1434,6 +1482,7 @@ export async function createLicensedUser(
         );
         grantSucceeded = true;
         grantError = null;
+        grantedRoleId = grantResult.roleId || null;
         break;
       }
       grantError = grantResult.error || "unknown error";
@@ -1446,6 +1495,24 @@ export async function createLicensedUser(
     );
     if (!isLast) {
       await new Promise((resolve) => setTimeout(resolve, GRANT_BACKOFF_MS[attempt]));
+    }
+  }
+
+  // Bug 6.3: even after the grant POST returns 2xx, Microsoft may not have
+  // propagated the membership to read replicas. Subsequent OAuth flows that
+  // check "is this user a Global Admin" can fail until propagation lands.
+  // Poll until the user shows up in the directoryRole members list. Flag-
+  // gated and best-effort — non-blocking even on exhaust.
+  if (USE_POLL_HELPERS && grantSucceeded && grantedRoleId) {
+    const propagation = await awaitGlobalAdminGranted(accessToken, userId, grantedRoleId);
+    if (!propagation.ok) {
+      console.log(
+        `⚠️ [Microsoft] (USE_POLL_HELPERS) GA grant POST succeeded but role-membership poll exhausted: ${propagation.reason}. Continuing — first OAuth attempt will likely succeed once Microsoft catches up.`
+      );
+    } else {
+      console.log(
+        `✅ [Microsoft] (USE_POLL_HELPERS) Global Admin role membership confirmed for ${userPrincipalName}`
+      );
     }
   }
 
