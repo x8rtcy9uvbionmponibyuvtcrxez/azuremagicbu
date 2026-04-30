@@ -76,22 +76,22 @@ async function startInstantlyUpload(opts: {
   cfg: {
     instantlyEmail: string;
     instantlyPassword: string;
-    instantlyV1Key: string;
     instantlyV2Key: string;
     instantlyWorkspace: string;
-    instantlyApiVersion: string;
   };
 }): Promise<TriggerResult> {
   const { cfg } = opts;
   if (!cfg.instantlyEmail || !cfg.instantlyPassword) {
     return { ok: false, error: "Instantly login email/password missing on batch", retryable: false };
   }
-  if (!cfg.instantlyV1Key && !cfg.instantlyV2Key) {
-    return { ok: false, error: "Instantly API key (v1 or v2) missing on batch", retryable: false };
+  // v1 was dropped — Instantly has been deprecating it and we hit silent 401s
+  // that destroyed entire upload runs. v2 only.
+  if (!cfg.instantlyV2Key) {
+    return { ok: false, error: "Instantly v2 API key missing on batch", retryable: false };
   }
 
-  const apiVersion = cfg.instantlyApiVersion === "v2" && cfg.instantlyV2Key ? "v2" : "v1";
-  const apiKey = cfg.instantlyV1Key || cfg.instantlyV2Key;
+  const apiVersion = "v2";
+  const apiKey = cfg.instantlyV2Key;
   const mode = cfg.instantlyWorkspace ? "multi" : "single";
   const workers = DEFAULT_WORKERS;
 
@@ -208,10 +208,8 @@ export async function triggerUploadForTenant(tenantDbId: string): Promise<Trigge
           uploaderAutoTrigger: true,
           instantlyEmail: true,
           instantlyPassword: true,
-          instantlyV1Key: true,
           instantlyV2Key: true,
           instantlyWorkspace: true,
-          instantlyApiVersion: true,
           smartleadApiKey: true,
           smartleadLoginUrl: true
         }
@@ -252,10 +250,8 @@ export async function triggerUploadForTenant(tenantDbId: string): Promise<Trigge
       cfg: {
         instantlyEmail: (tenant.batch.instantlyEmail || "").trim(),
         instantlyPassword: safeDecrypt(tenant.batch.instantlyPassword),
-        instantlyV1Key: safeDecrypt(tenant.batch.instantlyV1Key),
         instantlyV2Key: safeDecrypt(tenant.batch.instantlyV2Key),
-        instantlyWorkspace: (tenant.batch.instantlyWorkspace || "").trim(),
-        instantlyApiVersion: tenant.batch.instantlyApiVersion || "v1"
+        instantlyWorkspace: (tenant.batch.instantlyWorkspace || "").trim()
       }
     });
   } else {

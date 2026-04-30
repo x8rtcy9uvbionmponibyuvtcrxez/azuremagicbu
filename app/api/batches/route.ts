@@ -21,10 +21,9 @@ type UploaderConfig = {
   autoTrigger: boolean;
   instantlyEmail: string | null;
   instantlyPassword: string | null;
-  instantlyV1Key: string | null;
+  // v1 was dropped — Instantly is rolling v1 down and we hit silent 401s.
   instantlyV2Key: string | null;
   instantlyWorkspace: string | null;
-  instantlyApiVersion: "v1" | "v2";
   smartleadApiKey: string | null;
   smartleadLoginUrl: string | null;
 };
@@ -42,10 +41,8 @@ function parseUploaderConfig(formData: FormData): { cfg: UploaderConfig; error?:
     autoTrigger: false,
     instantlyEmail: null,
     instantlyPassword: null,
-    instantlyV1Key: null,
     instantlyV2Key: null,
     instantlyWorkspace: null,
-    instantlyApiVersion: "v1",
     smartleadApiKey: null,
     smartleadLoginUrl: null
   };
@@ -64,20 +61,16 @@ function parseUploaderConfig(formData: FormData): { cfg: UploaderConfig; error?:
   if (cfg.esp === "instantly") {
     cfg.instantlyEmail = (formData.get("instantly_email") as string | null)?.trim() || null;
     cfg.instantlyPassword = (formData.get("instantly_password") as string | null)?.trim() || null;
-    cfg.instantlyV1Key = (formData.get("instantly_v1_key") as string | null)?.trim() || null;
     cfg.instantlyV2Key = (formData.get("instantly_v2_key") as string | null)?.trim() || null;
     cfg.instantlyWorkspace = (formData.get("instantly_workspace") as string | null)?.trim() || null;
-    const apiVersion = (formData.get("instantly_api_version") as string | null)?.trim() || "v1";
-    cfg.instantlyApiVersion = apiVersion === "v2" ? "v2" : "v1";
+    // instantly_api_version and instantly_v1_key are no longer accepted —
+    // v1 was dropped because Instantly is rolling it down.
 
     if (!cfg.instantlyEmail || !cfg.instantlyPassword) {
       return { cfg, error: "Instantly email + password are required when uploader_esp=instantly" };
     }
-    if (!cfg.instantlyV1Key && !cfg.instantlyV2Key) {
-      return { cfg, error: "At least one Instantly API key (v1 or v2) is required" };
-    }
-    if (cfg.instantlyApiVersion === "v2" && !cfg.instantlyV2Key) {
-      return { cfg, error: "instantly_api_version=v2 requires instantly_v2_key" };
+    if (!cfg.instantlyV2Key) {
+      return { cfg, error: "Instantly v2 API key is required (v1 is no longer supported)" };
     }
   } else {
     cfg.smartleadApiKey = (formData.get("smartlead_api_key") as string | null)?.trim() || null;
@@ -230,14 +223,15 @@ export async function POST(request: Request) {
         instantlyPassword: uploaderCfg.instantlyPassword
           ? encryptSecret(uploaderCfg.instantlyPassword)
           : null,
-        instantlyV1Key: uploaderCfg.instantlyV1Key
-          ? encryptSecret(uploaderCfg.instantlyV1Key)
-          : null,
+        // instantlyV1Key intentionally not written — v1 was dropped. Column
+        // remains in schema for legacy reads of older batches.
+        instantlyV1Key: null,
         instantlyV2Key: uploaderCfg.instantlyV2Key
           ? encryptSecret(uploaderCfg.instantlyV2Key)
           : null,
         instantlyWorkspace: uploaderCfg.instantlyWorkspace,
-        instantlyApiVersion: uploaderCfg.instantlyApiVersion,
+        // instantlyApiVersion forced to "v2" since v1 was dropped.
+        instantlyApiVersion: "v2",
         smartleadApiKey: uploaderCfg.smartleadApiKey
           ? encryptSecret(uploaderCfg.smartleadApiKey)
           : null,
